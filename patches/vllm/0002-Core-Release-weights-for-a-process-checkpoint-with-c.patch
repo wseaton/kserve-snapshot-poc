@@ -1,4 +1,4 @@
-From 0f9bb3b156196daf31231836c8e878f9f141c971 Mon Sep 17 00:00:00 2001
+From cc296ed5cfafa64b2d5887d3aef75e284c445c86 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Thu, 5 Nov 2026 10:51:55 -0500
 Subject: [PATCH 2/2] [Core] Release weights for a process checkpoint with
@@ -23,7 +23,7 @@ retained parameters, which wake_up(["weights"]) restores.
  5 files changed, 101 insertions(+), 17 deletions(-)
 
 diff --git a/tests/v1/engine/test_engine_core.py b/tests/v1/engine/test_engine_core.py
-index e21953eb4c..6ce584a685 100644
+index e21953eb4c..9a611f8f4d 100644
 --- a/tests/v1/engine/test_engine_core.py
 +++ b/tests/v1/engine/test_engine_core.py
 @@ -6,7 +6,7 @@ import time
@@ -82,7 +82,7 @@ index e21953eb4c..6ce584a685 100644
 +    executor.reset_mock()
 +    core.scheduler.reset_mock()
 +    order: list[str] = []
-+    executor.collective_rpc.side_effect = lambda method: order.append(method)
++    executor.collective_rpc.side_effect = lambda method, *_: order.append(method)
 +    executor.wake_up.side_effect = lambda tags: (
 +        order.append(f"wake_up {tags}"),
 +        sleeping.difference_update(tags),

@@ -53,18 +53,19 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 
 ## Status
 
-Results so far, on 8x H200 nodes with ConnectX-7 InfiniBand, with an earlier version of the
-restore path (a vLLM worker extension driven over vLLM's dev endpoints, replaced by the patches
-above):
+The restore path built on these patches runs end to end (2026-11-05, Qwen3-8B TP=1 on 8x H200
+with ConnectX-7 InfiniBand, scaled out one replica at a time to 4):
 
-| Test | Result |
-| --- | --- |
-| Qwen3-8B TP=1, scale-out 1 to 4 | Every restore after the first pulled 16.4 GB from a peer in about 1 s (120 to 127 Gbps); a restored replica was Ready 37 s after scale-up against 93 s for a cold boot. |
-| TP=2, replicas on two nodes | Each rank pulled its 8.2 GB shard from its peer rank on the other node in 0.24 s (about 270 Gbps). |
-| TP=8, replicas on two nodes | All 8 ranks pulled 2.06 GB each in under 0.2 s. |
+| Replica | Weights | Ready |
+| --- | --- | --- |
+| 1, held for capture | from disk through ModelExpress, no peer yet | 156 s after creation, including the donor's cold boot and the capture |
+| 2 to 4 | 16.4 GB from a running replica over RDMA in 0.64 to 1.73 s (76 to 205 Gbps), inside `/checkpoint/restore` | 37 to 41 s after scale-up |
+| cold boot | ModelExpress's normal load from a peer, 0.73 s | 89 s |
 
-Every restored replica's greedy completion matched the first replica's; a TP=8 cold boot agreed
-within log-probability noise and split from it on an exact tie. The details are in the
-submodule's README.
+Every completion was token-identical to the first replica's, and each restored replica published
+itself to ModelExpress under its own pod identity.
 
-The restore path built on the patches above has not been run end to end yet.
+An earlier version of the restore path (a vLLM worker extension driven over vLLM's dev
+endpoints) also ran at TP=2 and TP=8 with replicas on two nodes: each rank pulled its shard from
+its peer rank on the other node (8.2 GB in 0.24 s at TP=2, 2.06 GB per rank in under 0.2 s at
+TP=8). Those have not been rerun on the patches above yet. Details are in the submodule's README.
