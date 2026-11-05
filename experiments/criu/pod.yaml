@@ -1,6 +1,6 @@
 apiVersion: v1
 kind: Pod
-metadata: {name: t5-criu, labels: {app: t5-criu}}
+metadata: {name: criu-tp2, labels: {app: criu-tp2}}
 spec:
   nodeSelector: {kubernetes.io/hostname: gf41fb2}
   imagePullSecrets: [{name: quay-wseaton-pull}]
@@ -22,7 +22,7 @@ spec:
     - {name: cuinterpose, mountPath: /tmp/snapshot-cuda, readOnly: true}
     - {name: compat, mountPath: /compat, readOnly: true}
   volumes:
-  - {name: exp, configMap: {name: t5-exp, defaultMode: 0755}}
+  - {name: exp, configMap: {name: criu-tp2, defaultMode: 0755}}
   - {name: cache, persistentVolumeClaim: {claimName: fst-model-cache}}
   - {name: work, emptyDir: {}}
   - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}

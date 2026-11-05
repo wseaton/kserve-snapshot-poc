@@ -1,0 +1,258 @@
+From 409087b94cb32c01b1cbb4c5b9f6dc3a568a39fe Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Thu, 5 Nov 2026 12:23:51 -0500
+Subject: [PATCH] [Distributed] Recreate NCCL communicators across a process
+ checkpoint
+
+/checkpoint/prepare left the NCCL communicator alive, so each TP worker
+kept its peers' buffers mapped when the process was checkpointed. On driver
+580, cuda-checkpoint then refuses to restore the workers, and suspending the
+communicator with ncclCommSuspend only helps when the restore lands on the
+same GPUs: after a remap, ncclCommResume leaves peer mappings that fault,
+and a new cuMem communicator fails its first all-reduce.
+
+checkpoint_prepare now destroys the communicator and checkpoint_restore
+creates a new one from a fresh unique id broadcast over the CPU group.
+CUDA graphs replay the old communicator and ncclCommDestroy waits for them,
+so the worker releases its graphs before preparing (V2 model runner only)
+and captures them again when the KV cache wakes, before scheduling resumes.
+
+With custom all-reduce off, FlashInfer all-reduce off and
+NCCL_CUMEM_ENABLE=0, a TP=2 CRIU dump and restore onto two other GPUs
+returns the same greedy completion, eager and with CUDA graphs. Recapturing
+the graphs adds about 7 s to the restore.
+---
+ tests/distributed/test_pynccl.py              | 24 ++++++++++++++
+ .../device_communicators/cuda_communicator.py | 10 ++++--
+ .../device_communicators/pynccl.py            | 33 ++++++++++++++++---
+ vllm/v1/worker/gpu/model_runner.py            | 15 +++++++++
+ vllm/v1/worker/gpu_worker.py                  | 26 ++++++++++++++-
+ 5 files changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/tests/distributed/test_pynccl.py b/tests/distributed/test_pynccl.py
+index 5279a05249..f679be6ea4 100644
+--- a/tests/distributed/test_pynccl.py
++++ b/tests/distributed/test_pynccl.py
+@@ -81,6 +81,30 @@ def test_pynccl():
+     distributed_run(worker_fn, 2)
+ 
+ 
++@worker_fn_wrapper
++def checkpoint_recreate_worker_fn():
++    pynccl_comm = PyNcclCommunicator(
++        get_world_group().cpu_group, device=get_world_group().device
++    )
++    pynccl_comm.checkpoint_release()
++    pynccl_comm.checkpoint_release()
++    pynccl_comm.checkpoint_recreate()
++    pynccl_comm.checkpoint_recreate()
++    tensor = torch.ones(16, 1024, 1024, dtype=torch.float32).cuda(pynccl_comm.rank)
++    tensor = pynccl_comm.all_reduce(tensor)
++    torch.accelerator.synchronize()
++    assert torch.all(tensor == pynccl_comm.world_size).cpu().item()
++
++
++@pytest.mark.skipif(
++    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
++)
++def test_pynccl_checkpoint_recreate():
++    """A communicator released for a process checkpoint is replaced by a new
++    one that reduces correctly, and repeating either step is a no-op."""
++    distributed_run(checkpoint_recreate_worker_fn, 2)
++
++
+ @worker_fn_wrapper
+ def multiple_allreduce_worker_fn():
+     device = torch.device(f"cuda:{torch.distributed.get_rank()}")
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 56c9e33ee4..06784cd17e 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -888,17 +888,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         checkpoint_restore_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
+ 
+     def checkpoint_prepare(self) -> None:
+-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
++        # Only FlashInfer all-reduce, FlashInfer all2all and NCCL are supported
++        # for now.
+         from .flashinfer_all_reduce import checkpoint_prepare_fi_ar_workspaces
+ 
+         checkpoint_prepare_fi_ar_workspaces(self.cpu_group)
+         if self.all2all_manager is not None:
+             self.all2all_manager.checkpoint_prepare()
++        if self.pynccl_comm is not None:
++            self.pynccl_comm.checkpoint_release()
+ 
+     def checkpoint_restore(self) -> None:
+-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
++        # Only FlashInfer all-reduce, FlashInfer all2all and NCCL are supported
++        # for now.
+         from .flashinfer_all_reduce import checkpoint_restore_fi_ar_workspaces
+ 
++        if self.pynccl_comm is not None:
++            self.pynccl_comm.checkpoint_recreate()
+         checkpoint_restore_fi_ar_workspaces(self.cpu_group)
+         if self.all2all_manager is not None:
+             self.all2all_manager.checkpoint_restore()
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index 8981594aff..15cc696ab7 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -140,14 +140,19 @@ class PyNcclCommunicator:
+         self.available = True
+         self.disabled = False
+         self._suspended = False
++        self._released = False
+ 
+         self.nccl_version = self.nccl.ncclGetRawVersion()
+         if self.rank == 0:
+-            # get the unique id from NCCL
+-            self.unique_id = self.nccl.ncclGetUniqueId()
+             logger.info_once("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
++        self._share_unique_id(group)
++        self._init_comm(device)
++
++    def _share_unique_id(self, group: ProcessGroup | StatelessProcessGroup) -> None:
++        """Get a new unique id on rank 0 and broadcast it over `group`."""
++        if self.rank == 0:
++            self.unique_id = self.nccl.ncclGetUniqueId()
+         else:
+-            # construct an empty unique id
+             self.unique_id = ncclUniqueId()
+ 
+         if not isinstance(group, StatelessProcessGroup):
+@@ -160,7 +165,6 @@ class PyNcclCommunicator:
+                 self.unique_id.internal[i] = byte
+         else:
+             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
+-        self._init_comm(device)
+ 
+     def _init_comm(self, device: int | str | torch.device) -> None:
+         """Create the communicator on `device` from the already-resolved
+@@ -640,6 +644,27 @@ class PyNcclCommunicator:
+     def deregister_comm_window(self, window):
+         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+ 
++    def checkpoint_release(self) -> None:
++        """Destroy the communicator before a process checkpoint (collective,
++        idempotent). Every CUDA graph that captured an op on it must already
++        be released."""
++        if self.disabled or self._released:
++            return
++        with torch.accelerator.device_index(self.device.index):
++            self.nccl.ncclCommDestroy(self.comm)
++        self._released = True
++
++    def checkpoint_recreate(self) -> None:
++        """Create a new communicator after a process checkpoint (collective,
++        no-op unless released). The process may now run on other GPUs, which
++        invalidates the peer mappings of the old communicator."""
++        if self.disabled or not self._released:
++            return
++        assert self.group is not None
++        self._share_unique_id(self.group)
++        self._init_comm(self.device)
++        self._released = False
++
+     def suspend(self):
+         """Release comm GPU memory (collective, idempotent); keeps topology."""
+         if self.disabled or self._suspended:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 949dfd79f9..aac0f257a8 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -114,6 +114,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
++    CudaGraphManager,
+     ModelCudaGraphManager,
+     has_compiled_submodule,
+     make_cudagraph_stats,
+@@ -1153,6 +1154,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             and self.cudagraph_manager.needs_capture()
+         )
+ 
++    def release_cuda_graphs(self) -> None:
++        """Drop every captured CUDA graph so `capture_model` can capture them
++        again, for example after the communicators they replay are replaced."""
++        if self.cudagraph_manager is not None:
++            self.cudagraph_manager.release_graphs()
++        for attr in vars(self.speculator).values() if self.speculator else ():
++            if isinstance(attr, CudaGraphManager):
++                attr.release_graphs()
++        CUDAGraphWrapper.clear_all_graphs()
++        BreakableCUDAGraphWrapper.clear_all_graphs()
++        gc.collect()
++        torch.accelerator.synchronize()
++        torch.accelerator.empty_cache()
++
+     @torch.inference_mode()
+     def capture_model(self, *, profile_only: bool = False) -> int:
+         assert self.cudagraph_manager is not None
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 0b14b1c2ec..ea1762eddb 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -122,7 +122,7 @@ from vllm.v1.worker.startup_plan import (
+     maybe_save_startup_plan,
+ )
+ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+-from vllm.v1.worker.workspace import init_workspace_manager
++from vllm.v1.worker.workspace import init_workspace_manager, unlock_workspace
+ 
+ from ...model_executor.model_loader import TensorizerLoader
+ from .gpu.cudagraph_utils import has_compiled_submodule
+@@ -225,6 +225,7 @@ class Worker(WorkerBase):
+         is_driver_worker: bool = False,
+     ):
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        self._checkpoint_graphs_released = False
+         if (
+             self.use_v2_model_runner
+             and not HAS_TRITON
+@@ -405,6 +406,9 @@ class Worker(WorkerBase):
+         if loader is not None:
+             loader.on_wake_up(tags)
+ 
++        if wake_kv_cache and self._checkpoint_graphs_released:
++            self._capture_released_graphs()
++
+     def _save_discarded_weight_state(self) -> None:
+         """Save what a weight reload does not bring back: buffers and the
+         parameters named by `sleep_preserve_parameter_names`."""
+@@ -434,11 +438,31 @@ class Worker(WorkerBase):
+         self.sleep_mode_backend.discard(tags)
+ 
+     def checkpoint_prepare(self) -> None:
++        if self._checkpoint_graphs_captured():
++            self._v2_model_runner().release_cuda_graphs()
++            self._checkpoint_graphs_released = True
+         checkpoint_prepare_distributed_state()
+ 
+     def checkpoint_restore(self) -> None:
+         checkpoint_restore_distributed_state()
+ 
++    def _capture_released_graphs(self) -> None:
++        """Capture the graphs `checkpoint_prepare` released."""
++        unlock_workspace()
++        with self._get_cudagraph_capture_context():
++            self.model_runner.capture_model()
++        self._checkpoint_graphs_released = False
++
++    def _checkpoint_graphs_captured(self) -> bool:
++        if self.model_config.enforce_eager or self.parallel_config.world_size == 1:
++            return False
++        if not self.use_v2_model_runner:
++            raise NotImplementedError(
++                "A process checkpoint with CUDA graphs and tensor parallelism "
++                "requires the V2 model runner"
++            )
++        return True
++
+     def _weight_checksum_prefix(self) -> str:
+         # data_parallel_rank is 0 in dense workers; only the index is unique.
+         dp = self.parallel_config.data_parallel_index
+-- 
+2.54.0 (Apple Git-157)
+
