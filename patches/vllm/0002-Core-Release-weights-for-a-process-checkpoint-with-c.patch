@@ -1,0 +1,278 @@
+From 0f9bb3b156196daf31231836c8e878f9f141c971 Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Thu, 5 Nov 2026 10:51:55 -0500
+Subject: [PATCH 2/2] [Core] Release weights for a process checkpoint with
+ --checkpoint-release-weights
+
+With --checkpoint-release-weights, /checkpoint/prepare also discards the
+weights after the KV cache, so a process checkpoint does not contain them,
+and /checkpoint/restore wakes the weights and refills them through the
+model loader before the KV cache. A checkpoint of a large model then stays
+small, and a loader such as ModelExpress can refill the weights from a
+running peer through reload_weights_inplace.
+
+Worker.discard(("weights",)) now does what a level-2 sleep does for the
+weights: it calls the loader's on_sleep(2) and saves the buffers and the
+retained parameters, which wake_up(["weights"]) restores.
+---
+ tests/v1/engine/test_engine_core.py | 57 ++++++++++++++++++++++++++++-
+ vllm/config/model.py                |  7 ++++
+ vllm/engine/arg_utils.py            |  6 +++
+ vllm/v1/engine/core.py              | 17 ++++++---
+ vllm/v1/worker/gpu_worker.py        | 31 ++++++++++------
+ 5 files changed, 101 insertions(+), 17 deletions(-)
+
+diff --git a/tests/v1/engine/test_engine_core.py b/tests/v1/engine/test_engine_core.py
+index e21953eb4c..6ce584a685 100644
+--- a/tests/v1/engine/test_engine_core.py
++++ b/tests/v1/engine/test_engine_core.py
+@@ -6,7 +6,7 @@ import time
+ import uuid
+ from collections import deque
+ from concurrent.futures import Future, ThreadPoolExecutor
+-from unittest.mock import MagicMock, PropertyMock, patch
++from unittest.mock import MagicMock, PropertyMock, call, patch
+ 
+ import pytest
+ from transformers import AutoTokenizer
+@@ -875,6 +875,7 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+     scheduling resumes. Repeating either is a no-op."""
+     core = _pausable_engine_core_proc()
+     core.vllm_config = MagicMock()
++    core.vllm_config.model_config.checkpoint_release_weights = False
+     core.model_executor.is_sleeping = False
+     core._reset_caches = MagicMock()
+     core.reject_new_requests = False
+@@ -900,12 +901,66 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+     assert not core.reject_new_requests
+ 
+ 
++def test_checkpoint_release_weights_discards_then_reloads():
++    """With checkpoint_release_weights, preparing discards the weights after
++    the KV cache, before the external state. Restoring wakes and reloads the
++    weights after the external state and before the KV cache, and scheduling
++    resumes only once both are resident."""
++    core = _pausable_engine_core_proc()
++    core.vllm_config = MagicMock()
++    core.vllm_config.model_config.checkpoint_release_weights = True
++    core._reset_caches = MagicMock()
++    core.reject_new_requests = False
++    core.scheduler.get_kv_connector.return_value = None
++    executor = core.model_executor
++    sleeping: set[str] = set()
++    type(executor).is_sleeping = property(lambda _: bool(sleeping))
++    executor.discard.side_effect = sleeping.update
++    executor.wake_up.side_effect = sleeping.difference_update
++
++    assert core.checkpoint_prepare("wait") is None
++    assert core.checkpoint_state() == (CheckpointState.PREPARED, None)
++    assert sleeping == {"kv_cache", "weights"}
++    assert [c for c in executor.mock_calls if c[0] == "discard"] == [
++        call.discard(("kv_cache",)),
++        call.discard(("weights",)),
++    ]
++    assert _executor_calls(core) == [
++        "synchronize_device",
++        "discard",
++        "discard",
++        "checkpoint_prepare",
++        "synchronize_device",
++    ]
++
++    executor.reset_mock()
++    core.scheduler.reset_mock()
++    order: list[str] = []
++    executor.collective_rpc.side_effect = lambda method: order.append(method)
++    executor.wake_up.side_effect = lambda tags: (
++        order.append(f"wake_up {tags}"),
++        sleeping.difference_update(tags),
++    )
++    core.scheduler.set_pause_state.side_effect = lambda state: order.append(str(state))
++    core.checkpoint_restore()
++    assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
++    assert not sleeping
++    assert order == [
++        "checkpoint_restore",
++        "wake_up ['weights']",
++        "reload_weights",
++        "wake_up ['kv_cache']",
++        str(PauseState.UNPAUSED),
++    ]
++
++
+ @pytest.mark.parametrize("deferred", [False, True])
+ def test_checkpoint_prepare_fails_on_drain_barrier_error(deferred: bool):
+     """A failing barrier at the end of the drain leaves the engine FAILED and
+     still rejecting, whether the drain completes at once or later."""
+     core = _pausable_engine_core_proc()
+     core.vllm_config = MagicMock()
++    core.vllm_config.model_config.checkpoint_release_weights = False
+     core.model_executor.is_sleeping = False
+     core.model_executor.collective_rpc.side_effect = RuntimeError("device lost")
+     core.reject_new_requests = False
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 0434f12913..05aa1d144b 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -399,6 +399,10 @@ class ModelConfig:
+     """Prepare each engine for a process checkpoint once it starts, as
+     `/checkpoint/prepare` does. It serves only after `/checkpoint/restore`.
+     Requires sleep mode."""
++    checkpoint_release_weights: bool = False
++    """Also discard the weights when preparing for a process checkpoint, so the
++    checkpoint does not contain them, and reload them through the model loader
++    when restoring. Requires sleep mode."""
+     enable_cumem_allocator: bool = False
+     """Enable the custom cumem allocator to leverage advanced GPU memory
+     allocation features such as multi-node NVLink support.
+@@ -512,6 +516,7 @@ class ModelConfig:
+             "skip_mm_profiling",
+             "mm_ipc_gpu_memory_gb",
+             "checkpoint_prepare_on_startup",
++            "checkpoint_release_weights",
+         }
+ 
+         from vllm.config.utils import get_hash_factors, hash_factors
+@@ -677,6 +682,8 @@ class ModelConfig:
+ 
+         if self.checkpoint_prepare_on_startup and not self.enable_sleep_mode:
+             raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
++        if self.checkpoint_release_weights and not self.enable_sleep_mode:
++            raise ValueError("checkpoint_release_weights requires enable_sleep_mode")
+         if self.enable_sleep_mode:
+             if not current_platform.is_sleep_mode_available():
+                 raise ValueError("Sleep mode is not supported on current platform.")
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 5b56ee1300..6e0cf7c469 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -810,6 +810,7 @@ class EngineArgs:
+     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
+     enable_nccl_comm_suspend: bool = ModelConfig.enable_nccl_comm_suspend
+     checkpoint_prepare_on_startup: bool = ModelConfig.checkpoint_prepare_on_startup
++    checkpoint_release_weights: bool = ModelConfig.checkpoint_release_weights
+     override_generation_config: dict[str, Any] = get_field(
+         ModelConfig, "override_generation_config"
+     )
+@@ -1074,6 +1075,10 @@ class EngineArgs:
+             "--checkpoint-prepare-on-startup",
+             **model_kwargs["checkpoint_prepare_on_startup"],
+         )
++        model_group.add_argument(
++            "--checkpoint-release-weights",
++            **model_kwargs["checkpoint_release_weights"],
++        )
+         model_group.add_argument("--model-impl", **model_kwargs["model_impl"])
+         model_group.add_argument(
+             "--logits-processors", **model_kwargs["logits_processors"]
+@@ -2079,6 +2084,7 @@ class EngineArgs:
+             enable_cumem_allocator=self.enable_cumem_allocator,
+             enable_nccl_comm_suspend=self.enable_nccl_comm_suspend,
+             checkpoint_prepare_on_startup=self.checkpoint_prepare_on_startup,
++            checkpoint_release_weights=self.checkpoint_release_weights,
+             model_impl=self.model_impl,
+             logits_processors=self.logits_processors,
+             video_pruning_rate=self.video_pruning_rate,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 57626d94f6..c93ecfc027 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1003,6 +1003,8 @@ class EngineCore:
+                 self._set_kv_cache_reclaimable(True)
+             if preparing:
+                 self.release_kv_cache_memory()
++                if self.vllm_config.model_config.checkpoint_release_weights:
++                    self.model_executor.discard(("weights",))
+                 self.collective_rpc("checkpoint_prepare")
+                 self.collective_rpc("synchronize_device")
+                 self._checkpoint_state = CheckpointState.PREPARED
+@@ -2424,9 +2426,10 @@ class EngineCoreProc(EngineCore):
+         self.reject_new_requests = False
+ 
+     def checkpoint_prepare(self, mode: PauseMode = "wait") -> str | None:
+-        """Drain with `mode`, then release the KV cache and what a process
+-        checkpoint must not contain, such as communicator state. The state
+-        becomes PREPARED once the drain completes. Repeating is a no-op.
++        """Drain with `mode`, then release the KV cache, the weights with
++        `checkpoint_release_weights`, and what a process checkpoint must not
++        contain, such as communicator state. The state becomes PREPARED once
++        the drain completes. Repeating is a no-op.
+ 
+         Returns:
+             Why the engine cannot prepare, with nothing changed, or None.
+@@ -2451,8 +2454,9 @@ class EngineCoreProc(EngineCore):
+         return None
+ 
+     def checkpoint_restore(self) -> None:
+-        """Bring back what preparing released, wake the KV cache and resume
+-        scheduling. Repeating is a no-op."""
++        """Bring back what preparing released, reload released weights through
++        the model loader, wake the KV cache and resume scheduling. Repeating is
++        a no-op."""
+         state = self._checkpoint_state
+         if state.is_restored:
+             return
+@@ -2462,6 +2466,9 @@ class EngineCoreProc(EngineCore):
+         self._checkpoint_state = CheckpointState.RESTORING
+         try:
+             self.collective_rpc("checkpoint_restore")
++            if self.vllm_config.model_config.checkpoint_release_weights:
++                self.wake_up(["weights"])
++                self.collective_rpc("reload_weights")
+             self.wake_up(["kv_cache"])
+         except Exception as e:
+             self._fail_checkpoint(e)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1977ace55f..0b14b1c2ec 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -337,18 +337,8 @@ class Worker(WorkerBase):
+         torch.accelerator.synchronize()
+         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
+ 
+-        # Save the buffers before level 2 sleep
+         if level == 2:
+-            model = self.model_runner.model
+-            self._save_sleep_parameters(model)
+-            self._sleep_saved_buffers = {
+-                name: buffer.cpu().clone() for name, buffer in model.named_buffers()
+-            }
+-            draft = self.get_draft_model()
+-            if draft is not None:
+-                self._sleep_saved_draft_buffers = {
+-                    name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
+-                }
++            self._save_discarded_weight_state()
+ 
+         if has_kv_transfer_group():
+             get_kv_transfer_group().unregister_kv_caches()
+@@ -415,7 +405,26 @@ class Worker(WorkerBase):
+         if loader is not None:
+             loader.on_wake_up(tags)
+ 
++    def _save_discarded_weight_state(self) -> None:
++        """Save what a weight reload does not bring back: buffers and the
++        parameters named by `sleep_preserve_parameter_names`."""
++        model = self.model_runner.model
++        self._save_sleep_parameters(model)
++        self._sleep_saved_buffers = {
++            name: buffer.cpu().clone() for name, buffer in model.named_buffers()
++        }
++        draft = self.get_draft_model()
++        if draft is not None:
++            self._sleep_saved_draft_buffers = {
++                name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
++            }
++
+     def discard(self, tags: tuple[str, ...]) -> None:
++        if "weights" in tags:
++            loader = self.model_runner.model_loader
++            if loader is not None:
++                loader.on_sleep(2)
++            self._save_discarded_weight_state()
+         if has_kv_transfer_group() and "kv_cache" in tags:
+             get_kv_transfer_group().unregister_kv_caches()
+         # Outside the allocator pool, like in sleep.
+-- 
+2.54.0 (Apple Git-157)
+

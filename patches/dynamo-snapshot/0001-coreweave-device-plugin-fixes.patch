@@ -1,0 +1,75 @@
+--- a/agent/internal/cuda/cuda.go
++++ b/agent/internal/cuda/cuda.go
+@@ -181,7 +181,7 @@
+ // Explicit environment selections are resolved on the host; disabled legacy
+ // selections inspect only container visibility, which can include CDI devices.
+ func DiscoverGPUs(ctx context.Context, clientset kubernetes.Interface, podName, podNamespace, containerName, hostProcPath string, pid int, env []string, log logr.Logger) (compat.GPUInfo, error) {
+-	if value := VisibleDevicesValue(env); value != nil && *value != "all" {
++	if value := VisibleDevicesValue(env); value != nil && *value != "all" && !isDeviceListVolumeMount(*value) {
+ 		if *value == "" || *value == "none" || *value == "void" {
+ 			// These disable legacy injection, not CDI. Inspect only actual
+ 			// container visibility; never substitute host/allocation UUIDs.
+@@ -506,3 +506,10 @@
+ 
+ 	return timings, nil
+ }
++
++// isDeviceListVolumeMount reports the device plugin's volume-mounts strategy,
++// where NVIDIA_VISIBLE_DEVICES names a directory of per-device mounts instead
++// of listing the devices.
++func isDeviceListVolumeMount(value string) bool {
++	return strings.HasPrefix(value, "/")
++}
+--- a/agent/internal/runtime/mounts.go
++++ b/agent/internal/runtime/mounts.go
+@@ -99,6 +99,14 @@
+ 			continue
+ 		}
+ 
++		// The device plugin's volume-mounts strategy marks each allocated GPU
++		// with a /dev/null bind named by UUID. It carries no state and differs
++		// on every node and GPU, so it cannot be an external restore source.
++		if isDeviceListMarker(m.MountPoint) {
++			skipped = append(skipped, m.MountPoint)
++			continue
++		}
++
+ 		// Let CRIU handle /dev/shm content natively — don't externalize it.
+ 		if m.MountPoint == "/dev/shm" && m.FSType == "tmpfs" {
+ 			continue
+@@ -135,3 +143,12 @@
+ 	}
+ 	return nil
+ }
++
++func isDeviceListMarker(mountPoint string) bool {
++	for _, dir := range []string{"/run/nvidia-container-devices/", "/var/run/nvidia-container-devices/"} {
++		if strings.HasPrefix(mountPoint, dir) {
++			return true
++		}
++	}
++	return false
++}
+--- a/agent/internal/logging/diagnostics.go
++++ b/agent/internal/logging/diagnostics.go
+@@ -94,6 +94,20 @@
+ 		log.Info("CRIU restore key lines", "path", path, "lines", strings.Join(keyLines, " | "))
+ 	}
+ 
++	var errorLines []string
++	for i, line := range lines {
++		if strings.Contains(line, "Error (") || strings.Contains(line, "Warn  (") {
++			from := max(0, i-3)
++			errorLines = append(errorLines, strings.Join(lines[from:i+1], " / "))
++			if len(errorLines) >= 60 {
++				break
++			}
++		}
++	}
++	if len(errorLines) > 0 {
++		log.Info("CRIU restore error lines", "path", path, "lines", strings.Join(errorLines, " | "))
++	}
++
+ 	// Last 40 non-empty lines
+ 	var tail []string
+ 	for i := len(lines) - 1; i >= 0 && len(tail) < 40; i-- {

@@ -1,0 +1,129 @@
+From 16ecf7a627d2a117f0c4f97c7a549923d6719529 Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Thu, 5 Nov 2026 10:51:58 -0500
+Subject: [PATCH] feat(client): read the pod identity from MX_POD_INFO_DIR
+
+A process restored from a checkpoint into another pod keeps the
+environment of the pod it was checkpointed in, so it would publish itself
+with that pod's POD_NAME, POD_UID and MX_WORKER_HOST. With MX_POD_INFO_DIR
+pointing at a downward API volume with name, namespace and uid files, the
+pod identity is read from there on every access, and the worker host is
+resolved from the network instead of MX_WORKER_HOST.
+---
+ .../python/modelexpress/envs.py               | 31 +++++++++++++--
+ modelexpress_client/python/tests/test_envs.py | 39 +++++++++++++++++++
+ 2 files changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/modelexpress_client/python/modelexpress/envs.py b/modelexpress_client/python/modelexpress/envs.py
+index c0e72281..e812399f 100644
+--- a/modelexpress_client/python/modelexpress/envs.py
++++ b/modelexpress_client/python/modelexpress/envs.py
+@@ -58,6 +58,7 @@ if TYPE_CHECKING:
+     MX_METADATA_PORT: int
+     MX_WORKER_GRPC_PORT: int
+     MX_WORKER_HOST: str
++    MX_POD_INFO_DIR: str
+     MX_HEARTBEAT_INTERVAL_SECS: int
+     MX_PUBLISH_TIMEOUT_SECS: int
+     MX_MODEL_REVISION: str
+@@ -160,6 +161,23 @@ if TYPE_CHECKING:
+ _TRUTHY = {"1", "true", "yes", "on"}
+ 
+ 
++def _pod_field(env_name: str, file_name: str) -> str:
++    """Read a pod identity field from the MX_POD_INFO_DIR downward API volume,
++    falling back to its environment variable. The volume tracks the pod the
++    process runs in now, which differs from the environment after a process
++    checkpoint is restored into another pod."""
++    directory = os.environ.get("MX_POD_INFO_DIR", "")
++    if directory:
++        try:
++            with open(os.path.join(directory, file_name)) as f:
++                value = f.read().strip()
++        except OSError:
++            value = ""
++        if value:
++            return value
++    return os.environ.get(env_name, "")
++
++
+ def _env_int(name: str, default: int) -> int:
+     """Parse an int env var, falling back to ``default`` (and warning) on error."""
+     raw = os.environ.get(name)
+@@ -264,7 +282,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
+     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
+-    "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
++    # A downward API pod IP is fixed in the environment at process start, so
++    # with MX_POD_INFO_DIR the host is resolved from the network instead.
++    "MX_WORKER_HOST": lambda: (
++        "" if os.environ.get("MX_POD_INFO_DIR") else os.environ.get("MX_WORKER_HOST", "")
++    ),
++    "MX_POD_INFO_DIR": lambda: os.environ.get("MX_POD_INFO_DIR", ""),
+     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
+     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
+     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
+@@ -416,9 +439,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
+     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
+     "LWS_LEADER_ADDRESS": lambda: os.environ.get("LWS_LEADER_ADDRESS", ""),
+-    "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
+-    "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
+-    "POD_UID": lambda: os.environ.get("POD_UID", ""),
++    "POD_NAMESPACE": lambda: _pod_field("POD_NAMESPACE", "namespace"),
++    "POD_NAME": lambda: _pod_field("POD_NAME", "name"),
++    "POD_UID": lambda: _pod_field("POD_UID", "uid"),
+ }
+ 
+ 
+diff --git a/modelexpress_client/python/tests/test_envs.py b/modelexpress_client/python/tests/test_envs.py
+index be76a5f6..86ad46fc 100644
+--- a/modelexpress_client/python/tests/test_envs.py
++++ b/modelexpress_client/python/tests/test_envs.py
+@@ -169,3 +169,42 @@ def test_dir_lists_registered_names():
+     assert "MX_NIXL_BACKEND" in names
+     assert "VLLM_ATTENTION_BACKEND" in names
+     assert names == sorted(names)
++
++
++def test_pod_identity_from_pod_info_dir(monkeypatch, tmp_path):
++    """MX_POD_INFO_DIR wins over the environment, which describes the pod the
++    process started in, and drops the environment's worker host."""
++    monkeypatch.setenv("POD_NAME", "donor")
++    monkeypatch.setenv("POD_NAMESPACE", "old-ns")
++    monkeypatch.setenv("POD_UID", "donor-uid")
++    monkeypatch.setenv("MX_WORKER_HOST", "10.0.0.1")
++    monkeypatch.delenv("MX_POD_INFO_DIR", raising=False)
++    assert (envs.POD_NAME, envs.POD_NAMESPACE, envs.POD_UID) == ("donor", "old-ns", "donor-uid")
++    assert envs.MX_WORKER_HOST == "10.0.0.1"
++
++    (tmp_path / "name").write_text("restored\n")
++    (tmp_path / "namespace").write_text("serving")
++    (tmp_path / "uid").write_text("restored-uid")
++    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path))
++    assert envs.MX_POD_INFO_DIR == str(tmp_path)
++    assert (envs.POD_NAME, envs.POD_NAMESPACE, envs.POD_UID) == (
++        "restored",
++        "serving",
++        "restored-uid",
++    )
++    assert envs.MX_WORKER_HOST == ""
++
++    (tmp_path / "name").write_text("renamed")
++    assert envs.POD_NAME == "renamed"
++
++
++def test_pod_identity_falls_back_per_missing_file(monkeypatch, tmp_path):
++    """A field missing or empty in MX_POD_INFO_DIR falls back to its variable."""
++    monkeypatch.setenv("POD_NAME", "env-name")
++    monkeypatch.setenv("POD_UID", "env-uid")
++    (tmp_path / "uid").write_text("  ")
++    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path))
++    assert envs.POD_NAME == "env-name"
++    assert envs.POD_UID == "env-uid"
++    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path / "missing"))
++    assert envs.POD_NAME == "env-name"
+-- 
+2.54.0 (Apple Git-157)
+

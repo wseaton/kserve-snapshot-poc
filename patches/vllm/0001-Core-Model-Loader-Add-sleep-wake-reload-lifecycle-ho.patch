@@ -1,0 +1,490 @@
+From 773ab8375a568c25025cc02ac229fe007094d91e Mon Sep 17 00:00:00 2001
+From: Roman Baron <romanb@nvidia.com>
+Date: Thu, 10 Sep 2026 11:03:15 +0300
+Subject: [PATCH 1/2] [Core][Model Loader] Add sleep/wake/reload lifecycle
+ hooks to BaseModelLoader
+
+Signed-off-by: Roman Baron <romanb@nvidia.com>
+---
+ docs/features/sleep_mode.md                   | 10 +++
+ .../model_loader/test_modelexpress_loader.py  | 77 +++++++++++++++++++
+ tests/v1/worker/test_gpu_model_runner.py      |  1 +
+ .../worker/test_kv_cache_allocation_scope.py  |  1 +
+ tests/v1/worker/test_sleep_mode_backend.py    |  1 +
+ vllm/model_executor/model_loader/__init__.py  | 12 ++-
+ .../model_loader/base_loader.py               | 36 +++++++++
+ .../model_loader/modelexpress_loader.py       | 23 ++++++
+ .../model_loader/reload/inplace.py            | 37 ++++++---
+ vllm/v1/worker/gpu/model_runner.py            | 14 +++-
+ vllm/v1/worker/gpu_model_runner.py            |  8 ++
+ vllm/v1/worker/gpu_worker.py                  |  8 ++
+ 12 files changed, 215 insertions(+), 13 deletions(-)
+
+diff --git a/docs/features/sleep_mode.md b/docs/features/sleep_mode.md
+index 8c73dd16a6..120fdc8857 100644
+--- a/docs/features/sleep_mode.md
++++ b/docs/features/sleep_mode.md
+@@ -239,6 +239,16 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
+ !!! note
+     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
+ 
++## Custom model loaders
++
++A custom `BaseModelLoader` can override three optional methods. All are inert by default, so existing loaders are unaffected. See the docstrings on `BaseModelLoader` for the exact contract.
++
++`on_sleep(level)` is called before `Worker.sleep(level)` frees the GPU memory the loader made resident, and `on_wake_up(tags)` is called after `Worker.wake_up(tags)` returns. Together they let a loader pause and resume external state that depends on that memory, such as a loader serving weights to other processes over RDMA directly out of GPU memory. Both are no-ops by default.
++
++What `on_wake_up` can assume about the weights depends on the sleep level. After a level-1 sleep the weights have been restored and are valid. After a level-2 sleep they have been discarded, so `on_wake_up` runs on re-allocated memory with no valid content. The weights only become valid again once the `reload_weights_inplace` call that follows has completed.
++
++`reload_weights_inplace(vllm_config, model_config, model)` lets a loader own the `reload_weights()` step of the level-2 flow above. By default it returns `False` and the runner falls back to `get_all_weights()` + `model.load_weights()`, which requires the loader to expose weights as an iterator of tensors. A loader that writes final weights into the model itself should override it, perform the reload, and return `True`.
++
+ ## Limitation
+ 
+ On ROCm, the virtual memory allocation on ROCm is done through chunked memory allocation. You can control the chunk size through `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE` (in MB). The default value is set at 256MB. The larger the chunk size the faster the performance. However, setting it too large will cause OOM. So if you encounter OOM when using sleep mode. Try reducing the chunk size. It is recommended to define the chunk size as a power of 2.
+diff --git a/tests/model_executor/model_loader/test_modelexpress_loader.py b/tests/model_executor/model_loader/test_modelexpress_loader.py
+index 8c43865b4e..1ba66b8fff 100644
+--- a/tests/model_executor/model_loader/test_modelexpress_loader.py
++++ b/tests/model_executor/model_loader/test_modelexpress_loader.py
+@@ -32,6 +32,32 @@ class FakeModelexpressLoader:
+         self.calls.append(("load_model", args, kwargs))
+         return self.loaded_model
+ 
++    def on_sleep(self, *args, **kwargs):
++        self.calls.append(("on_sleep", args, kwargs))
++
++    def on_wake_up(self, *args, **kwargs):
++        self.calls.append(("on_wake_up", args, kwargs))
++
++    def reload_model(self, *args, **kwargs):
++        self.calls.append(("reload_model", args, kwargs))
++        return kwargs["model"]
++
++
++class FakeModelexpressLoaderWithoutSleepHooks:
++    """Mimics an older modelexpress install that predates on_sleep/on_wake_up."""
++
++    def __init__(self, load_config: LoadConfig):
++        self.load_config = load_config
++
++    def download_model(self, *args, **kwargs):
++        pass
++
++    def load_weights(self, *args, **kwargs):
++        pass
++
++    def load_model(self, *args, **kwargs):
++        pass
++
+ 
+ def _install_fake_modelexpress(monkeypatch):
+     FakeModelexpressLoader.calls = []
+@@ -90,6 +116,57 @@ def test_modelexpress_loader_delegates_to_modelexpress(monkeypatch):
+     ]
+ 
+ 
++def test_modelexpress_loader_delegates_sleep_hooks(monkeypatch):
++    _install_fake_modelexpress(monkeypatch)
++    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
++
++    loader.on_sleep(1)
++    loader.on_wake_up(["weights"])
++
++    assert FakeModelexpressLoader.calls == [
++        ("on_sleep", (1,), {}),
++        ("on_wake_up", (["weights"],), {}),
++    ]
++
++
++def test_modelexpress_loader_tolerates_missing_sleep_hooks(monkeypatch):
++    _install_fake_modelexpress(monkeypatch)
++    module = sys.modules["modelexpress.engines.vllm.loader"]
++    module.__dict__["MxModelLoader"] = FakeModelexpressLoaderWithoutSleepHooks
++    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
++
++    loader.on_sleep(1)
++    loader.on_wake_up(["weights"])
++
++
++def test_modelexpress_loader_reloads_weights_inplace(monkeypatch):
++    _install_fake_modelexpress(monkeypatch)
++    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
++    model = nn.Module()
++    model_config = SimpleNamespace()
++    vllm_config = SimpleNamespace()
++
++    assert loader.reload_weights_inplace(vllm_config, model_config, model)
++    assert FakeModelexpressLoader.calls == [
++        (
++            "reload_model",
++            (),
++            {"vllm_config": vllm_config, "model_config": model_config, "model": model},
++        ),
++    ]
++
++
++def test_modelexpress_loader_without_reload_model_falls_back(monkeypatch):
++    _install_fake_modelexpress(monkeypatch)
++    module = sys.modules["modelexpress.engines.vllm.loader"]
++    module.__dict__["MxModelLoader"] = FakeModelexpressLoaderWithoutSleepHooks
++    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
++
++    assert not loader.reload_weights_inplace(
++        SimpleNamespace(), SimpleNamespace(), nn.Module()
++    )
++
++
+ def test_modelexpress_loader_missing_modelexpress_error(monkeypatch):
+     import importlib
+ 
+diff --git a/tests/v1/worker/test_gpu_model_runner.py b/tests/v1/worker/test_gpu_model_runner.py
+index ecb05e7250..a95b4e3e9f 100644
+--- a/tests/v1/worker/test_gpu_model_runner.py
++++ b/tests/v1/worker/test_gpu_model_runner.py
+@@ -1145,6 +1145,7 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
+     # model_config.model. A new weights_path must replace it, or the loader
+     # silently re-streams the original checkpoint.
+     loader = Mock()
++    loader.reload_weights_inplace.return_value = False
+     loader.get_all_weights.return_value = iter(())
+     monkeypatch.setattr(reload_inplace_module, "get_model_loader", lambda _: loader)
+     monkeypatch.setattr(reload_inplace_module, "start_reload", Mock())
+diff --git a/tests/v1/worker/test_kv_cache_allocation_scope.py b/tests/v1/worker/test_kv_cache_allocation_scope.py
+index 3570d64d90..9248a28825 100644
+--- a/tests/v1/worker/test_kv_cache_allocation_scope.py
++++ b/tests/v1/worker/test_kv_cache_allocation_scope.py
+@@ -138,6 +138,7 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+     class Runner:
+         def __init__(self) -> None:
+             self.model = model
++            self.model_loader = None
+             self.layout_tensors = tuple(torch.tensor([i]) for i in range(5))
+             self.recovery_calls = 0
+ 
+diff --git a/tests/v1/worker/test_sleep_mode_backend.py b/tests/v1/worker/test_sleep_mode_backend.py
+index 34efde6063..892d08036d 100644
+--- a/tests/v1/worker/test_sleep_mode_backend.py
++++ b/tests/v1/worker/test_sleep_mode_backend.py
+@@ -60,6 +60,7 @@ def test_worker_drives_communicator_suspension(monkeypatch, enable_nccl_comm_sus
+     worker.model_runner = SimpleNamespace(extensible_kv_cache=None)
+     worker._sleep_saved_buffers = {}
+     worker._sleep_saved_draft_buffers = {}
++    worker.model_runner = SimpleNamespace(model_loader=None)
+     worker.vllm_config = SimpleNamespace(
+         model_config=SimpleNamespace(enable_nccl_comm_suspend=enable_nccl_comm_suspend)
+     )
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 226caebe1c..642afa6448 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -120,12 +120,17 @@ def register_model_loader(load_format: str):
+     return _wrapper
+ 
+ 
+-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+-    """Get a model loader based on the load format."""
++def get_model_loader_cls(load_config: LoadConfig) -> type[BaseModelLoader]:
++    """Get the model loader class for the load format."""
+     load_format = load_config.load_format
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+-    return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
++    return _LOAD_FORMAT_TO_MODEL_LOADER[load_format]
++
++
++def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
++    """Get a model loader based on the load format."""
++    return get_model_loader_cls(load_config)(load_config)
+ 
+ 
+ def get_model(
+@@ -146,6 +151,7 @@ def get_model(
+ __all__ = [
+     "get_model",
+     "get_model_loader",
++    "get_model_loader_cls",
+     "get_architecture_class_name",
+     "get_model_architecture",
+     "get_model_cls",
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index b2e5e33440..e0eb78f5a6 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -47,6 +47,42 @@ class BaseModelLoader(ABC):
+         inplace weights loading for an already-initialized model"""
+         raise NotImplementedError
+ 
++    def on_sleep(self, level: int) -> None:  # noqa: B027
++        """Called before ``Worker.sleep(level)`` frees GPU memory this
++        loader made resident.
++
++        No-op by default. Override to release or pause any external state
++        that depends on that memory remaining valid before it becomes
++        invalid.
++        """
++
++    def on_wake_up(self, tags: list[str] | None) -> None:  # noqa: B027
++        """Called after ``Worker.wake_up(tags)`` returns.
++
++        No-op by default. Override to resume whatever ``on_sleep`` paused.
++        ``tags`` is the same argument ``wake_up`` was called with. After a
++        level-1 sleep weights are valid here. After a level-2 sleep they are
++        not: they only become valid once the ``reload_weights()`` call that
++        follows, which reaches this loader through
++        :meth:`reload_weights_inplace`, has completed.
++        """
++
++    def reload_weights_inplace(
++        self,
++        vllm_config: VllmConfig,
++        model_config: ModelConfig,
++        model: nn.Module,
++    ) -> bool:
++        """Refresh ``model``'s weights in place from this loader's source.
++
++        Used by ``reload_weights()`` when no weights are provided. After a
++        level-2 sleep this is the point where weights become valid again.
++        Returns ``False`` by default, falling back to ``get_all_weights()`` +
++        ``model.load_weights()``. Override and return ``True`` for loaders
++        that write final weights into the model themselves.
++        """
++        return False
++
+     def create_model(
+         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+     ) -> nn.Module:
+diff --git a/vllm/model_executor/model_loader/modelexpress_loader.py b/vllm/model_executor/model_loader/modelexpress_loader.py
+index 959506925b..beeb772d9d 100644
+--- a/vllm/model_executor/model_loader/modelexpress_loader.py
++++ b/vllm/model_executor/model_loader/modelexpress_loader.py
+@@ -55,6 +55,29 @@ class ModelExpressModelLoader(BaseModelLoader):
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         self._loader.load_weights(model, model_config)
+ 
++    def on_sleep(self, level: int) -> None:
++        if hasattr(self._loader, "on_sleep"):
++            self._loader.on_sleep(level)
++
++    def on_wake_up(self, tags: list[str] | None) -> None:
++        if hasattr(self._loader, "on_wake_up"):
++            self._loader.on_wake_up(tags)
++
++    def reload_weights_inplace(
++        self,
++        vllm_config: VllmConfig,
++        model_config: ModelConfig,
++        model: nn.Module,
++    ) -> bool:
++        if not hasattr(self._loader, "reload_model"):
++            return False
++        self._loader.reload_model(
++            vllm_config=vllm_config,
++            model_config=model_config,
++            model=model,
++        )
++        return True
++
+     @instrument(span_name="Load model")
+     def load_model(
+         self,
+diff --git a/vllm/model_executor/model_loader/reload/inplace.py b/vllm/model_executor/model_loader/reload/inplace.py
+index 4239e81487..c355503793 100644
+--- a/vllm/model_executor/model_loader/reload/inplace.py
++++ b/vllm/model_executor/model_loader/reload/inplace.py
+@@ -9,7 +9,8 @@ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+-from vllm.model_executor.model_loader import get_model_loader
++from vllm.model_executor.model_loader import get_model_loader, get_model_loader_cls
++from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+ 
+ from .lifecycle import finish_reload, start_reload
+ 
+@@ -35,6 +36,7 @@ def reload_weights(
+     weights_iterator: Iterable[tuple[str, torch.Tensor]] | None,
+     weights_path: str | None,
+     is_checkpoint_format: bool,
++    model_loader: BaseModelLoader | None = None,
+ ) -> None:
+     """Reload a model's weights in place from a weights iterator or from disk.
+ 
+@@ -50,6 +52,10 @@ def reload_weights(
+             provided. Use path of original model if neither is provided.
+         is_checkpoint_format: set to False if weights have already been
+             processed into kernel format (repacking, renaming, etc.)
++        model_loader: loader that received the sleep/wake hooks, reused so any
++            state it keeps across them sees the reload too. Ignored if
++            `vllm_config.load_config` now selects a different loader class.
++            Defaults to a new loader for `vllm_config.load_config`.
+ 
+     """
+     # TODO(@kylesayrs): generalize to all runners and loaders
+@@ -70,12 +76,10 @@ def reload_weights(
+     counter_before_reloading = time.perf_counter()
+ 
+     # load weights from disk if none are provided
++    reloaded_by_loader = False
+     if weights_iterator is None:
+-        model_loader = get_model_loader(load_config)
+-        if not hasattr(model_loader, "get_all_weights"):
+-            raise NotImplementedError(
+-                f"Model reloading with `{load_config.load_format}` format"
+-            )
++        if not isinstance(model_loader, get_model_loader_cls(load_config)):
++            model_loader = get_model_loader(load_config)
+ 
+         if weights_path is not None:
+             # The revision and any object-storage `model_weights` source
+@@ -84,12 +88,26 @@ def reload_weights(
+             model_config.model = weights_path
+             model_config.model_weights = ""
+             model_config.revision = None
+-        weights_iterator = model_loader.get_all_weights(model_config, model)
+-        weights_iterator = cast(Iterable[tuple[str, torch.Tensor]], weights_iterator)
++
++        reloaded_by_loader = model_loader.reload_weights_inplace(
++            vllm_config, model_config, model
++        )
++        if not reloaded_by_loader:
++            if not hasattr(model_loader, "get_all_weights"):
++                raise NotImplementedError(
++                    f"Model reloading with `{load_config.load_format}` format"
++                )
++            weights_iterator = model_loader.get_all_weights(model_config, model)
++            weights_iterator = cast(
++                Iterable[tuple[str, torch.Tensor]], weights_iterator
++            )
+ 
+     # begin loading weights
+     logger.info_once("Reloading weights inplace...")
+-    if is_checkpoint_format:
++    if reloaded_by_loader:
++        # The loader validates its own weights.
++        loaded_weights = None
++    elif is_checkpoint_format:
+         # load weights from checkpoint/ original model format
+         device = torch.device(load_config.device or vllm_config.device_config.device)
+         start_reload(model)
+@@ -102,6 +120,7 @@ def reload_weights(
+             "Reloading with `is_checkpoint_format=True` requires that "
+             "weights be in kernel format and already sharded",
+         )
++        assert weights_iterator is not None
+         loaded_weights = set()
+         for name, loaded_weight in weights_iterator:
+             param = get_parameter_for_reload(model, name)  # TODO: buffers?
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5286d9008d..949dfd79f9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -55,6 +55,7 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
+     refresh_quantized_lm_heads,
+ )
+ from vllm.model_executor.model_loader import get_model_loader
++from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+ from vllm.model_executor.model_loader.reload.inplace import reload_weights
+ from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+ from vllm.model_executor.offloader import (
+@@ -207,6 +208,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.compilation_config = vllm_config.compilation_config
+         self.lora_config = vllm_config.lora_config
+         self.load_config = vllm_config.load_config
++        # Set in load_model(). Kept alive (rather than discarded once the
++        # model is constructed) so Worker.sleep/wake_up can notify it of
++        # GPU-memory-validity transitions via the optional on_sleep/on_wake_up
++        # hooks, and so reload_weights() can route through the same loader.
++        self.model_loader: BaseModelLoader | None = None
+         self.parallel_config = vllm_config.parallel_config
+         self.scheduler_config = vllm_config.scheduler_config
+         self.speculative_config = vllm_config.speculative_config
+@@ -401,6 +407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         eplb_models_added = False
+         with DeviceMemoryProfiler() as m:
+             model_loader = get_model_loader(self.vllm_config.load_config)
++            self.model_loader = model_loader
+             logger.info_once("Loading model from scratch...")
+ 
+             # Capture warmup providers selected while constructing the model.
+@@ -614,7 +621,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         vllm_config = self.vllm_config
+         model = self.get_model()
+         reload_weights(
+-            vllm_config, model, weights_iterator, weights_path, is_checkpoint_format
++            vllm_config,
++            model,
++            weights_iterator,
++            weights_path,
++            is_checkpoint_format,
++            model_loader=self.model_loader,
+         )
+         self.reset_lora_state()
+         self.reset_encoder_cache()
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index c2de73d98d..02d0ba614b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -66,6 +66,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+ )
+ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+ from vllm.model_executor.model_loader import get_model_loader
++from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+ from vllm.model_executor.model_loader.reload.inplace import reload_weights
+ from vllm.model_executor.models.interfaces import (
+     MixtureOfExperts,
+@@ -496,6 +497,11 @@ class GPUModelRunner(
+         self.compilation_config = vllm_config.compilation_config
+         self.lora_config = vllm_config.lora_config
+         self.load_config = vllm_config.load_config
++        # Set in load_model(). Kept alive (rather than discarded once the
++        # model is constructed) so Worker.sleep/wake_up can notify it of
++        # GPU-memory-validity transitions via the optional on_sleep/on_wake_up
++        # hooks, and so reload_weights() can route through the same loader.
++        self.model_loader: BaseModelLoader | None = None
+         self.parallel_config = vllm_config.parallel_config
+         self.scheduler_config = vllm_config.scheduler_config
+         self.speculative_config = vllm_config.speculative_config
+@@ -5087,6 +5093,7 @@ class GPUModelRunner(
+                 if model is None and load_dummy_weights:
+                     self.load_config.load_format = "dummy"
+                 model_loader = get_model_loader(self.load_config)
++                self.model_loader = model_loader
+                 # Capture warmup providers selected while constructing the model.
+                 with self.jit_warmup_registry.activate():  # type: ignore[attr-defined]
+                     self.model = model or model_loader.load_model(
+@@ -5333,6 +5340,7 @@ class GPUModelRunner(
+             weights_iterator=weights_iterator,
+             weights_path=weights_path,
+             is_checkpoint_format=is_checkpoint_format,
++            model_loader=self.model_loader,
+         )
+         self.reset_lora_state()
+         self.reset_encoder_cache()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 30d09e5621..1977ace55f 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -330,6 +330,10 @@ class Worker(WorkerBase):
+         self._sleep_saved_parameters.clear()
+ 
+     def sleep(self, level: int = 1) -> None:
++        loader = self.model_runner.model_loader
++        if loader is not None:
++            loader.on_sleep(level)
++
+         torch.accelerator.synchronize()
+         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
+ 
+@@ -407,6 +411,10 @@ class Worker(WorkerBase):
+ 
+         self.synchronize_device()
+ 
++        loader = self.model_runner.model_loader
++        if loader is not None:
++            loader.on_wake_up(tags)
++
+     def discard(self, tags: tuple[str, ...]) -> None:
+         if has_kv_transfer_group() and "kv_cache" in tags:
+             get_kv_transfer_group().unregister_kv_caches()
+-- 
+2.54.0 (Apple Git-157)
+
