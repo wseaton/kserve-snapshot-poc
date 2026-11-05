@@ -16,6 +16,8 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 | [`patches/vllm/`](patches/vllm) | vLLM changes on `a2bcb565` (a nightly that includes the checkpoint lifecycle from [vllm-project/vllm#62570](https://github.com/vllm-project/vllm/pull/62570)). |
 | [`patches/modelexpress/`](patches/modelexpress) | ModelExpress changes on `main` (`8b2e8787`), which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854). |
 | [`patches/dynamo-snapshot/`](patches/dynamo-snapshot) | Dynamo Snapshot agent changes on `bc9d216` for CoreWeave's GPU device plugin. |
+| [`DESIGN.md`](DESIGN.md) | A Rust node daemon in place of Dynamo Snapshot, and the TP=2 experiments behind it. |
+| [`experiments/`](experiments) | Scripts for those experiments. |
 | [`upstream.tsv`](upstream.tsv) | Each project's upstream repository, base commit and fork branch. |
 | [`checkout.sh`](checkout.sh) | `./checkout.sh vllm` clones a project at its base commit into `src/` and applies its patches. |
 
@@ -29,6 +31,9 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
   checkpoint does not contain them, and `/checkpoint/restore` wakes them and reloads them through
   the model loader before the KV cache. Upstream #62570 keeps the weights in GPU memory, and so in
   the checkpoint.
+- `0003`: `/checkpoint/prepare` suspends the NCCL communicator and `/checkpoint/restore` resumes
+  it, so at TP>1 with custom all-reduce off no CUDA memory is shared between workers when the
+  process is checkpointed, and cuda-checkpoint alone restores them.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
@@ -39,6 +44,8 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 **Dynamo Snapshot**
 - `0001`: accept CoreWeave's volume-mounts `NVIDIA_VISIBLE_DEVICES`, skip the per-GPU device-list
   marker mounts at dump, and log every CRIU error line on a failed restore.
+- `0002`: expose cuInterpose's coordinator as a library, so a node agent can run its phases
+  in-process. Proposed for upstream; see [DESIGN.md](DESIGN.md).
 
 ## How a scale-out works
 
