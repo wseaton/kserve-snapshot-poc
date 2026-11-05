@@ -91,12 +91,55 @@ shared unicast memory cuInterpose had to re-import.
 
 The scripts and pod spec for these runs are in [`experiments/tp2-shared-memory`](experiments/tp2-shared-memory).
 
+### Through CRIU, and onto other GPUs
+
+The in-place runs leave the processes alive. These dump the whole vLLM tree with CRIU (Dynamo's
+bundled CRIU 4.2.1, its CUDA plugin disabled), restore it into a fresh network namespace in the same
+privileged pod, then run the CUDA restore, either onto the same two GPUs or remapped onto two other
+GPUs through `CUcheckpointGpuPair`, then `/checkpoint/restore`. TP=2, the nightly image, patch
+0003, custom all-reduce off, no cuInterpose. The dump is about 6 s and 9 to 13 GB of host memory,
+and the CRIU restore about 1.5 s.
+
+| GPUs after restore | NCCL transport | Graphs | FlashInfer all-reduce | Result |
+| --- | --- | --- | --- | --- |
+| same | cuMem P2P, suspended | off | `trtllm` | token-identical |
+| other | cuMem P2P, suspended | off | `trtllm` | workspace rebuild fails in `cuMemCreate`: `CUDA_ERROR_NOT_INITIALIZED` |
+| other | cuMem P2P, suspended | off | off | restores and reloads weights; first forward `CUDA_ERROR_ILLEGAL_ADDRESS` |
+| other, 13.1 driver | cuMem P2P, suspended | off | off | same illegal address |
+| other | legacy IPC P2P (`NCCL_CUMEM_ENABLE=0`) | off | off | `cuCheckpointProcessRestore`: `CUDA_ERROR_INVALID_VALUE` on both workers; suspend does not release legacy IPC buffers |
+| other | host shared memory (`NCCL_P2P_DISABLE=1`, cuMem off) | off | off | token-identical |
+| other | host shared memory | on, fusion off | off | token-identical |
+| other | host shared memory | on, allreduce-RMS fusion on | fused workspace | workspace rebuild fails: `CUDA_ERROR_NOT_INITIALIZED` |
+
+Three things broke on the move to other GPUs, and none of them is cuInterpose's business:
+
+- `ncclCommResume` re-maps cuMem peer buffers but leaves the communicator pointing at memory that
+  faults once a kernel uses it, on both drivers. snapshot-orchestrator saw the same class of failure
+  with fresh cuMem communicators after migration, and avoided it by destroying NCCL at checkpoint and
+  creating a new communicator over legacy IPC after restore.
+- FlashInfer's all-reduce workspaces are rebuilt through `cuda-python`, which returns
+  `CUDA_ERROR_NOT_INITIALIZED` after the device remap. This is the standalone FlashInfer
+  all-reduce and the workspace the allreduce-RMS compile fusion creates.
+- Legacy IPC buffers survive `ncclCommSuspend`.
+
+The PIDs of the dumped tree must be free at restore, and the source's loopback sockets must be gone,
+which a new pod provides. The vLLM API server opens an `io_uring` through uvloop's libuv even with
+`UV_USE_IO_URING=0`, and CRIU cannot dump it, so the workload needs `io_uring_setup` blocked, as
+Dynamo's `block-iouring` seccomp profile does. The experiment installs the same filter before
+exec'ing vLLM.
+
 ### What this means for the design
 
-- With vLLM releasing its communicators, TP>1 on one node needs no cuInterpose: prepare, then the
-  ordered lock-all, checkpoint-all, restore-all, unlock-all sequence. The pod contract requires
-  `--disable-custom-all-reduce`, and either the 13.1+ user-mode driver or
-  `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm` when the allreduce-RMS fusion is on.
+- With vLLM releasing its communicators, TP>1 on one node needs no cuInterpose when the restore
+  lands on the source's GPUs: prepare, then the ordered lock-all, checkpoint-all, restore-all,
+  unlock-all sequence. The pod contract requires `--disable-custom-all-reduce`, and either the 13.1+
+  user-mode driver or `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm` when the allreduce-RMS fusion is on.
+- A scale-out restore almost never lands on the source's GPUs. Without cuInterpose that works today
+  only with NCCL over host shared memory and FlashInfer all-reduce off, which costs all-reduce
+  bandwidth (not measured yet). The fix belongs in vLLM: tear the NCCL communicator down at prepare
+  and create a new one at restore, as snapshot-orchestrator's worker extension did, and rebuild the
+  FlashInfer workspaces through the device remap. Until then, cuInterpose with the 13.1 driver is the
+  way to keep NVLink P2P across a GPU move; the earlier Dynamo TP=2 and TP=8 cross-node runs did that.
 - cuInterpose stays as a fallback for workloads that still share memory at checkpoint time: custom
   all-reduce, symmetric memory, NVLS, or engines without a checkpoint lifecycle. The daemon decides
   at checkpoint time by inspecting, not by configuration.
@@ -296,16 +339,19 @@ inspection client; the Rust module has unit tests only.
 
 | Change | Where | State |
 | --- | --- | --- |
-| Suspend NCCL in `checkpoint_prepare`, resume in `checkpoint_restore` | vLLM, `patches/vllm/0003` | tested at TP=2 in place |
+| Suspend NCCL in `checkpoint_prepare`, resume in `checkpoint_restore` | vLLM, `patches/vllm/0003` | tested at TP=2, in place and through CRIU onto the same GPUs |
 | Release custom all-reduce IPC buffers in `checkpoint_prepare` and re-register them in `checkpoint_restore` | vLLM | not started; removes `--disable-custom-all-reduce` |
+| Destroy the NCCL communicator at prepare and create a new one at restore, instead of suspending it | vLLM | not started; needed for P2P across a GPU move |
+| Rebuild FlashInfer all-reduce workspaces after a device remap | FlashInfer, vLLM | not started; `cuda-python` returns `CUDA_ERROR_NOT_INITIALIZED` |
 | Expose the cuInterpose coordinator as a library | ai-dynamo/snapshot, `patches/dynamo-snapshot/0002` | builds, clippy clean, existing tests pass |
 | Accept CoreWeave's volume-mounts device strategy | ai-dynamo/snapshot, `patches/dynamo-snapshot/0001` | in use |
 
 ## Open questions
 
-- The experiments restored in place. Restoring into a new pod through CRIU at TP=2 without
-  cuInterpose, across GPUs, is next; snapshot-orchestrator did it on vLLM 0.25.1 with NCCL torn down
-  rather than suspended, and with `NCCL_CUMEM_ENABLE=0`, which this path does not use.
+- The CRIU runs restored into a fresh network namespace in the same pod, not into a new pod; the
+  mount, cgroup and device-node handling of a real cross-pod restore is the daemon port above.
+- NCCL over host shared memory versus NVLink P2P at TP=2 and TP=8: the decode latency cost decides
+  whether the shared-memory path is acceptable until vLLM recreates the communicator.
 - Multi-node TP needs IB verbs released at prepare; NCCL's IB plugin leaves an `uverbs` mapping
   that CRIU cannot dump. Out of scope here, as in snapshot-orchestrator.
 - Whether NVIDIA would take the coordinator split, and whether cuInterpose's control socket should
