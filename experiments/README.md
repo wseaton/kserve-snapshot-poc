@@ -64,3 +64,17 @@ A=(--disable-custom-all-reduce --max-model-len 4096 --kv-cache-memory-bytes 1G
 /exp/restore-bench.sh defer128 "${A[@]}" --kv-offloading-size 128 --checkpoint-release-kv-offload
 GHOST_LIMIT=160G /exp/restore-bench.sh keep128 "${A[@]}" --kv-offloading-size 128
 ```
+
+The comparison rows in BENCHMARKS.md, with `TP=2` and `TP=4`:
+
+```bash
+export MODEL=/models/Qwen3-8B TP=4 REMAP=rotate
+B=(--max-model-len 4096 --gpu-memory-utilization 0.6)
+MODE=cuinterpose COMPAT=/compat/usr/local/cuda-13.1/compat CUDA_TOOL=helper \
+  /exp/restore-bench.sh dynamo "${B[@]}"
+OVERLAY=/exp/overlay.tgz NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 \
+  /exp/restore-bench.sh ours "${B[@]}" --disable-custom-all-reduce \
+  --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'
+```
+
+Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM in the pod.

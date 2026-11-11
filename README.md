@@ -17,6 +17,7 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 | [`patches/modelexpress/`](patches/modelexpress) | ModelExpress changes on `main` (`8b2e8787`), which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854). |
 | [`patches/dynamo-snapshot/`](patches/dynamo-snapshot) | Dynamo Snapshot agent changes on `bc9d216` for CoreWeave's GPU device plugin. |
 | [`DESIGN.md`](DESIGN.md) | A Rust node daemon in place of Dynamo Snapshot, and the TP=2 experiments behind it. |
+| [`BENCHMARKS.md`](BENCHMARKS.md) | Cold boot against restore at TP=2 and TP=4, `snapshotd` against Dynamo's CUDA path, and CPU KV offload kept or deferred. |
 | [`daemon/`](daemon) | `snapshotd`, the Rust node path so far: CUDA checkpoint through the driver API with GPU remap, and the cuInterpose integration. |
 | [`experiments/`](experiments) | Scripts and pod specs for the experiments in DESIGN.md. |
 | [`upstream.tsv`](upstream.tsv) | Each project's upstream repository, base commit and fork branch. |
