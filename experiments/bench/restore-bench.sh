@@ -8,6 +8,10 @@
 #   TP           tensor parallel size (default 8)
 #   MODE         plain: cuda-checkpoint only; cuinterpose: preload cuInterpose and run its
 #                prepare and restore phases around the CUDA checkpoint (default plain)
+#   CUDA_TOOL    snapshotd: one process drives the driver API, all PIDs in parallel; helper:
+#                Dynamo's cuda-checkpoint-helper, one run for each PID and action, in the order
+#                its agent uses (default snapshotd)
+#   COMPAT       directory of a newer libcuda to put first on vLLM's library path, if set
 #   REMAP        0: restore onto the same GPUs; rotate: restore rank i onto rank i+1's GPU (default 0)
 #   CKPT_DIR     where the CRIU images go (default /work/<tag>/img)
 #   SNAPSHOTD    snapshotd binary (default /models/bin/snapshotd)
@@ -20,7 +24,7 @@
 # sees every GPU on the node, so the GPUs to use come from the kubelet's device checkpoint.
 set -u
 TAG=$1; shift
-: "${MODEL:?}" "${TP:=8}" "${MODE:=plain}" "${REMAP:=0}"
+: "${MODEL:?}" "${TP:=8}" "${MODE:=plain}" "${REMAP:=0}" "${CUDA_TOOL:=snapshotd}"
 W=/work/$TAG; rm -rf "$W"; mkdir -p "$W" /work/empty; cd "$W" || exit 1
 IMG=${CKPT_DIR:-$W/img}; rm -rf "$IMG"; mkdir -p "$IMG"
 SD=${SNAPSHOTD:-/models/bin/snapshotd}
@@ -33,13 +37,14 @@ secs() { python3 -c "print(round(($(now) - $1) / 1e9, 3))"; }
 declare -A R
 fail() { R[result]=$1; report; killall9; exit 1; }
 report() {
-  local out="{\"tag\": \"$TAG\", \"mode\": \"$MODE\", \"tp\": $TP, \"remap\": \"$REMAP\""
+  local out="{\"tag\": \"$TAG\", \"mode\": \"$MODE\", \"cuda_tool\": \"$CUDA_TOOL\", \"tp\": $TP, \"remap\": \"$REMAP\""
   for k in "${!R[@]}"; do out+=", \"$k\": \"${R[$k]}\""; done
   echo "RESULT $out}"
 }
 tree() { local p=$1; echo "$p"; for t in /proc/"$p"/task/*; do for c in $(cat "$t"/children 2>/dev/null); do tree "$c"; done; done; }
 PIDS=; VP=
-killall9() { for p in $( [ -n "$VP" ] && tree "$VP") $PIDS; do kill -9 "$p" 2>/dev/null; done; sleep 5; }
+killall9() { for p in $( [ -n "$VP" ] && tree "$VP") $PIDS; do kill -9 "$p" 2>/dev/null; done
+  for _ in $(seq 120); do pgrep -f "VLLM::" >/dev/null || break; sleep 1; done; sleep 5; }
 complete() { ${NETNS:-} curl -s -m 600 localhost:8000/v1/completions -H 'content-type: application/json' \
   -d '{"model":"m","prompt":"The capital of France is","max_tokens":32,"temperature":0}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["text"])'; }
@@ -65,6 +70,15 @@ export NCCL_NVLS_ENABLE=0 NCCL_IB_DISABLE=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_U
   VLLM_WORKER_MULTIPROC_METHOD=spawn GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo VLLM_HOST_IP=127.0.0.1
 
 LAUNCH=(python3 /exp/noiouring.py)
+[ -n "${COMPAT:-}" ] && LAUNCH+=(env "LD_LIBRARY_PATH=$COMPAT:$LD_LIBRARY_PATH")
+helper() { local action=$1; shift; for p in $PIDS; do $B/cuda-checkpoint-helper --action "$action" --pid "$p" "$@" || return 1; done; }
+cuda_checkpoint() {
+  if [ "$CUDA_TOOL" = helper ]; then helper lock && helper checkpoint; else $SD cuda checkpoint $PIDS; fi
+}
+cuda_restore() {
+  if [ "$CUDA_TOOL" != helper ]; then $SD cuda restore "${GPUS[@]}" $PIDS; return; fi
+  helper restore ${DEVICE_MAP:+--device-map "$DEVICE_MAP"} && helper unlock
+}
 if [ "$MODE" = cuinterpose ]; then
   mkdir -p $BUNDLE && cp $B/snapshot-cuda/libcuinterpose.so $B/snapshot-cuda/libcuinterpose_core.so $B/cuinterpose-coordinator $BUNDLE/
   rm -f /tmp/cuinterpose-*.sock
@@ -101,7 +115,7 @@ if [ "$MODE" = cuinterpose ]; then
   $SD cuinterpose prepare --bundle-dir $BUNDLE --checkpoint-dir "$IMG" $PIDS | tee cuinterpose-prepare.log || fail CUINTERPOSE_PREPARE_FAILED
   R[cuinterpose_prepare_s]=$(secs "$T")
 fi
-T=$(now); $SD cuda checkpoint $PIDS || fail CUDA_CHECKPOINT_FAILED; R[cuda_checkpoint_s]=$(secs "$T")
+T=$(now); cuda_checkpoint || fail CUDA_CHECKPOINT_FAILED; R[cuda_checkpoint_s]=$(secs "$T")
 T=$(now)
 LD_LIBRARY_PATH=$B/lib $B/criu dump -t $VP -D "$IMG" -L /work/empty --tcp-established --ext-unix-sk --file-locks \
   --link-remap --ghost-limit "${GHOST_LIMIT:-1G}" -v4 -o dump.log || { grep Error "$IMG/dump.log" | tail -10; fail CRIU_DUMP_FAILED; }
@@ -114,12 +128,16 @@ unshare --net bash -c "LD_LIBRARY_PATH=$B/lib $B/ip link set lo up && LD_LIBRARY
   --pidfile $W/restored.pid -v4 -o restore.log" || { grep Error "$IMG/restore.log" | tail -10; fail CRIU_RESTORE_FAILED; }
 R[criu_restore_s]=$(secs "$T")
 NETNS="nsenter --net=/proc/$(cat "$W/restored.pid")/ns/net"
-GPUS=()
+GPUS=(); DEVICE_MAP=
 if [ "$REMAP" = rotate ]; then
   TGT=("${SRC[@]:1}" "${SRC[0]}")
+  for u in "${ALL[@]}"; do
+    t=$u; for i in "${!SRC[@]}"; do [ "${SRC[$i]}" = "$u" ] && t=${TGT[$i]}; done
+    DEVICE_MAP+=${DEVICE_MAP:+,}$u=$t
+  done
   GPUS=(--source "$(IFS=,; echo "${SRC[*]}")" --target "$(IFS=,; echo "${TGT[*]}")" --visible "$(IFS=,; echo "${ALL[*]}")")
 fi
-T=$(now); $SD cuda restore "${GPUS[@]}" $PIDS || fail CUDA_RESTORE_FAILED; R[cuda_restore_s]=$(secs "$T")
+T=$(now); cuda_restore || fail CUDA_RESTORE_FAILED; R[cuda_restore_s]=$(secs "$T")
 if [ "$MODE" = cuinterpose ]; then
   T=$(now)
   $NETNS $SD cuinterpose restore --bundle-dir $BUNDLE --checkpoint-dir "$IMG" || fail CUINTERPOSE_RESTORE_FAILED

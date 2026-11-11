@@ -20,11 +20,10 @@
 //! coordinator binary, which validates the cross-process topology.
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use cuinterpose_protocol::{NamespacePid, Record, Reply, Request, Response};
@@ -37,23 +36,22 @@ const LIBRARIES: [&str; 2] = [FRONTEND_LIBRARY, CORE_LIBRARY];
 const COORDINATOR: &str = "cuinterpose-coordinator";
 const MANIFEST_FILE: &str = "cuinterpose.json";
 const STATE_FILE: &str = "cuinterpose.state";
-const COORDINATOR_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Where the cuInterpose bundle and the workload's control sockets live, as
 /// seen from inside the workload's mount namespace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, clap::Args)]
 pub struct Config {
+    /// Directory holding the cuInterpose libraries and coordinator.
+    #[arg(long)]
     pub bundle_dir: PathBuf,
+    /// Directory holding the processes' control sockets.
+    #[arg(long, default_value = "/tmp")]
     pub socket_dir: PathBuf,
 }
 
 impl Config {
     fn library(&self, name: &str) -> PathBuf {
         self.bundle_dir.join(name)
-    }
-
-    fn socket(&self, pid: NamespacePid) -> PathBuf {
-        cuinterpose_protocol::socket_path(&self.socket_dir, pid)
     }
 }
 
@@ -229,8 +227,8 @@ fn parse_namespace_pid(status: &str) -> Option<NamespacePid> {
 }
 
 /// Ask one participant for the CUDA memory it tracks.
-pub fn inspect(config: &Config, pid: NamespacePid) -> Result<Vec<Record>> {
-    let endpoint = config.socket(pid);
+pub fn inspect(socket_dir: &Path, pid: NamespacePid) -> Result<Vec<Record>> {
+    let endpoint = cuinterpose_protocol::socket_path(socket_dir, pid);
     let socket = cuinterpose_protocol::connect(&endpoint, cuinterpose_protocol::control_timeout())
         .with_context(|| format!("connect {}", endpoint.display()))?;
     socket.set_read_timeout(Some(cuinterpose_protocol::control_timeout()))?;
@@ -269,7 +267,8 @@ pub struct Sharing {
 
 impl Sharing {
     pub fn of(records: &[Record]) -> Self {
-        records.iter().fold(Self::default(), |mut sharing, record| {
+        let mut sharing = Self::default();
+        for record in records {
             match record {
                 Record::Allocation {
                     shared: true, size, ..
@@ -280,8 +279,8 @@ impl Sharing {
                 Record::Multicast { .. } => sharing.multicast_objects += 1,
                 _ => {}
             }
-            sharing
-        })
+        }
+        sharing
     }
 
     pub fn is_empty(&self) -> bool {
@@ -307,28 +306,27 @@ pub fn prepare_checkpoint(
     ckpt_dir: &Path,
     cuda_pids: &[i32],
 ) -> Result<SharedMemory> {
-    let mut participants = Vec::new();
-    let mut total = Sharing::default();
+    let mut host_pids = Vec::new();
+    let mut namespace_pids = Vec::new();
+    let mut shared = false;
     for &pid in cuda_pids {
         let namespace_pid = namespace_pid(pid)?;
-        if !config.socket(namespace_pid).exists() {
+        if !cuinterpose_protocol::socket_path(&config.socket_dir, namespace_pid).exists() {
             continue;
         }
-        let sharing = Sharing::of(&inspect(config, namespace_pid)?);
+        let sharing = Sharing::of(&inspect(&config.socket_dir, namespace_pid)?);
         println!("cuinterpose pid {pid} (ns {namespace_pid}): {sharing:?}");
-        total.shared_allocations += sharing.shared_allocations;
-        total.shared_bytes += sharing.shared_bytes;
-        total.multicast_objects += sharing.multicast_objects;
-        participants.push((pid, namespace_pid));
+        shared |= !sharing.is_empty();
+        host_pids.push(pid);
+        namespace_pids.push(namespace_pid);
     }
-    if total.is_empty() {
+    if !shared {
         return Ok(SharedMemory::NotShared);
     }
-    let host_pids: Vec<i32> = participants.iter().map(|(pid, _)| *pid).collect();
     check_loaded_libraries(config, &host_pids)?;
     let manifest = Manifest {
         libraries: hash_libraries(config)?,
-        pids: participants.iter().map(|(_, pid)| *pid).collect(),
+        pids: namespace_pids,
     };
     manifest.save(ckpt_dir)?;
     run_coordinator(config, "--prepare", ckpt_dir, &manifest.pids)?;
@@ -358,39 +356,19 @@ fn run_coordinator(
         .arg("--checkpoint-dir")
         .arg(ckpt_dir)
         .arg("--socket-dir")
-        .arg(&config.socket_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(&config.socket_dir);
     for pid in pids {
         command.arg("--process").arg(pid.to_string());
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", binary.display()))?;
-    let deadline = Instant::now() + COORDINATOR_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "{} {action} timed out after {COORDINATOR_TIMEOUT:?}",
-                binary.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let output = command
+        .output()
+        .with_context(|| format!("run {}", binary.display()))?;
     ensure!(
-        status.success(),
-        "{} {action} exited with {status}: {}",
+        output.status.success(),
+        "{} {action} exited with {}: {}",
         binary.display(),
-        stderr.trim()
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
 }

@@ -18,7 +18,7 @@ use std::fs;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{
     CUcheckpointGpuPair, CUcheckpointLockArgs, CUcheckpointRestoreArgs, CUprocessState, CUresult,
     CUuuid,
@@ -260,40 +260,19 @@ impl GpuMap {
         if source == target {
             return Ok(Self::default());
         }
-        let mut freed: Vec<GpuUuid> = source
-            .iter()
-            .filter(|g| !target.contains(g))
-            .copied()
-            .collect();
-        freed.sort();
-        let mut displaced: Vec<GpuUuid> = target
-            .iter()
-            .filter(|g| !source.contains(g))
-            .copied()
-            .collect();
-        displaced.sort();
         let mut pairs: Vec<(GpuUuid, GpuUuid)> =
             source.iter().copied().zip(target.iter().copied()).collect();
-        pairs.extend(displaced.into_iter().zip(freed));
-        for &gpu in visible {
-            if !pairs.iter().any(|(old, _)| *old == gpu) {
-                pairs.push((gpu, gpu));
-            }
-        }
+        let (unmoved, displaced): (Vec<GpuUuid>, Vec<GpuUuid>) = visible_set
+            .iter()
+            .filter(|gpu| !source.contains(gpu))
+            .partition(|gpu| !target.contains(gpu));
+        let freed = visible_set
+            .iter()
+            .filter(|gpu| source.contains(gpu) && !target.contains(gpu));
+        pairs.extend(displaced.into_iter().zip(freed.copied()));
+        pairs.extend(unmoved.into_iter().map(|gpu| (gpu, gpu)));
         pairs.sort();
-        let map = Self(pairs);
-        map.validate(visible)?;
-        Ok(map)
-    }
-
-    fn validate(&self, visible: &[GpuUuid]) -> Result<()> {
-        let olds: BTreeSet<_> = self.0.iter().map(|(old, _)| *old).collect();
-        let news: BTreeSet<_> = self.0.iter().map(|(_, new)| *new).collect();
-        let visible: BTreeSet<_> = visible.iter().copied().collect();
-        if olds != visible || news != visible || self.0.len() != visible.len() {
-            bail!("GPU map is not a bijection over the visible GPUs");
-        }
-        Ok(())
+        Ok(Self(pairs))
     }
 
     fn pairs(&self) -> impl Iterator<Item = CUcheckpointGpuPair> + '_ {

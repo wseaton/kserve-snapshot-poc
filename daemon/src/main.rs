@@ -8,7 +8,7 @@ mod cuinterpose;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::cuda::{Driver, GpuMap, GpuUuid};
@@ -46,7 +46,7 @@ enum CudaCommand {
     /// Restore every process, onto other GPUs if given, then unlock every process.
     Restore {
         /// GPUs the checkpoint ran on, in order.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', requires = "visible")]
         source: Vec<GpuUuid>,
         /// GPUs to restore onto, in the same order.
         #[arg(long, value_delimiter = ',')]
@@ -72,70 +72,62 @@ enum CuinterposeCommand {
     /// checkpoint and unmap it. The processes cannot resume afterwards.
     Prepare {
         #[command(flatten)]
-        paths: CuinterposePaths,
+        config: cuinterpose::Config,
+        #[arg(long)]
+        checkpoint_dir: PathBuf,
         #[arg(required = true)]
         pids: Vec<i32>,
     },
     /// Re-import the shared memory a checkpoint saved, after CUDA restore.
     Restore {
         #[command(flatten)]
-        paths: CuinterposePaths,
+        config: cuinterpose::Config,
+        #[arg(long)]
+        checkpoint_dir: PathBuf,
     },
-}
-
-#[derive(clap::Args)]
-struct CuinterposePaths {
-    #[arg(long)]
-    bundle_dir: PathBuf,
-    #[arg(long, default_value = "/tmp")]
-    socket_dir: PathBuf,
-    #[arg(long)]
-    checkpoint_dir: PathBuf,
-}
-
-impl CuinterposePaths {
-    fn config(&self) -> cuinterpose::Config {
-        cuinterpose::Config {
-            bundle_dir: self.bundle_dir.clone(),
-            socket_dir: self.socket_dir.clone(),
-        }
-    }
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Cuda(command) => cuda_command(command),
-        Command::Cuinterpose(CuinterposeCommand::Prepare { paths, pids }) => {
-            let shared =
-                cuinterpose::prepare_checkpoint(&paths.config(), &paths.checkpoint_dir, &pids)?;
-            println!("{shared:?}");
-            Ok(())
-        }
-        Command::Cuinterpose(CuinterposeCommand::Restore { paths }) => {
-            match cuinterpose::Manifest::load(&paths.checkpoint_dir)? {
-                None => println!("no shared CUDA memory in the checkpoint"),
-                Some(manifest) => {
-                    manifest.verify_libraries(&paths.config())?;
-                    cuinterpose::restore(&paths.config(), &paths.checkpoint_dir, &manifest)?;
-                }
-            }
-            Ok(())
-        }
-        Command::Cuinterpose(CuinterposeCommand::Inspect {
+        Command::Cuinterpose(command) => cuinterpose_command(command),
+    }
+}
+
+fn cuinterpose_command(command: CuinterposeCommand) -> Result<()> {
+    match command {
+        CuinterposeCommand::Inspect {
             socket_dir,
             namespace_pids,
-        }) => {
-            let config = cuinterpose::Config {
-                bundle_dir: PathBuf::new(),
-                socket_dir,
-            };
+        } => {
             for pid in namespace_pids {
-                let sharing = cuinterpose::Sharing::of(&cuinterpose::inspect(&config, pid)?);
+                let sharing = cuinterpose::Sharing::of(&cuinterpose::inspect(&socket_dir, pid)?);
                 println!("{pid}: {sharing:?}");
             }
-            Ok(())
         }
+        CuinterposeCommand::Prepare {
+            config,
+            checkpoint_dir,
+            pids,
+        } => match cuinterpose::prepare_checkpoint(&config, &checkpoint_dir, &pids)? {
+            cuinterpose::SharedMemory::NotShared => println!("no shared CUDA memory"),
+            cuinterpose::SharedMemory::Prepared(manifest) => println!(
+                "saved the shared CUDA memory of {} processes",
+                manifest.pids.len()
+            ),
+        },
+        CuinterposeCommand::Restore {
+            config,
+            checkpoint_dir,
+        } => match cuinterpose::Manifest::load(&checkpoint_dir)? {
+            None => println!("no shared CUDA memory in the checkpoint"),
+            Some(manifest) => {
+                manifest.verify_libraries(&config)?;
+                cuinterpose::restore(&config, &checkpoint_dir, &manifest)?;
+            }
+        },
     }
+    Ok(())
 }
 
 fn cuda_command(command: CudaCommand) -> Result<()> {
@@ -164,15 +156,7 @@ fn cuda_command(command: CudaCommand) -> Result<()> {
             visible,
             pids,
         } => {
-            let map = if source.is_empty() && target.is_empty() {
-                GpuMap::default()
-            } else {
-                ensure!(
-                    !visible.is_empty(),
-                    "--visible is required with --source and --target"
-                );
-                GpuMap::new(&source, &target, &visible)?
-            };
+            let map = GpuMap::new(&source, &target, &visible)?;
             if !map.is_identity() {
                 println!("remap {map}");
             }
