@@ -17,6 +17,7 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 | [`patches/modelexpress/`](patches/modelexpress) | ModelExpress changes on `main` (`8b2e8787`), which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854). |
 | [`patches/dynamo-snapshot/`](patches/dynamo-snapshot) | Dynamo Snapshot agent changes on `bc9d216` for CoreWeave's GPU device plugin. |
 | [`DESIGN.md`](DESIGN.md) | A Rust node daemon in place of Dynamo Snapshot, and the TP=2 experiments behind it. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | What KServe has to lifecycle for snapshot scale-out, with diagrams, and the boundary a different snapshot engine would plug into. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | Cold boot against restore at TP=2 and TP=4, `snapshotd` against Dynamo's CUDA path, and CPU KV offload kept or deferred. |
 | [`daemon/`](daemon) | `snapshotd`, the Rust node path so far: CUDA checkpoint through the driver API with GPU remap, and the cuInterpose integration. |
 | [`experiments/`](experiments) | Scripts and pod specs for the experiments in DESIGN.md. |
@@ -63,6 +64,45 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
    `/checkpoint/restore`. vLLM rebuilds the communicators and reloads the weights through
    ModelExpress, which pulls them from a running replica over RDMA, or from disk when there is
    none, and publishes the replica as a source for the next one.
+
+## Results
+
+Qwen3-8B on 8x H200 nodes, weights left out of the checkpoint and reloaded from a network volume,
+the restored server checked against the source with a greedy completion. Full tables, setup and
+caveats are in [BENCHMARKS.md](BENCHMARKS.md).
+
+Node path only, one pod, restored onto other GPUs (mean of two runs):
+
+| TP | Configuration | CUDA tool | CUDA checkpoint | Image | Restore | Cold boot |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2 | cuInterpose, CUDA 13.1 `libcuda` | Dynamo helper | 2.0 s | 11.0 GB | 7.4 s | 46.3 s |
+| 2 | cuInterpose, CUDA 13.1 `libcuda` | `snapshotd` | 1.5 s | 11.0 GB | 7.1 s | 46.3 s |
+| 2 | no cuInterpose (`patches/vllm/0003`) | `snapshotd` | 1.6 s | 11.7 GB | 13.6 s | 45.3 s |
+| 4 | cuInterpose, CUDA 13.1 `libcuda` | Dynamo helper | 4.1 s | 20.5 GB | 8.8 s | 49.3 s |
+| 4 | cuInterpose, CUDA 13.1 `libcuda` | `snapshotd` | 1.9 s | 20.4 GB | 8.0 s | 48.8 s |
+| 4 | no cuInterpose (`patches/vllm/0003`) | `snapshotd` | 2.1 s | 22.1 GB | 15.1 s | 46.3 s |
+
+Restore is 3 to 6 times faster than a cold boot. `snapshotd` keeps the CUDA checkpoint near 2 s
+where Dynamo's helper grows with the worker count. Dropping cuInterpose runs on the host's 580
+driver and costs about 7 s of CUDA graph recapture on each restore.
+
+CPU KV offload (`--kv-offloading-size`) at TP=2:
+
+| Offload | Region | Image | Restore | Cold boot |
+| --- | --- | --- | --- | --- |
+| none | | 11.3 GB | 14.7 s | 43.3 s |
+| 128 GiB | kept in the checkpoint | 139.4 GB | 82.8 s | 75.5 s |
+| 128 GiB | deferred (`patches/vllm/0004`) | 11.5 GB | 45.4 s | 83.6 s |
+
+End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
+([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):
+
+| Run | Restored replica Ready | Cold boot Ready |
+| --- | --- | --- |
+| TP=1, weights from a peer over InfiniBand | 37 to 41 s | 89 s |
+| TP=2, restored on another node | 62 s | 177 s |
+| TP=8, restored on another node | 97 s | 391 s |
+| DeepSeek-V4.1-Flash, TP=8 + expert parallel, same node | 60 s | 148 s |
 
 ## Status
 
