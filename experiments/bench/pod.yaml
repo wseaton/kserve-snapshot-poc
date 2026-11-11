@@ -1,0 +1,47 @@
+# Privileged benchmark pod. Set the node and the GPU count (TP, or 2x TP to restore onto other GPUs).
+apiVersion: v1
+kind: Pod
+metadata: {name: restore-bench, labels: {app: snapshot-bench}}
+spec:
+  nodeSelector: {kubernetes.io/hostname: NODE}
+  imagePullSecrets: [{name: quay-wseaton-pull}]
+  restartPolicy: Never
+  containers:
+  - name: main
+    image: quay.io/wseaton/vllm-checkpoint@sha256:e2659cc191b90c0bceb8e40fa037020e609715774523d0d29422fc0bf23895ee
+    command: [python3, -c, "import os,time\nwhile True:\n  try: os.waitpid(-1,0)\n  except ChildProcessError: time.sleep(1)"]
+    securityContext: {privileged: true}
+    env:
+    - {name: POD_UID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
+    - {name: XDG_CACHE_HOME, value: /compile-cache/xdg}
+    - {name: TORCHINDUCTOR_CACHE_DIR, value: /compile-cache/torchinductor}
+    - {name: TRITON_CACHE_DIR, value: /compile-cache/triton}
+    - {name: CUDA_CACHE_PATH, value: /compile-cache/cuda}
+    - {name: DG_JIT_CACHE_DIR, value: /compile-cache/deepgemm}
+    - {name: FLASHINFER_WORKSPACE_BASE, value: /compile-cache/flashinfer}
+    - {name: VLLM_CACHE_ROOT, value: /compile-cache/vllm}
+    - {name: TILELANG_CACHE_DIR, value: /compile-cache/tilelang}
+    - {name: PYTORCH_ALLOC_CONF, value: "pinned_max_round_threshold_mb:1,pinned_max_cached_size_mb:1"}
+    resources:
+      requests: {cpu: "32", memory: 512Gi, nvidia.com/gpu: "GPUS"}
+      limits: {memory: 1Ti, nvidia.com/gpu: "GPUS"}
+    volumeMounts:
+    - {name: exp, mountPath: /exp}
+    - {name: models, mountPath: /models}
+    - {name: compile-cache, mountPath: /compile-cache}
+    - {name: work, mountPath: /work}
+    - {name: dshm, mountPath: /dev/shm}
+    - {name: cuinterpose, mountPath: /tmp/snapshot-cuda, readOnly: true}
+    - {name: compat, mountPath: /compat, readOnly: true}
+    - {name: device-plugins, mountPath: /host-device-plugins, readOnly: true}
+  volumes:
+  - {name: exp, configMap: {name: restore-bench, defaultMode: 0755}}
+  - {name: models, persistentVolumeClaim: {claimName: snapshot-bench-models}}
+  - {name: compile-cache, persistentVolumeClaim: {claimName: snapshot-bench-compile-cache}}
+  - {name: work, emptyDir: {}}
+  - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+  - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
+  - name: cuinterpose
+    image: {reference: "quay.io/wseaton/snapshot-agent@sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f", pullPolicy: IfNotPresent}
+  - name: compat
+    image: {reference: "quay.io/wseaton/vllm-openai@sha256:20fd867e86bdae3f5f2689d0a32661619560b8054d1a7c10fd303c71a8b2a8a0", pullPolicy: IfNotPresent}

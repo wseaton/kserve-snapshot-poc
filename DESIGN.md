@@ -150,6 +150,38 @@ which a new pod provides. The vLLM API server opens an `io_uring` through uvloop
 Dynamo's `block-iouring` seccomp profile does. The experiment installs the same filter before
 exec'ing vLLM.
 
+### CPU KV offload: keep the region in the checkpoint, or defer it
+
+`--kv-offloading-size N` selects `OffloadingConnector` with the CPU spec: one region of N GiB in
+`/dev/shm`, shared by the TP workers, pre-faulted, registered with CUDA by every worker, and
+unlinked as soon as all of them have mapped it. `/checkpoint/prepare` empties its index and leaves
+the memory. Two ways through a checkpoint, both measured with
+[`experiments/bench`](experiments/bench) on Qwen3-8B at TP=2, restored onto the other GPU of the
+pair, same greedy completion before and after:
+
+| Offload | Region | Cold boot | Prepare | CRIU dump | Image | CRIU restore | CUDA restore | vLLM restore | Restore total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| none | | 43.3 s | 0.6 s | 8.6 s | 11.3 GB | 2.2 s | 2.3 s | 10.2 s | 14.7 s |
+| 16 GiB | kept | 48.3 s | 0.6 s | 19.9 s | 27.3 GB | 9.4 s | 4.3 s | 9.7 s | 23.4 s |
+| 16 GiB | deferred | 46.3 s | 2.3 s | 8.1 s | 11.3 GB | 2.1 s | 2.0 s | 12.5 s | 16.7 s |
+| 128 GiB | kept | 75.5 s | 0.6 s | 84.1 s | 139.4 GB | 58.5 s | 14.0 s | 10.3 s | 82.8 s |
+| 128 GiB | deferred | 83.6 s | 13.5 s | 7.2 s | 11.5 GB | 2.3 s | 2.1 s | 41.0 s | 45.4 s |
+
+- **Kept** needs no vLLM change. CRIU copies the unlinked files into the image as ghost files, so
+  the daemon must raise `--ghost-limit` above the region size (the dump fails at the 1 GB the
+  experiments used before), and the restore pod needs a `/dev/shm` as large as the source's. The
+  image grows by the region. At 128 GiB the restore is slower than a cold boot.
+- **Deferred** is `patches/vllm/0004`, `--checkpoint-release-kv-offload`: prepare unregisters the
+  region on every rank and frees its pages, restore pre-faults and registers it again. The image
+  does not grow. Refilling 128 GiB takes 31 s of the restore, in the foreground; doing it after
+  serving resumes, with offload off until it finishes, would leave about 15 s.
+
+After each restore, [`offload-check.sh`](experiments/bench/offload-check.sh) pushes a prompt out of
+a 1 GiB GPU KV cache and sends it again; 514 MB came back from the CPU region in every offload row,
+so the host registrations work on the new GPUs in both modes.
+`VLLM_USE_SIMPLE_KV_OFFLOAD=1` (`SimpleCPUOffloadConnector`) restores too, with the region always
+kept (16 GiB: 27.7 GB image, 19.2 s restore); 0004 does not cover it or the tiering spec.
+
 ### What this means for the design
 
 - With `patches/vllm/0003`, TP>1 on one node needs no cuInterpose, on the source's GPUs or on
@@ -160,6 +192,8 @@ exec'ing vLLM.
 - cuInterpose stays as a fallback for workloads that still share memory at checkpoint time: custom
   all-reduce, symmetric memory, NVLS, NCCL over cuMem, or engines without a checkpoint lifecycle. The daemon decides
   at checkpoint time by inspecting, not by configuration.
+- CPU KV offload at production sizes wants `--checkpoint-release-kv-offload`. Without it the daemon
+  sets CRIU's ghost limit from the pod's `/dev/shm` size.
 - Every TP>1 cuInterpose restore needs the CUDA 13.1+ user-mode driver until host drivers are
   upgraded. The daemon records `cuDriverGetVersion` of the workload's `libcuda` in the manifest and
   refuses a restore below 13010 when the checkpoint holds shared memory.
@@ -362,6 +396,8 @@ branch.
 | Change | Where | State |
 | --- | --- | --- |
 | Destroy the NCCL communicator in `checkpoint_prepare` and create a new one in `checkpoint_restore`, releasing and recapturing CUDA graphs | vLLM, `patches/vllm/0003` | tested at TP=2 through CRIU onto other GPUs, eager and with graphs; new 2-GPU test in `tests/distributed/test_pynccl.py` |
+| `--checkpoint-release-kv-offload`: free the CPU KV offload region in `checkpoint_prepare` and refill it in `checkpoint_restore` | vLLM, `patches/vllm/0004` | tested at TP=2 through CRIU onto other GPUs at 16 and 128 GiB; new tests in `tests/v1/kv_offload/cpu/test_shared_offload_region.py` |
+| Refill the CPU KV offload region after serving resumes | vLLM | not started; hides 31 s of a 128 GiB restore |
 | Release custom all-reduce IPC buffers in `checkpoint_prepare` and re-register them in `checkpoint_restore` | vLLM | not started; removes `--disable-custom-all-reduce` |
 | Rebuild FlashInfer all-reduce workspaces after a device remap | FlashInfer, vLLM | not started; `cuda-python` returns `CUDA_ERROR_NOT_INITIALIZED` |
 | A new cuMem NCCL communicator after a cuda-checkpoint GPU remap | NCCL or the driver | not reported yet; `Cuda failure 3` on the first all-reduce |

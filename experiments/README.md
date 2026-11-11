@@ -38,3 +38,29 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
     --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'
   ```
 - `noiouring.py`: installs a seccomp filter that fails `io_uring_setup` with ENOSYS, then execs.
+
+## `bench/`: timed cold boot, checkpoint and restore of one server
+
+- `pod.yaml`: privileged, with the node and GPU count filled in, a models volume and a compile
+  cache volume. Configmap `restore-bench` from `restore-bench.sh`, `../criu/noiouring.py` and an
+  `overlay.tgz` of the vLLM files the patches change. `snapshotd` goes to `/models/bin/snapshotd`.
+  A privileged pod sees every GPU on the node, so the script takes its GPUs from the kubelet's
+  device checkpoint, mounted from the host.
+- `restore-bench.sh <tag> [vllm args]`: cold boot, a greedy completion, prepare,
+  `snapshotd cuda checkpoint`, `criu dump`, `criu restore` into a new network namespace,
+  `snapshotd cuda restore`, `/checkpoint/restore`, the completion again. Every phase is timed and
+  one `RESULT` line of JSON comes out. `MODE=cuinterpose` preloads cuInterpose and runs its prepare
+  and restore phases; `REMAP=rotate` restores each rank onto the next rank's GPU.
+- `offload-check.sh`: as `POST_CHECK`, counts the bytes CPU KV offload loads back after the
+  restore.
+
+The CPU KV offload rows in DESIGN.md:
+
+```bash
+export MODEL=/models/Qwen3-8B TP=2 NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 \
+  POST_CHECK=/exp/offload-check.sh REMAP=rotate
+A=(--disable-custom-all-reduce --max-model-len 4096 --kv-cache-memory-bytes 1G
+   --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}')
+/exp/restore-bench.sh defer128 "${A[@]}" --kv-offloading-size 128 --checkpoint-release-kv-offload
+GHOST_LIMIT=160G /exp/restore-bench.sh keep128 "${A[@]}" --kv-offloading-size 128
+```

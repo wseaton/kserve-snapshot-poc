@@ -36,6 +36,9 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
   new one, releasing CUDA graphs before and capturing them again after. At TP>1 with custom
   all-reduce off, no CUDA memory is shared between workers when the process is checkpointed, and
   cuda-checkpoint alone restores them, onto other GPUs too.
+- `0004`: `--checkpoint-release-kv-offload`. `/checkpoint/prepare` frees the CPU KV offload region
+  (`--kv-offloading-size`) and `/checkpoint/restore` refills it, so the checkpoint does not grow by
+  the region size.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
