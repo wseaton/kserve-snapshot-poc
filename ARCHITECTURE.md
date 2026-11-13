@@ -285,6 +285,50 @@ flowchart LR
   order reverses: the process must exist before its GPU state can come back.
 - **CRIU** does everything else, and is where the image size and most of the dump time go.
 
+## Where the privilege lives
+
+Checkpointing a process and recreating it somewhere else is privileged work whoever does it: CRIU
+reads another process's memory and file table, recreates PIDs, mounts and sockets, and on restore
+enters the target pod's namespaces and cgroup. The choice is not whether something runs with root
+or its capabilities, but which component does, and how many copies of it there are.
+
+| | Node agent (this design, and Dynamo Snapshot) | Wrapper in every workload pod | Kubelet and container runtime |
+| --- | --- | --- | --- |
+| Who runs CRIU | one DaemonSet pod per GPU node, in its own namespace | a wrapper injected as PID 1 of every vLLM container, which spawns vLLM and later dumps or restores it | the container runtime, on a kubelet checkpoint request |
+| What is privileged | the agent: `privileged`, `hostPID`, host paths for the runtime socket, kubelet pod dirs, `/proc` and cgroups | every workload container: `CAP_CHECKPOINT_RESTORE` and `CAP_SYS_PTRACE` at the least, `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` for much of what CRIU restores, and a seccomp profile wide enough for CRIU | nothing new: the runtime is already root |
+| Workload pod | unprivileged: non-root, all capabilities dropped, `io_uring` blocked by seccomp. KServe's hardened container is kept | carries the capabilities above next to model code, tokenizers and `--trust-remote-code` | unprivileged |
+| Change to every deployment | a restore placeholder shaped at admission. Dynamo's path also wraps `vllm serve` in an unprivileged entrypoint; the Rust daemon design removes it | the entrypoint of every pod is replaced, and the wrapper stays PID 1 for the pod's life | none to the pod; restore means starting a container from a checkpoint image |
+| Who must be trusted | one image and its RBAC, installed by the platform team | every image that runs with those capabilities, in every tenant namespace | the runtime |
+| Pod Security | one namespace at the `privileged` level | every serving namespace needs an exception from `restricted` and `baseline` | none |
+| GPU handling | the agent orders cuInterpose, cuda-checkpoint and CRIU, and maps GPUs to the new pod's | the wrapper must do the same from inside the pod | CRIU's CUDA plugin; no hook for the ordering or for a GPU map |
+
+So yes: the alternative to a privileged node agent is a wrapper in every vLLM pod, and it is the
+more invasive of the two. It does not remove the privilege. It moves it out of one component the
+platform owns into every container that runs user-selected model code, multiplies it by the
+number of replicas, and makes every serving namespace a Pod Security exception. A container
+escape from a model server then starts with checkpoint and ptrace capabilities; with the node
+agent it starts with none.
+
+What the node agent costs, stated plainly: it is root on every GPU node, it can read the memory
+of any process there, and a bug in it is a node compromise. Ways to bound that, as requirements
+on the daemon and not yet built:
+
+- Run it only on GPU nodes that serve snapshotted workloads, in its own namespace, and have it act
+  only on pods the integration has labelled and that a request names.
+- Limit its RBAC to reading pods and writing its own objects and one pod condition.
+- Keep the privileged part small. DESIGN.md has a single-threaded worker forked for each job do
+  the namespace entry and the CRIU call, so the long-lived control loop never enters a workload's
+  namespaces. Dynamo's agent also sets `hostNetwork` and `hostIPC`; whether the daemon can drop
+  them is open.
+- Protect checkpoint storage like the model's own data: images contain process memory. This holds
+  for every column of the table.
+
+What was and was not checked here: Dynamo's agent settings are from its Helm chart, and the
+unprivileged workload pod is what the end-to-end runs used. The capability list for the in-pod
+wrapper is CRIU's documented requirement, not something this proof of concept ran, and the
+kubelet checkpoint path was not evaluated. Only the CUDA and cuInterpose parts of the Rust daemon
+are built.
+
 Everything left of the interface is about KServe's objects and vLLM's state, and carries over.
 What a new engine must supply: a way to dump a quiesced pod and report where the artifact is, a
 pod shape it can restore into, a restore that ends with the process running in the new pod's
