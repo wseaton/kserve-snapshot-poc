@@ -171,16 +171,19 @@ pair, same greedy completion before and after:
   the daemon must raise `--ghost-limit` above the region size (the dump fails at the 1 GB the
   experiments used before), and the restore pod needs a `/dev/shm` as large as the source's. The
   image grows by the region. At 128 GiB the restore is slower than a cold boot.
-- **Deferred** is `patches/vllm/0004`, `--checkpoint-release-kv-offload`: prepare unregisters the
-  region on every rank and frees its pages, restore pre-faults and registers it again. The image
-  does not grow. Refilling 128 GiB takes 31 s of the restore, in the foreground; doing it after
-  serving resumes, with offload off until it finishes, would leave about 15 s.
+- **Deferred** is `patches/vllm/0005`, on the connector hooks of vllm-project/vllm#64371
+  (`patches/vllm/0004`): prepare unregisters the region on every rank and frees its pages, restore
+  pre-faults and registers it again. The image does not grow. Refilling 128 GiB takes about 30 s
+  of the restore, in the foreground; doing it after serving resumes, with offload off until it
+  finishes, would leave about 15 s. The table's deferred rows were measured on an earlier version
+  behind a `--checkpoint-release-kv-offload` flag; the current patch has no flag and measures the
+  same (128 GiB: 11.4 GB image, 43.3 s restore; see [BENCHMARKS.md](BENCHMARKS.md)).
 
 After each restore, [`offload-check.sh`](experiments/bench/offload-check.sh) pushes a prompt out of
 a 1 GiB GPU KV cache and sends it again; 514 MB came back from the CPU region in every offload row,
 so the host registrations work on the new GPUs in both modes.
 `VLLM_USE_SIMPLE_KV_OFFLOAD=1` (`SimpleCPUOffloadConnector`) restores too, with the region always
-kept (16 GiB: 27.7 GB image, 19.2 s restore); 0004 does not cover it or the tiering spec.
+kept (16 GiB: 27.7 GB image, 19.2 s restore); 0005 does not cover it or the tiering spec.
 
 ### What this means for the design
 
@@ -192,7 +195,7 @@ kept (16 GiB: 27.7 GB image, 19.2 s restore); 0004 does not cover it or the tier
 - cuInterpose stays as a fallback for workloads that still share memory at checkpoint time: custom
   all-reduce, symmetric memory, NVLS, NCCL over cuMem, or engines without a checkpoint lifecycle. The daemon decides
   at checkpoint time by inspecting, not by configuration.
-- CPU KV offload at production sizes wants `--checkpoint-release-kv-offload`. Without it the daemon
+- CPU KV offload at production sizes wants `patches/vllm/0005`. On a vLLM without it the daemon
   sets CRIU's ghost limit from the pod's `/dev/shm` size.
 - Every TP>1 cuInterpose restore needs the CUDA 13.1+ user-mode driver until host drivers are
   upgraded. The daemon records `cuDriverGetVersion` of the workload's `libcuda` in the manifest and
@@ -396,7 +399,7 @@ branch.
 | Change | Where | State |
 | --- | --- | --- |
 | Destroy the NCCL communicator in `checkpoint_prepare` and create a new one in `checkpoint_restore`, releasing and recapturing CUDA graphs | vLLM, `patches/vllm/0003` | tested at TP=2 through CRIU onto other GPUs, eager and with graphs; new 2-GPU test in `tests/distributed/test_pynccl.py` |
-| `--checkpoint-release-kv-offload`: free the CPU KV offload region in `checkpoint_prepare` and refill it in `checkpoint_restore` | vLLM, `patches/vllm/0004` | tested at TP=2 through CRIU onto other GPUs at 16 and 128 GiB; new tests in `tests/v1/kv_offload/cpu/test_shared_offload_region.py` |
+| Free the CPU KV offload region in the connector's `checkpoint_prepare` and refill it in `checkpoint_restore`, stacked on vllm-project/vllm#64371 | vLLM, `patches/vllm/0005`; branch `checkpoint-release-kv-offload-on-64371` on the fork for upstream | tested at TP=2 through CRIU onto other GPUs at 16 and 128 GiB; new tests in `tests/v1/kv_offload/cpu/test_shared_offload_region.py` |
 | Refill the CPU KV offload region after serving resumes | vLLM | not started; hides 31 s of a 128 GiB restore |
 | Release custom all-reduce IPC buffers in `checkpoint_prepare` and re-register them in `checkpoint_restore` | vLLM | not started; removes `--disable-custom-all-reduce` |
 | Rebuild FlashInfer all-reduce workspaces after a device remap | FlashInfer, vLLM | not started; `cuda-python` returns `CUDA_ERROR_NOT_INITIALIZED` |

@@ -62,19 +62,19 @@ from `vllm serve` to a healthy server with warm compile caches; the first boot i
 ## CPU KV offload
 
 `--kv-offloading-size N` keeps an N GiB region in `/dev/shm`. Kept in the checkpoint, CRIU copies
-it into the image; deferred (`patches/vllm/0004`, `--checkpoint-release-kv-offload`), vLLM frees
-it at prepare and refills it at restore. TP=2, no cuInterpose, `snapshotd`, one run each.
+it into the image, which is what vLLM does without `patches/vllm/0005`. With it, vLLM frees the
+region at prepare and refills it at restore. TP=2, no cuInterpose, `snapshotd`, one run each.
 
 | Offload | Region | Prepare | CRIU dump | Image | Restore total | Cold boot |
 | --- | --- | --- | --- | --- | --- | --- |
 | none | | 0.6 s | 8.6 s | 11.3 GB | 14.7 s | 43.3 s |
 | 16 GiB | kept | 0.6 s | 19.9 s | 27.3 GB | 23.4 s | 48.3 s |
-| 16 GiB | deferred | 2.3 s | 8.1 s | 11.3 GB | 16.7 s | 46.3 s |
+| 16 GiB | released | 2.1 s | 8.6 s | 11.4 GB | 16.9 s | 48.3 s |
 | 128 GiB | kept | 0.6 s | 84.1 s | 139.4 GB | 82.8 s | 75.5 s |
-| 128 GiB | deferred | 13.5 s | 7.2 s | 11.5 GB | 45.4 s | 83.6 s |
+| 128 GiB | released | 12.3 s | 8.5 s | 11.4 GB | 43.3 s | 74.5 s |
 
-A kept 128 GiB region makes the restore slower than a cold boot. Deferred, the refill is 31 s of
-the 45.4 s. After every restore the server loaded blocks back from the CPU region, so the host
+A kept 128 GiB region makes the restore slower than a cold boot. Released, the refill is 26 to
+29 s of the 43.3 s. After every restore the server loaded blocks back from the CPU region, so the host
 registrations survive the move to other GPUs in both modes.
 
 Keeping the region needs CRIU's ghost-file limit above the size of one region file (up to 4 GiB).

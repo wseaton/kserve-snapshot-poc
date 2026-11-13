@@ -61,9 +61,11 @@ export MODEL=/models/Qwen3-8B TP=2 NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHI
   POST_CHECK=/exp/offload-check.sh REMAP=rotate
 A=(--disable-custom-all-reduce --max-model-len 4096 --kv-cache-memory-bytes 1G
    --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}')
-/exp/restore-bench.sh defer128 "${A[@]}" --kv-offloading-size 128 --checkpoint-release-kv-offload
-GHOST_LIMIT=160G /exp/restore-bench.sh keep128 "${A[@]}" --kv-offloading-size 128
+/exp/restore-bench.sh released128 "${A[@]}" --kv-offloading-size 128
 ```
+
+The kept rows are the same command with `GHOST_LIMIT=160G` on an overlay built without
+`patches/vllm/0004` and `0005`.
 
 The comparison rows in BENCHMARKS.md, with `TP=2` and `TP=4`:
 

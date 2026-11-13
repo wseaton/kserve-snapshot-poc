@@ -1,0 +1,217 @@
+From 5f0dade166c70df0a4c59deb28f689ed4a333250 Mon Sep 17 00:00:00 2001
+From: Schwinn Saereesitthipitak <schwinns@nvidia.com>
+Date: Thu, 29 Oct 2026 16:44:12 +0000
+Subject: [PATCH 4/5] [KV Connector] Add checkpoint_prepare and
+ checkpoint_restore connector hooks
+
+Let KV connectors release what a process checkpoint must not contain, such
+as transports and peer state, and rebuild it on restore. The engine calls
+the scheduler-side instance before the workers on prepare and after them on
+restore. The defaults do nothing.
+
+An engine with a KV connector prepares only if the connector supports
+process checkpoints with its config. supports_checkpoint is False by
+default, and a MultiConnector needs every child to support them.
+
+Signed-off-by: Schwinn Saereesitthipitak <schwinns@nvidia.com>
+(cherry picked from commit cdc403d59109fb897e4a184d463570bf998b2a2f)
+---
+ tests/v1/engine/test_engine_core.py           | 33 +++++++++++++++++--
+ .../kv_transfer/kv_connector/v1/base.py       | 14 ++++++++
+ .../kv_connector/v1/multi_connector.py        | 15 +++++++++
+ vllm/v1/engine/core.py                        | 13 ++++++++
+ vllm/v1/worker/gpu_worker.py                  |  5 +++
+ 5 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/engine/test_engine_core.py b/tests/v1/engine/test_engine_core.py
+index 9a611f8f4d..3952382f8d 100644
+--- a/tests/v1/engine/test_engine_core.py
++++ b/tests/v1/engine/test_engine_core.py
+@@ -879,15 +879,22 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+     core.model_executor.is_sleeping = False
+     core._reset_caches = MagicMock()
+     core.reject_new_requests = False
+-    core.scheduler.get_kv_connector.return_value = None
++    kv_connector = MagicMock()
++    kv_connector.supports_checkpoint.return_value = True
++    core.scheduler.get_kv_connector.return_value = kv_connector
++    # Record the scheduler-side connector calls among the executor calls.
++    core.model_executor.attach_mock(kv_connector, "kv_connector")
++    core.model_executor.get_kv_connector_handshake_metadata.return_value = []
+ 
+     assert core.checkpoint_prepare("wait") is None
+     assert core.checkpoint_prepare("wait") is None
+     assert core.checkpoint_state() == (CheckpointState.PREPARED, None)
+     assert core.reject_new_requests
+     assert _executor_calls(core) == [
++        "kv_connector.supports_checkpoint",
+         "synchronize_device",
+         "discard",
++        "kv_connector.checkpoint_prepare",
+         "checkpoint_prepare",
+         "synchronize_device",
+     ]
+@@ -896,7 +903,12 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+     core.checkpoint_restore()
+     core.checkpoint_restore()
+     assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
+-    assert _executor_calls(core) == ["checkpoint_restore", "wake_up"]
++    assert _executor_calls(core) == [
++        "checkpoint_restore",
++        "kv_connector.checkpoint_restore",
++        "wake_up",
++        "get_kv_connector_handshake_metadata",
++    ]
+     core.scheduler.set_pause_state.assert_called_with(PauseState.UNPAUSED)
+     assert not core.reject_new_requests
+ 
+@@ -954,6 +966,23 @@ def test_checkpoint_release_weights_discards_then_reloads():
+     ]
+ 
+ 
++def test_checkpoint_prepare_refuses_unsupported_kv_connector():
++    """A KV connector whose process checkpoint cannot be restored makes the
++    engine refuse to prepare, with nothing paused."""
++    core = _pausable_engine_core_proc()
++    core.vllm_config = MagicMock()
++    core.model_executor.is_sleeping = False
++    kv_connector = MagicMock()
++    kv_connector.supports_checkpoint.return_value = False
++    core.scheduler.get_kv_connector.return_value = kv_connector
++
++    refusal = core.checkpoint_prepare("wait")
++    assert refusal is not None and "does not support process checkpoints" in refusal
++    kv_connector.supports_checkpoint.assert_called_once_with(core.vllm_config)
++    assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
++    core.scheduler.set_pause_state.assert_not_called()
++
++
+ @pytest.mark.parametrize("deferred", [False, True])
+ def test_checkpoint_prepare_fails_on_drain_barrier_error(deferred: bool):
+     """A failing barrier at the end of the drain leaves the engine FAILED and
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 89fd727307..981caf8508 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -218,6 +218,11 @@ class KVConnectorBase_V1(ABC):
+         """Whether the connector can follow the KV cache remap of sleep mode."""
+         return True
+ 
++    @classmethod
++    def supports_checkpoint(cls, vllm_config: "VllmConfig") -> bool:
++        """Whether a process checkpoint of the engine can be restored."""
++        return False
++
+     def __init__(
+         self,
+         vllm_config: "VllmConfig",
+@@ -242,6 +247,15 @@ class KVConnectorBase_V1(ABC):
+     def role(self) -> KVConnectorRole:
+         return self._role
+ 
++    def checkpoint_prepare(self) -> None:
++        """Release transports and peer state before a process checkpoint. The
++        KV cache is already released."""
++        return
++
++    def checkpoint_restore(self) -> None:
++        """Bring back what `checkpoint_prepare` released."""
++        return
++
+     # ==============================
+     # Worker-side methods
+     # ==============================
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index 94a25d3717..cfbb524992 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -249,6 +249,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+             for c in children
+         )
+ 
++    @classmethod
++    def supports_checkpoint(cls, vllm_config: "VllmConfig") -> bool:
++        children = cls._get_connector_classes_and_configs(vllm_config)
++        return bool(children) and all(
++            child.supports_checkpoint(config) for child, config in children
++        )
++
+     @classmethod
+     def _get_connector_classes_and_configs(
+         cls, vllm_config: "VllmConfig"
+@@ -287,6 +294,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         for c in self._connectors:
+             c.restore_kv_caches()
+ 
++    def checkpoint_prepare(self) -> None:
++        for c in self._connectors:
++            c.checkpoint_prepare()
++
++    def checkpoint_restore(self) -> None:
++        for c in self._connectors:
++            c.checkpoint_restore()
++
+     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+         for connector in self._connectors:
+             connector.bind_kv_cache_manager(kv_cache_manager)
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c93ecfc027..a4d7d2aad3 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1005,6 +1005,9 @@ class EngineCore:
+                 self.release_kv_cache_memory()
+                 if self.vllm_config.model_config.checkpoint_release_weights:
+                     self.model_executor.discard(("weights",))
++                # The scheduler-side connector stops first and restarts last.
++                if (kv_connector := self.scheduler.get_kv_connector()) is not None:
++                    kv_connector.checkpoint_prepare()
+                 self.collective_rpc("checkpoint_prepare")
+                 self.collective_rpc("synchronize_device")
+                 self._checkpoint_state = CheckpointState.PREPARED
+@@ -2444,6 +2447,14 @@ class EngineCoreProc(EngineCore):
+             return "Preparing for a checkpoint requires --enable-sleep-mode"
+         if self.model_executor.is_sleeping:
+             return "Preparing for a checkpoint requires an awake engine"
++        kv_connector = self.scheduler.get_kv_connector()
++        if kv_connector is not None and not kv_connector.supports_checkpoint(
++            self.vllm_config
++        ):
++            return (
++                f"{type(kv_connector).__name__} does not support process "
++                "checkpoints with this configuration"
++            )
+         self._checkpoint_state = CheckpointState.PREPARING
+         try:
+             self.pause_generation(mode=mode, clear_cache=False)
+@@ -2469,6 +2480,8 @@ class EngineCoreProc(EngineCore):
+             if self.vllm_config.model_config.checkpoint_release_weights:
+                 self.wake_up(["weights"])
+                 self.collective_rpc("reload_weights")
++            if (kv_connector := self.scheduler.get_kv_connector()) is not None:
++                kv_connector.checkpoint_restore()
+             self.wake_up(["kv_cache"])
+         except Exception as e:
+             self._fail_checkpoint(e)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index ea1762eddb..f076016fac 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -441,10 +441,15 @@ class Worker(WorkerBase):
+         if self._checkpoint_graphs_captured():
+             self._v2_model_runner().release_cuda_graphs()
+             self._checkpoint_graphs_released = True
++        # Connectors are created after the communicators, so release them first.
++        if has_kv_transfer_group():
++            get_kv_transfer_group().checkpoint_prepare()
+         checkpoint_prepare_distributed_state()
+ 
+     def checkpoint_restore(self) -> None:
+         checkpoint_restore_distributed_state()
++        if has_kv_transfer_group():
++            get_kv_transfer_group().checkpoint_restore()
+ 
+     def _capture_released_graphs(self) -> None:
+         """Capture the graphs `checkpoint_prepare` released."""
+-- 
+2.54.0 (Apple Git-157)
+

@@ -49,9 +49,13 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
   new one, releasing CUDA graphs before and capturing them again after. At TP>1 with custom
   all-reduce off, no CUDA memory is shared between workers when the process is checkpointed, and
   cuda-checkpoint alone restores them, onto other GPUs too.
-- `0004`: `--checkpoint-release-kv-offload`. `/checkpoint/prepare` frees the CPU KV offload region
-  (`--kv-offloading-size`) and `/checkpoint/restore` refills it, so the checkpoint does not grow by
-  the region size.
+- `0004`: the connector hooks of [vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371)
+  (open), its first commit backported: KV connectors get `checkpoint_prepare` and
+  `checkpoint_restore`, and the engine refuses to prepare with a connector that does not declare
+  `supports_checkpoint`. Its NIXL prefill/decode commit is not carried.
+- `0005`: stacked on those hooks. With the CPU KV offload connector (`--kv-offloading-size`),
+  `/checkpoint/prepare` frees the offload region and `/checkpoint/restore` refills it, so the
+  checkpoint does not grow by the region size. No flag: stock vLLM keeps the region.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
@@ -102,8 +106,8 @@ CPU KV offload (`--kv-offloading-size`) at TP=2:
 | Offload | Region | Image | Restore | Cold boot |
 | --- | --- | --- | --- | --- |
 | none | | 11.3 GB | 14.7 s | 43.3 s |
-| 128 GiB | kept in the checkpoint | 139.4 GB | 82.8 s | 75.5 s |
-| 128 GiB | deferred (`patches/vllm/0004`) | 11.5 GB | 45.4 s | 83.6 s |
+| 128 GiB | kept in the checkpoint (stock vLLM) | 139.4 GB | 82.8 s | 75.5 s |
+| 128 GiB | released (`patches/vllm/0005`) | 11.4 GB | 43.3 s | 74.5 s |
 
 End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
 ([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):
