@@ -310,12 +310,20 @@ escape from a model server then starts with checkpoint and ptrace capabilities; 
 agent it starts with none.
 
 This is not hypothetical. [snapshot-orchestrator](https://github.com/neuralmagic/snapshot-orchestrator)
-started as the in-pod design: a supervisor image wrapped vLLM, carried CRIU and `cuda-checkpoint`,
-and the orchestrator ran checkpoints by exec-ing into the workload pods, which ran `privileged`
-with `SYS_ADMIN` and `CHECKPOINT_RESTORE`. It was dropped for a node agent, and the workload went
-back to running vLLM unprivileged as PID 1. Beyond the privileges, the operational cost decided it:
-every deployment's entrypoint and image had to be replaced, so each serving runtime, vLLM version
-and KServe template needed its own patched variant, kept in step with upstream.
+started as the in-pod design: a supervisor was PID 1 of the vLLM container, its image carried CRIU
+and `cuda-checkpoint`, and the orchestrator ran checkpoints by exec-ing into the workload pods.
+CRIU has only the privileges of the container it runs in, so the vLLM container itself ran
+`privileged` with `SYS_ADMIN`, `CHECKPOINT_RESTORE` and `IPC_LOCK`: the model server held the
+rights to recreate arbitrary processes and remount its own filesystem. Its README listed that as
+a prototype limitation and planned the node agent to "remove both the supervisor and privileged
+workload Pods", which commit `847c4a7` did; the workload went back to vLLM unprivileged as PID 1.
+
+The same README weighed two more options. A privileged sidecar with a shared process namespace
+removes the custom PID 1 but keeps a privileged container in every pod. Teaching vLLM to persist
+its own state removes CRIU, but its sleep mode has no durable storage. Beyond the privileges, the
+operational cost counted against anything in-pod: every deployment's entrypoint and image is
+replaced, so each serving runtime, vLLM version and KServe template needs its own patched variant
+kept in step with upstream.
 
 What the node agent costs, stated plainly: it is root on every GPU node, it can read the memory
 of any process there, and a bug in it is a node compromise. Ways to bound that, as requirements
