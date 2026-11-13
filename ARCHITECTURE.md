@@ -173,30 +173,117 @@ shapes the pod for restore directly, on any node that mounts the checkpoint stor
 ## The engine boundary
 
 Rows 8, 10 to 13 and the signals in 16 and 18 are the whole surface between the integration and
-the engine. DESIGN.md names it as an interface with three calls:
+the engine. DESIGN.md names it as an interface with three calls. Behind it, both engines run the
+same three tools in the same order; they differ in who drives them and how.
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph INT["Integration"]
     WH["webhook"]
     CAP["capture controller"]
     REJ["restore-failure controller"]
   end
-  B{{"SnapshotBackend<br/>Checkpoint(pod) -> Artifact<br/>ShapeRestorePod(pod, artifact)<br/>Restore(artifact, pod)"}}
-  subgraph DY["Dynamo Snapshot"]
-    DJ["SnapshotJob / PodSnapshot"]
-    DA["snapshot-agent"]
+
+  B{{"SnapshotBackend<br/>Checkpoint(pod) returns Artifact<br/>ShapeRestorePod(pod, artifact)<br/>Restore(artifact, pod)"}}
+  WH -- "ShapeRestorePod" --> B
+  CAP -- "Checkpoint, Restore" --> B
+  REJ -. "done / failed" .-> B
+
+  subgraph DY["Dynamo Snapshot (in use)"]
+    direction TB
+    DCR["SnapshotJob, PodSnapshot<br/>nvidia.com/Restored pod condition"]
+    DOP["operator (Go)"]
+    DAG["snapshot-agent (Go, privileged DaemonSet)<br/>finds the container through containerd"]
+    subgraph DCK["checkpoint, from the host"]
+      direction TB
+      D1["cuinterpose-coordinator --prepare<br/>TP>1 only, always when preloaded"]
+      D2["cuda-checkpoint-helper lock, then checkpoint<br/>one process for each PID, in sequence"]
+      D3["CRIU dump over go-criu RPC<br/>ghost limit 32-bit, 512 MB default"]
+      D1 --> D2 --> D3
+    end
+    subgraph DRS["restore, nsrestore in the pod"]
+      direction TB
+      D4["CRIU restore in the pod's namespaces<br/>mounts, cgroup, socket addresses to the new pod IP"]
+      D5["cuda-checkpoint-helper restore with a device map, then unlock"]
+      D6["cuinterpose-coordinator --restore"]
+      D7["write restore-complete<br/>the pod's entrypoint calls /checkpoint/restore"]
+      D4 --> D5 --> D6 --> D7
+    end
+    DCR --> DOP --> DAG
+    DAG --> DCK
+    DAG --> DRS
   end
-  subgraph RD["Rust daemon (design)"]
-    RC["SnapshotCheckpoint + pod annotation"]
-    RA["snapshotd"]
+
+  subgraph RD["Rust daemon (snapshotd)"]
+    direction TB
+    RCR["SnapshotCheckpoint, request annotation on the pod<br/>readiness gate condition<br/>(design)"]
+    RLOOP["control loop: CRI lookup, vLLM /checkpoint/prepare and /status<br/>(design)"]
+    subgraph RCK["checkpoint, from the host"]
+      direction TB
+      R1["inspect each process over the cuInterpose socket<br/>coordinator prepare only if memory is shared<br/>(built)"]
+      R2["cuCheckpointProcessLock, then Checkpoint<br/>driver API, every PID in parallel<br/>(built)"]
+      R3["CRIU dump over swrk RPC<br/>ghost limit from the pod's /dev/shm<br/>(design; the bench runs the CRIU CLI)"]
+      R1 --> R2 --> R3
+    end
+    subgraph RRS["restore, worker in the pod"]
+      direction TB
+      R4["CRIU restore in the pod's namespaces<br/>(design; the bench restores in-pod)"]
+      R5["cuCheckpointProcessRestore with a full GPU bijection, then Unlock<br/>(built)"]
+      R6["coordinator restore, if the checkpoint holds shared memory<br/>library hashes verified first<br/>(built)"]
+      R7["POST /checkpoint/restore from the daemon<br/>set the readiness condition<br/>(design)"]
+      R4 --> R5 --> R6 --> R7
+    end
+    RCR --> RLOOP
+    RLOOP --> RCK
+    RLOOP --> RRS
   end
-  WH --> B
-  CAP --> B
-  REJ --> B
-  B --> DJ --> DA
-  B --> RC --> RA
+
+  B --> DCR
+  B --> RCR
+  D3 --> STORE[("checkpoint storage")]
+  R3 --> STORE
+  STORE --> D4
+  STORE --> R4
 ```
+
+What each tool is for, and why the order is fixed:
+
+```mermaid
+flowchart LR
+  subgraph PREP["vLLM, before"]
+    V1["/checkpoint/prepare<br/>drain, drop KV cache and weights,<br/>tear down communicators"]
+  end
+  subgraph CK["checkpoint"]
+    direction LR
+    C1["cuInterpose<br/>unmap GPU memory shared<br/>between processes, save how<br/>to re-import it"]
+    C2["cuda-checkpoint<br/>lock every process, then copy<br/>each one's GPU state into<br/>its host memory"]
+    C3["CRIU<br/>dump the process tree: memory,<br/>files, sockets, namespaces"]
+    C1 --> C2 --> C3
+  end
+  subgraph RS["restore"]
+    direction LR
+    S1["CRIU<br/>recreate the tree in the<br/>new pod's namespaces"]
+    S2["cuda-checkpoint<br/>move GPU state back, onto<br/>the new pod's GPUs, unlock"]
+    S3["cuInterpose<br/>re-export and re-import<br/>the shared memory"]
+    S1 --> S2 --> S3
+  end
+  subgraph POST["vLLM, after"]
+    V2["/checkpoint/restore<br/>communicators, weights,<br/>KV cache, CUDA graphs"]
+  end
+  V1 --> C1
+  C3 --> IMG[("image")]
+  IMG --> S1
+  S3 --> V2
+```
+
+- **cuInterpose** is needed only while processes still share GPU memory at checkpoint time: the
+  driver cannot checkpoint a mapping another process holds. It is an `LD_PRELOAD` library plus a
+  coordinator, and at TP>1 its restore needs the CUDA 13.1 `libcuda` on 580 hosts. With
+  `patches/vllm/0003` nothing is shared after prepare, and both of its boxes drop out.
+- **cuda-checkpoint** must finish before CRIU starts, because CRIU cannot dump device memory or
+  the driver's mappings; after it, a GPU process looks like a CPU process to CRIU. On restore the
+  order reverses: the process must exist before its GPU state can come back.
+- **CRIU** does everything else, and is where the image size and most of the dump time go.
 
 Everything left of the interface is about KServe's objects and vLLM's state, and carries over.
 What a new engine must supply: a way to dump a quiesced pod and report where the artifact is, a
