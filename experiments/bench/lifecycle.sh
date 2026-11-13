@@ -20,6 +20,9 @@
 #   OUT                where the traces and the merged trace go (default ./lifecycle-<tag>)
 #   TITLE, SUBTITLE    headings for the rendered page (lifecycle.html in OUT); PNG=1 also
 #                      renders it to lifecycle.png with a headless Chrome
+#   PEER               1: before the target restores, cold boot the server again on the source and
+#                      leave it serving, so a ModelExpress restore on the target has a peer to
+#                      pull weights from; needs NET=pod (default 0)
 #   RESTORE_WAIT       seconds to leave the target pod alone while it restores (default 150)
 # Everything restore-bench.sh reads (MODEL, TP, MODE, OVERLAY, SNAPSHOTD, COMPAT, ...) is passed
 # through to both pods.
@@ -40,7 +43,7 @@ k() { kubectl --context "$CONTEXT" -n "$NS" "$@"; }
 main() { local pod=$1; shift; k exec "$pod" -c main -- "$@"; }
 xfer() { local pod=$1; shift; k exec "$pod" -c xfer -- "$@"; }
 
-PASS=(MODEL TP MODE GPU_POSITIONS RELEASE_WEIGHTS CUDA_TOOL SNAPSHOTD COMPAT OVERLAY CRIU_VERBOSITY GHOST_LIMIT POST_CHECK
+PASS=(MODEL TP MODE GPU_POSITIONS RELEASE_WEIGHTS MX MX_SERVER NET CUDA_TOOL SNAPSHOTD COMPAT OVERLAY CRIU_VERBOSITY GHOST_LIMIT POST_CHECK
   NCCL_CUMEM_ENABLE VLLM_ALLREDUCE_USE_FLASHINFER VLLM_USE_SIMPLE_KV_OFFLOAD)
 envs() { for name in "${PASS[@]}"; do [ -n "${!name:-}" ] && printf '%s=%q ' "$name" "${!name}"; done; printf 'CKPT_DIR=%q ' "$IMG"; }
 ARGS=$(printf '%q ' "$@")
@@ -106,9 +109,18 @@ if [ "$IMG" != "$W/img" ]; then
   xfer "$SRC_POD" sh -c "cd /tmp && $XFER transfer send --dir $IMG --to $DST_IP:7700 ${POOL[*]}" | grep -E '^(TRANSFER|Error)' | tee "$OUT/transfer-side.txt"
 fi
 
+if [ "${PEER:-0}" = 1 ]; then
+  echo "== peer on $SRC_POD"
+  main "$SRC_POD" sh -c "rm -f /work/peer.log; setsid nohup env $(envs) CKPT_DIR=/work/$TAG-peer/img PHASE=serve bash /work/rb.sh $TAG-peer $ARGS > /work/peer.log 2>&1 < /dev/null &"
+  until main "$SRC_POD" grep -q '^RESULT' /work/peer.log 2>/dev/null; do sleep 10; done
+  main "$SRC_POD" grep '^RESULT' /work/peer.log | tee "$OUT/peer.json"
+  grep -q '"SERVING"' "$OUT/peer.json"
+fi
+
 echo "== restore on $DST_POD"
 RESTORE_STREAM=0; [ "$OVERLAP" = memory ] && RESTORE_STREAM=external
-main "$DST_POD" sh -c "rm -f /work/restore.log; setsid nohup env $(envs) PHASE=restore STREAM=$RESTORE_STREAM bash /work/rb.sh $TAG > /work/restore.log 2>&1 < /dev/null &"
+# The harness itself must not sit on a PID the checkpoint needs.
+main "$DST_POD" sh -c "echo 4000000 > /proc/sys/kernel/ns_last_pid; rm -f /work/restore.log; setsid nohup env $(envs) PHASE=restore STREAM=$RESTORE_STREAM bash /work/rb.sh $TAG > /work/restore.log 2>&1 < /dev/null &"
 end=$(( $(date +%s) + RESTORE_WAIT )); until [ "$(date +%s)" -ge "$end" ]; do sleep 5; done
 until main "$DST_POD" grep -q '^RESULT' /work/restore.log 2>/dev/null; do sleep 10; done
 main "$DST_POD" grep '^RESULT' /work/restore.log | tee "$OUT/restore.json"

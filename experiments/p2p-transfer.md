@@ -98,6 +98,37 @@ Things tried on the RAM path that were slower:
   it reads a stream range by range in one place. Faulting the 112 GiB arena in beforehand took
   52.5 s.
 
+## Where the weights come from
+
+The checkpoint can carry the weights, or vLLM can release them at prepare
+(`--checkpoint-release-weights`) and load them again at restore: from the model volume, or from a
+replica that is already serving, through ModelExpress over RDMA. Qwen3-8B (16 GB of weights),
+TP=4, stock vLLM with cuInterpose, streamed into the second node's RAM, restored into the pod's
+network (`NET=pod`); every run matched the source's completion:
+
+| Weights | Image | CUDA checkpoint | CRIU dump and copy | CRIU restore | CUDA restore | vLLM restore | Restore total |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| In the checkpoint | 41.1 GB | 3.6 s | 9.5 s | 4.4 s | 3.9 s | 0.2 s | 8.9 s |
+| Released, reloaded from the model volume | 21.9 GB | 1.9 s | 5.7 s | 2.3 s | 3.2 s | 1.5 s | 7.4 s |
+| Released, ModelExpress from the model volume | 23.9 GB | 1.9 s | 9.4 s, not overlapped | 2.8 s | 3.1 s | 5.1 s | 11.5 s |
+| Released, ModelExpress from a serving peer | 23.9 GB | 1.9 s | 5.9 s | 2.8 s | 3.2 s | 1.9 s | 8.4 s |
+
+Cold boot is 47 to 54 s. In the last row each worker pulled its 4.11 GB from the peer in 0.12 s
+(277 Gbps); the 1.9 s is ModelExpress's 1.6 s receive path plus vLLM's reload bookkeeping. The
+peer was a second server cold-booted on the source node after the capture (`PEER=1`).
+
+At 16 GB the three ways of bringing weights back are within two seconds of each other, and
+releasing them mainly shortens the capture. The gap grows with the model: carrying weights in the
+image costs CRIU's 4.5 GB/s on the way out and CRIU plus CUDA restore on the way in (gpt-oss-120b:
+about 75 GB more image, 23 s more capture, 10 s more restore than its weightless checkpoint),
+while the peer transfer ran at 277 Gbps per worker here. For a large model the released path with
+a peer is the one to want; gpt-oss-120b cannot use it yet (see Open).
+
+A restore into the pod's own network needs the source's socket addresses rewritten to the new
+pod's. Dynamo's CRIU plugin (`snapshot_inet_remap.so`, loaded with `--libdir`) does it from a
+"source target" address file. Closing connections instead (`--tcp-close`) also closes the workers'
+loopback connections to each other and fails vLLM's restore.
+
 ## What a cross-node restore needs
 
 Found by failing, in this order:

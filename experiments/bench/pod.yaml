@@ -23,8 +23,8 @@ spec:
     - {name: TILELANG_CACHE_DIR, value: /compile-cache/tilelang}
     - {name: PYTORCH_ALLOC_CONF, value: "pinned_max_round_threshold_mb:1,pinned_max_cached_size_mb:1"}
     resources:
-      requests: {cpu: "32", memory: 512Gi, nvidia.com/gpu: "GPUS"}
-      limits: {memory: 1Ti, nvidia.com/gpu: "GPUS"}
+      requests: {cpu: "32", memory: 512Gi, nvidia.com/gpu: "GPUS", rdma/ib: "GPUS"}
+      limits: {memory: 1Ti, nvidia.com/gpu: "GPUS", rdma/ib: "GPUS"}
     volumeMounts:
     - {name: exp, mountPath: /exp}
     - {name: models, mountPath: /models}
@@ -35,6 +35,7 @@ spec:
     - {name: cuinterpose, mountPath: /tmp/snapshot-cuda, readOnly: true}
     - {name: compat, mountPath: /compat, readOnly: true}
     - {name: device-plugins, mountPath: /host-device-plugins, readOnly: true}
+    - {name: podinfo, mountPath: /etc/snapshot-podinfo, readOnly: true}
   # Copies /work/<tag> to or from another node: snapshotd built with the nixl feature.
   - name: xfer
     image: quay.io/wseaton/nixl-regbench@sha256:da96ebb45ccd74f4e6259aa4a744a8c00ad22e9ec3dd1805da1378977536b241
@@ -57,6 +58,13 @@ spec:
   - {name: mem, emptyDir: {medium: Memory, sizeLimit: 256Gi}}
   - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
   - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
+  # A restored process keeps the source's environment; ModelExpress reads who it is from here.
+  - name: podinfo
+    downwardAPI:
+      items:
+      - {path: name, fieldRef: {fieldPath: metadata.name}}
+      - {path: namespace, fieldRef: {fieldPath: metadata.namespace}}
+      - {path: uid, fieldRef: {fieldPath: metadata.uid}}
   - name: cuinterpose
     image: {reference: "quay.io/wseaton/snapshot-agent@sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f", pullPolicy: IfNotPresent}
   - name: compat

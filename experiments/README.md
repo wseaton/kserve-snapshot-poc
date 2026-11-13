@@ -87,6 +87,9 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
   through the `xfer` container, restore there, and merge everything into one Perfetto trace.
   `OVERLAP=1` streams the dump as it is taken; `IMG_DIR=/mem/<tag>` keeps the image in RAM on the
   target. `restore-bench.sh` does the two halves with `PHASE=capture` and `PHASE=restore`.
+- `MX=1 NET=pod PEER=1` on `lifecycle.sh` loads weights through ModelExpress, restores into the
+  pod's network, and cold boots a second server on the source as the peer to pull from. The
+  workload container needs `rdma/ib` and the pod-info volume in `pod.yaml`.
 - `bench/trace-merge.py`: merges the transfer's sender and receiver traces with the harness
   phases.
 - `bench/trace-render.py <output dir> [--png FILE]`: draws a run as a standalone page that reads on

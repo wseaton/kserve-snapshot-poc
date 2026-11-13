@@ -23,12 +23,18 @@
 #   CRIU_VERBOSITY  CRIU's -v level (default 4)
 #   PHASE        all: capture and restore here; capture: stop after the dump and leave everything
 #                a restore on another node needs under /work/<tag>; restore: restore a /work/<tag>
-#                captured elsewhere onto this pod's GPUs (default all)
+#                captured elsewhere onto this pod's GPUs; serve: cold boot and leave the
+#                server running, as a ModelExpress peer for example (default all)
 #   GPU_POSITIONS  enumeration positions of the GPUs to run on, such as "4 5 6 7"; they must be
 #                allocated to the pod (default: its first TP GPUs). A restore on another node
 #                lands on the same positions there
 #   RELEASE_WEIGHTS  0: keep the weights in the checkpoint instead of releasing them at prepare
 #                and reloading them at restore (default 1)
+#   MX           1: load weights through ModelExpress, from a peer over RDMA when one is serving,
+#                else from disk; MX_SERVER is its address (default modelexpress-server:8001)
+#   NET          pod: restore into the pod's own network instead of a new namespace, so the
+#                restored server can reach peers; needs the dumped ports free (default new)
+#   KEEP         1: leave the restored server running (default 0)
 #   REMAP        0: restore onto the same GPUs; rotate: restore rank i onto rank i+1's GPU (default 0)
 #   CKPT_DIR     where the CRIU images go (default /work/<tag>/img)
 #   SNAPSHOTD    snapshotd binary (default /models/bin/snapshotd)
@@ -121,6 +127,13 @@ export NCCL_NVLS_ENABLE=0 NCCL_IB_DISABLE=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_U
   VLLM_WORKER_MULTIPROC_METHOD=spawn GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo VLLM_HOST_IP=127.0.0.1
 
 LAUNCH=(python3 /exp/noiouring.py)
+MX_ARGS=()
+if [ "${MX:-0}" = 1 ]; then
+  LAUNCH+=(env VLLM_PLUGINS=modelexpress "MX_SERVER_ADDRESS=${MX_SERVER:-modelexpress-server:8001}"
+    MX_METADATA_PORT=5555 MX_WORKER_GRPC_PORT=6555 MX_RDMA_NIC_PIN=auto
+    MX_POD_INFO_DIR=/etc/snapshot-podinfo "UCX_TLS=^rc_gda")
+  MX_ARGS=(--load-format modelexpress)
+fi
 [ -n "${COMPAT:-}" ] && LAUNCH+=(env "LD_LIBRARY_PATH=$COMPAT:$LD_LIBRARY_PATH")
 helper() { local action=$1; shift; for p in $PIDS; do $B/cuda-checkpoint-helper --action "$action" --pid "$p" "$@" || return 1; done; }
 cuda_checkpoint() {
@@ -141,7 +154,7 @@ RELEASE=(--checkpoint-release-weights); [ "${RELEASE_WEIGHTS:-1}" = 0 ] && RELEA
 if [ "$PHASE" != restore ]; then
 T=$(now)
 setsid "${LAUNCH[@]}" vllm serve "$MODEL" --served-model-name m --tensor-parallel-size "$TP" \
-  --enable-sleep-mode "${RELEASE[@]}" --host 127.0.0.1 --port 8000 "$@" \
+  --enable-sleep-mode "${RELEASE[@]}" "${MX_ARGS[@]}" --host 127.0.0.1 --port 8000 "$@" \
   < /dev/null > "$W/vllm.log" 2>&1 &
 VP=$!
 for _ in $(seq 3600); do
@@ -153,6 +166,7 @@ lap cold_boot "$T"
 T=$(now); complete > before.txt || fail FIRST_COMPLETION_FAILED; lap cold_first_completion "$T"
 complete > before.txt
 echo "before: $(cat before.txt)"
+if [ "$PHASE" = serve ]; then R[result]=SERVING; report; exit 0; fi
 
 T=$(now)
 curl -s -XPOST localhost:8000/checkpoint/prepare >/dev/null
@@ -182,7 +196,7 @@ if [ "$STREAM" = 1 ]; then
 fi
 T=$(now)
 LD_LIBRARY_PATH=$B/lib $B/criu dump -t $VP -D "$IMG" -L /work/empty --tcp-established --ext-unix-sk --file-locks \
-  --link-remap --ghost-limit "${GHOST_LIMIT:-1G}" "${CRIU_STREAM[@]}" -v"${CRIU_VERBOSITY:-4}" -o dump.log || { grep Error "$IMG/dump.log" | tail -10; fail CRIU_DUMP_FAILED; }
+  --link-remap --ghost-limit "${GHOST_LIMIT:-1G}" --libdir $B/criu-plugins "${CRIU_STREAM[@]}" -v"${CRIU_VERBOSITY:-4}" -o dump.log || { grep Error "$IMG/dump.log" | tail -10; fail CRIU_DUMP_FAILED; }
 wait $VP 2>/dev/null
 lap criu_dump "$T"
 if [ "$STREAM" = 1 ]; then
@@ -195,7 +209,8 @@ elif [ "$STREAM" = 0 ]; then
 fi
 if [ "$PHASE" = capture ]; then
   SRC_VISIBLE=("${ALL[@]}")
-  declare -p PIDS SRC SRC_VISIBLE > "$W/capture.env"
+  SRC_IP=$(hostname -i)
+  declare -p PIDS SRC SRC_VISIBLE SRC_IP > "$W/capture.env"
   cp "$W/vllm.log" "$W/vllm.log.captured"
   mkdir -p "$W/shm" && cp -a /dev/shm/. "$W/shm/"
   R[result]=CAPTURED; report; exit 0
@@ -204,11 +219,21 @@ fi
 
 rm -f "$W/restored.pid"
 T_RESTORE=$(now); T=$T_RESTORE
-unshare --net bash -c "LD_LIBRARY_PATH=$B/lib $B/ip link set lo up && LD_LIBRARY_PATH=$B/lib exec $B/criu restore \
-  -D $IMG -L /work/empty --tcp-established --ext-unix-sk --file-locks --link-remap --restore-detached \
-  ${CRIU_STREAM[*]} --pidfile $W/restored.pid -v${CRIU_VERBOSITY:-4} -o restore.log" || { grep Error "$IMG/restore.log" | tail -10; fail CRIU_RESTORE_FAILED; }
+RESTORE="LD_LIBRARY_PATH=$B/lib exec $B/criu restore -D $IMG -L /work/empty --ext-unix-sk --file-locks --link-remap \
+  --restore-detached ${CRIU_STREAM[*]} --pidfile $W/restored.pid -v${CRIU_VERBOSITY:-4} -o restore.log"
+if [ "${NET:-new}" = pod ]; then
+  # The source's sockets carry its pod address; Dynamo's CRIU plugin rewrites it to this pod's.
+  if [ -n "${SRC_IP:-}" ] && [ "$SRC_IP" != "$(hostname -i)" ]; then
+    echo "$SRC_IP $(hostname -i)" > "$W/inet-remap.map"
+    export SNAPSHOT_CRIU_INET_REMAP_FILE=$W/inet-remap.map
+  fi
+  bash -c "$RESTORE --tcp-established --libdir $B/criu-plugins" || { grep Error "$IMG/restore.log" | tail -10; fail CRIU_RESTORE_FAILED; }
+else
+  unshare --net bash -c "LD_LIBRARY_PATH=$B/lib $B/ip link set lo up && $RESTORE --tcp-established" \
+    || { grep Error "$IMG/restore.log" | tail -10; fail CRIU_RESTORE_FAILED; }
+fi
 lap criu_restore "$T"
-NETNS="nsenter --net=/proc/$(cat "$W/restored.pid")/ns/net"
+NETNS=; [ "${NET:-new}" = pod ] || NETNS="nsenter --net=/proc/$(cat "$W/restored.pid")/ns/net"
 GPUS=(); DEVICE_MAP=
 if [ "$PHASE" = restore ]; then
   GPUS=(--source "$(IFS=,; echo "${SRC_VISIBLE[*]}")" --target "$(IFS=,; echo "${ALL[*]}")" --visible "$(IFS=,; echo "${ALL[*]}")")
@@ -239,4 +264,4 @@ echo "after:  $(cat after.txt)"
 cmp -s before.txt after.txt && R[result]=MATCH || R[result]=DIFFER
 [ -n "${POST_CHECK:-}" ] && R[post_check]=$(NETNS=$NETNS "$POST_CHECK" 2> post-check.log | tail -1)
 report
-killall9
+[ "${KEEP:-0}" = 1 ] || killall9
