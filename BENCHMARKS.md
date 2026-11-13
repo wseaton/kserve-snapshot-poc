@@ -82,6 +82,30 @@ Dynamo Snapshot's agent passes that limit as a 32-bit field defaulting to 512 MB
 keep a region whose files reach 4 GiB, which a 128 GiB region's do. This follows from its source;
 it was not run.
 
+## Dynamo Snapshot and `snapshotd` on a large model
+
+DeepSeek-V4.1-Flash, TP=8 with expert parallel on one 8x H200 node, cuInterpose and the CUDA 13.1
+compat `libcuda`, weights released from the checkpoint. 2026-11-13.
+
+![Dynamo Snapshot and snapshotd](experiments/dynamo-comparison.png)
+
+| | Dynamo Snapshot | `snapshotd`, local disk | `snapshotd`, huge-page memory |
+| --- | --- | --- | --- |
+| Checkpoint size | 73 GB | 65.1 GB | 69.9 GB |
+| CUDA checkpoint | 14.4 s | 3.8 s | 3.9 s |
+| CRIU dump | 3m52s, to a shared NFS volume | 30.9 s | 16.9 s |
+| CRIU restore | 8.0 s | 4.4 s | 9.8 s |
+| CUDA restore | 11.3 s | 7.1 s | 7.0 s |
+| vLLM restore, with the weight reload | 31.2 s | 28.9 s | 29.6 s |
+| Cold boot | 150 s through KServe | 91.7 s | 90.7 s |
+
+Not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and its only storage
+backend is a volume claim, here NFS at about 315 MB/s. The `snapshotd` columns dump and restore
+inside one pod. Most of the capture gap is the storage; the CUDA checkpoint gap is the tool
+(one helper process for each PID in sequence against driver calls in parallel). Two nodes with
+`snapshotd` are in [experiments/p2p-transfer.md](experiments/p2p-transfer.md); the same model has
+not been run through Dynamo's agent across nodes on this stack.
+
 ## Not measured yet
 
 - Dynamo Snapshot's agent as a DaemonSet, restoring into another pod. A first TP=2 run captured in

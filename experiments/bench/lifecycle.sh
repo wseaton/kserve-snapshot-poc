@@ -18,6 +18,8 @@
 #   SLOTS, SLOT_MIB    shape of the registered pool (default 64, 64)
 #   XFER               snapshotd built with the nixl feature (default /models/bin/snapshotd-nixl)
 #   OUT                where the traces and the merged trace go (default ./lifecycle-<tag>)
+#   TITLE, SUBTITLE    headings for the rendered page (lifecycle.html in OUT); PNG=1 also
+#                      renders it to lifecycle.png with a headless Chrome
 #   RESTORE_WAIT       seconds to leave the target pod alone while it restores (default 150)
 # Everything restore-bench.sh reads (MODEL, TP, MODE, OVERLAY, SNAPSHOTD, COMPAT, ...) is passed
 # through to both pods.
@@ -122,3 +124,4 @@ fetch "$DST_POD" /work/receive-stream.json receive-stream.json
 fetch "$SRC_POD" /work/send-files.json send-files.json
 fetch "$DST_POD" /work/receive-files.json receive-files.json
 "$HERE/trace-merge.py" -o "$OUT/lifecycle.json" --phases "$OUT/phases.jsonl" "${TRACES[@]}"
+"$HERE/trace-render.py" "$OUT" --title "${TITLE:-$TAG}" --subtitle "${SUBTITLE:-}" ${PNG:+--png "$OUT/lifecycle.png"}

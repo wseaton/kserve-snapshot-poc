@@ -89,4 +89,7 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
   target. `restore-bench.sh` does the two halves with `PHASE=capture` and `PHASE=restore`.
 - `bench/trace-merge.py`: merges the transfer's sender and receiver traces with the harness
   phases.
+- `bench/trace-render.py <output dir> [--png FILE]`: draws a run as a standalone page that reads on
+  a phone: capture, transfer, restore and the cold boot beside them. `lifecycle.sh` writes it as
+  `lifecycle.html`.
 - Notes and results: [p2p-transfer.md](p2p-transfer.md), [memory-capture.md](memory-capture.md).
