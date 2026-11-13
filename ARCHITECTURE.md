@@ -309,6 +309,12 @@ number of replicas, and makes every serving namespace a Pod Security exception. 
 escape from a model server then starts with checkpoint and ptrace capabilities; with the node
 agent it starts with none.
 
+The kubelet column is out for now, for two reasons. It is generic: it checkpoints a container as
+it stands, and this design depends on steps only the application can take, which are quiescing
+vLLM, leaving the weights out and reloading them, ordering cuInterpose and cuda-checkpoint around
+CRIU, and mapping GPUs for the new pod. And the kubelet checkpoint API is not supported on
+OpenShift, which is a target platform. That leaves the node agent and the in-pod wrapper.
+
 This is not hypothetical. [snapshot-orchestrator](https://github.com/neuralmagic/snapshot-orchestrator)
 started as the in-pod design: a supervisor was PID 1 of the vLLM container, its image carried CRIU
 and `cuda-checkpoint`, and the orchestrator ran checkpoints by exec-ing into the workload pods.
@@ -342,7 +348,7 @@ on the daemon and not yet built:
 What was and was not checked here: Dynamo's agent settings are from its Helm chart, and the
 unprivileged workload pod is what the end-to-end runs used. The in-pod wrapper was run in
 snapshot-orchestrator, not in this proof of concept; the wider capability list is CRIU's
-documented requirement. The kubelet checkpoint path was not evaluated. Only the CUDA and cuInterpose parts of the Rust daemon
+documented requirement. The kubelet checkpoint path was not run; it is excluded on the grounds above. Only the CUDA and cuInterpose parts of the Rust daemon
 are built.
 
 Everything left of the interface is about KServe's objects and vLLM's state, and carries over.
