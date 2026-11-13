@@ -3,7 +3,7 @@
 A map of every object, decision and hand-off between an `LLMInferenceService` and a replica that
 serves from a checkpoint, as the proof of concept does it today with Dynamo Snapshot. Each piece
 is marked by who owns it, so the same map says what stays and what is replaced if the snapshot
-engine changes (see [DESIGN.md](DESIGN.md) for the Rust daemon that would replace it).
+engine changes (see [DESIGN.md](DESIGN.md) for the Rust daemon that would replace it, and [`daemon/`](daemon) for the part of it that exists).
 
 Three owners:
 

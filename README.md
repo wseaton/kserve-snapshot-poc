@@ -82,7 +82,7 @@ Node path only, one pod, restored onto other GPUs (mean of two runs):
 | 4 | cuInterpose, CUDA 13.1 `libcuda` | `snapshotd` | 1.9 s | 20.4 GB | 8.0 s | 48.8 s |
 | 4 | no cuInterpose (`patches/vllm/0003`) | `snapshotd` | 2.1 s | 22.1 GB | 15.1 s | 46.3 s |
 
-Restore is 3 to 6 times faster than a cold boot. `snapshotd` keeps the CUDA checkpoint near 2 s
+Restore is 3 to 6 times faster than a cold boot. [`snapshotd`](daemon) keeps the CUDA checkpoint near 2 s
 where Dynamo's helper grows with the worker count. Dropping cuInterpose runs on the host's 580
 driver and costs about 7 s of CUDA graph recapture on each restore.
 

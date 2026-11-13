@@ -1,7 +1,7 @@
 # Benchmarks
 
 Cold boot against restore from a CRIU checkpoint for vLLM at tensor parallel 2 and 4, with the
-phases broken out, and `snapshotd` against Dynamo Snapshot's CUDA path on the same workload.
+phases broken out, and [`snapshotd`](daemon) against Dynamo Snapshot's CUDA path on the same workload.
 The method and the scripts are in [`experiments/bench`](experiments/bench); the reasoning behind
 the configurations is in [DESIGN.md](DESIGN.md).
 
