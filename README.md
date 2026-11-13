@@ -8,6 +8,17 @@ RDMA through [ModelExpress](https://github.com/ai-dynamo/modelexpress).
 This repository holds every change the proof of concept makes to upstream projects as patch files
 against pinned commits, so each change reads as a diff, plus the KServe integration as a submodule.
 
+## Where things are
+
+- **The Rust daemon, `snapshotd`**: source in [`daemon/`](daemon) ([README](daemon/README.md)),
+  design in [DESIGN.md](DESIGN.md). It replaces Dynamo Snapshot's node agent; the CUDA checkpoint
+  and cuInterpose parts are built, the rest is design.
+- **Numbers**: [BENCHMARKS.md](BENCHMARKS.md), summarized under [Results](#results).
+- **What KServe has to manage, and where another snapshot engine plugs in**:
+  [ARCHITECTURE.md](ARCHITECTURE.md).
+- **The KServe integration**: [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot).
+- **Upstream changes**: [`patches/`](patches), described under [The patches](#the-patches).
+
 ## Layout
 
 | Path | What it is |
