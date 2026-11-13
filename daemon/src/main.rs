@@ -4,6 +4,11 @@
 //! a privileged container while the control loop is written.
 mod cuda;
 mod cuinterpose;
+mod image;
+#[cfg(feature = "nixl")]
+mod trace;
+#[cfg(feature = "nixl")]
+mod transfer;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,6 +33,78 @@ enum Command {
     /// cuInterpose shared-memory tracking.
     #[command(subcommand)]
     Cuinterpose(CuinterposeCommand),
+    /// Hold a checkpoint in huge-page memory.
+    #[command(subcommand)]
+    Image(ImageCommand),
+    /// Copy a checkpoint directory to another node over RDMA.
+    #[cfg(feature = "nixl")]
+    #[command(subcommand)]
+    Transfer(TransferCommand),
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// Take one `criu dump --stream` into memory, then answer every
+    /// `criu restore --stream` from it until killed.
+    Hold {
+        /// The directory given to CRIU as its images directory.
+        #[arg(long)]
+        images_dir: PathBuf,
+        /// Size of each huge-page segment.
+        #[arg(long, default_value_t = 4)]
+        segment_gib: usize,
+        /// Memory to map and fault in before CRIU starts; the expected
+        /// checkpoint size.
+        #[arg(long, default_value_t = 0)]
+        reserve_gib: usize,
+    },
+}
+
+#[cfg(feature = "nixl")]
+#[derive(Subcommand)]
+enum TransferCommand {
+    /// Wait for one sender and write what it sends under a directory.
+    Receive {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value = "0.0.0.0:7700")]
+        listen: String,
+        /// Write with O_DIRECT, past the page cache and its dirty limits.
+        #[arg(long)]
+        direct: bool,
+        #[command(flatten)]
+        hold: transfer::Hold,
+        /// Write a per-chunk timeline here, in the Chrome trace event format.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Take one `criu dump --stream` and send it to a receiver as it arrives.
+    Stream {
+        /// The directory given to CRIU as its images directory.
+        #[arg(long)]
+        images_dir: PathBuf,
+        /// The receiver's address and port.
+        #[arg(long)]
+        to: String,
+        #[command(flatten)]
+        pool: transfer::Pool,
+        /// Write a per-chunk timeline here, in the Chrome trace event format.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Send every file under a directory to a receiver.
+    Send {
+        #[arg(long)]
+        dir: PathBuf,
+        /// The receiver's address and port.
+        #[arg(long)]
+        to: String,
+        #[command(flatten)]
+        pool: transfer::Pool,
+        /// Write a per-chunk timeline here, in the Chrome trace event format.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +168,33 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Cuda(command) => cuda_command(command),
         Command::Cuinterpose(command) => cuinterpose_command(command),
+        Command::Image(ImageCommand::Hold {
+            images_dir,
+            segment_gib,
+            reserve_gib,
+        }) => image::hold(&images_dir, segment_gib << 30, reserve_gib << 30),
+        #[cfg(feature = "nixl")]
+        Command::Transfer(TransferCommand::Receive {
+            dir,
+            listen,
+            direct,
+            hold,
+            trace,
+        }) => transfer::receive_directory(&dir, &listen, direct, hold, trace),
+        #[cfg(feature = "nixl")]
+        Command::Transfer(TransferCommand::Stream {
+            images_dir,
+            to,
+            pool,
+            trace,
+        }) => transfer::stream_capture(&images_dir, &to, pool, trace),
+        #[cfg(feature = "nixl")]
+        Command::Transfer(TransferCommand::Send {
+            dir,
+            to,
+            pool,
+            trace,
+        }) => transfer::send_directory(&dir, &to, pool, trace),
     }
 }
 

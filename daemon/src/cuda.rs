@@ -239,8 +239,11 @@ impl GpuUuid {
 pub struct GpuMap(Vec<(GpuUuid, GpuUuid)>);
 
 impl GpuMap {
-    /// Map `source[i]` to `target[i]` and complete the bijection over
-    /// `visible` with the displaced GPUs, keeping every other GPU in place.
+    /// Map `source[i]` to `target[i]`. On the node the checkpoint was taken
+    /// on, the bijection over `visible` is completed with the displaced
+    /// GPUs and every other GPU stays in place. For a checkpoint from
+    /// another node, whose GPUs are not visible here, every visible GPU that
+    /// is not a target maps to itself.
     pub fn new(source: &[GpuUuid], target: &[GpuUuid], visible: &[GpuUuid]) -> Result<Self> {
         ensure!(
             source.len() == target.len(),
@@ -249,7 +252,7 @@ impl GpuMap {
             target.len()
         );
         let visible_set: BTreeSet<_> = visible.iter().copied().collect();
-        for gpu in source.iter().chain(target) {
+        for gpu in target {
             ensure!(visible_set.contains(gpu), "{gpu} is not visible");
         }
         ensure!(
@@ -260,6 +263,25 @@ impl GpuMap {
         if source == target {
             return Ok(Self::default());
         }
+        let local = source
+            .iter()
+            .filter(|gpu| visible_set.contains(gpu))
+            .count();
+        if local == 0 {
+            let mut pairs: Vec<(GpuUuid, GpuUuid)> =
+                source.iter().copied().zip(target.iter().copied()).collect();
+            pairs.extend(
+                visible_set
+                    .iter()
+                    .filter(|gpu| !target.contains(gpu))
+                    .map(|&gpu| (gpu, gpu)),
+            );
+            return Ok(Self(pairs));
+        }
+        ensure!(
+            local == source.len(),
+            "some source GPUs are visible and some are not"
+        );
         let mut pairs: Vec<(GpuUuid, GpuUuid)> =
             source.iter().copied().zip(target.iter().copied()).collect();
         let (unmoved, displaced): (Vec<GpuUuid>, Vec<GpuUuid>) = visible_set
@@ -372,6 +394,32 @@ mod tests {
         assert!(map.0.contains(&(all[1], all[2])));
         assert!(map.0.contains(&(all[2], all[0])));
         assert!(map.0.contains(&(all[3], all[3])));
+    }
+
+    #[test]
+    fn checkpoint_from_another_node_maps_onto_every_visible_gpu() {
+        let here = gpus(4);
+        let there: Vec<GpuUuid> = (0..4)
+            .map(|i| {
+                format!("GPU-{i:08x}-aaaa-bbbb-cccc-202baf8a3566")
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        let map = GpuMap::new(&there, &here, &here).unwrap();
+        assert_eq!(map.pairs().count(), 4);
+        for i in 0..4 {
+            assert!(map.0.contains(&(there[i], here[i])));
+        }
+        assert!(!map.is_identity());
+
+        let partial = GpuMap::new(&there[0..2], &here[1..3], &here).unwrap();
+        assert_eq!(partial.pairs().count(), 4);
+        assert!(partial.0.contains(&(there[0], here[1])));
+        assert!(partial.0.contains(&(there[1], here[2])));
+        assert!(partial.0.contains(&(here[0], here[0])));
+        assert!(partial.0.contains(&(here[3], here[3])));
+        assert!(GpuMap::new(&[there[0], here[1]], &here[2..4], &here).is_err());
     }
 
     #[test]

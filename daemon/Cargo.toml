@@ -17,10 +17,17 @@ cuinterpose-protocol = { git = "https://github.com/ai-dynamo/snapshot", rev = "b
 hex = "0.4"
 libc = "0.2"
 libloading = "0.8"
+nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
+prost = "0.14"
+rustix = { version = "1", features = ["mm", "net", "pipe"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 uuid = "1"
+walkdir = { version = "2", optional = true }
+
+[features]
+nixl = ["dep:nixl-sys", "dep:walkdir"]
 
 [lints.clippy]
 all = "warn"

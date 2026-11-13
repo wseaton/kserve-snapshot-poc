@@ -14,6 +14,9 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
   design in [DESIGN.md](DESIGN.md). It replaces Dynamo Snapshot's node agent; the CUDA checkpoint
   and cuInterpose parts are built, the rest is design.
 - **Numbers**: [BENCHMARKS.md](BENCHMARKS.md), summarized under [Results](#results).
+- **Capture on one node, restore on another over RDMA**:
+  [experiments/p2p-transfer.md](experiments/p2p-transfer.md), with a
+  [picture of the whole lifecycle](experiments/cross-node-lifecycle.png).
 - **What KServe has to manage, and where another snapshot engine plugs in**:
   [ARCHITECTURE.md](ARCHITECTURE.md).
 - **The KServe integration**: [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot).
@@ -108,6 +111,16 @@ CPU KV offload (`--kv-offloading-size`) at TP=2:
 | none | | 11.3 GB | 14.7 s | 43.3 s |
 | 128 GiB | kept in the checkpoint (stock vLLM) | 139.4 GB | 82.8 s | 75.5 s |
 | 128 GiB | released (`patches/vllm/0005`) | 11.4 GB | 43.3 s | 74.5 s |
+
+Across two nodes with `snapshotd`, gpt-oss-120b at TP=4 with a 106 GB checkpoint: CRIU streams
+into an RDMA sender while it dumps and the second node restores from RAM
+([details](experiments/p2p-transfer.md)):
+
+| | Local disk, dump then copy | RAM, streamed during the dump |
+| --- | --- | --- |
+| Checkpoint start to image on the second node | 98.0 s | 33.0 to 33.8 s |
+| Restore on the second node | 26.3 s | 17.2 to 18.6 s |
+| Cold boot | 72.5 s | 72.5 s |
 
 End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
 ([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):

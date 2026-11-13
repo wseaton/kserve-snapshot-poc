@@ -80,3 +80,13 @@ OVERLAY=/exp/overlay.tgz NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 \
 ```
 
 Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM in the pod.
+
+## Two nodes
+
+- `bench/lifecycle.sh <tag> [vllm args]`: capture on one bench pod, copy to another over RDMA
+  through the `xfer` container, restore there, and merge everything into one Perfetto trace.
+  `OVERLAP=1` streams the dump as it is taken; `IMG_DIR=/mem/<tag>` keeps the image in RAM on the
+  target. `restore-bench.sh` does the two halves with `PHASE=capture` and `PHASE=restore`.
+- `bench/trace-merge.py`: merges the transfer's sender and receiver traces with the harness
+  phases.
+- Notes and results: [p2p-transfer.md](p2p-transfer.md), [memory-capture.md](memory-capture.md).

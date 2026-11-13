@@ -30,15 +30,31 @@ spec:
     - {name: models, mountPath: /models}
     - {name: compile-cache, mountPath: /compile-cache}
     - {name: work, mountPath: /work}
+    - {name: mem, mountPath: /mem}
     - {name: dshm, mountPath: /dev/shm}
     - {name: cuinterpose, mountPath: /tmp/snapshot-cuda, readOnly: true}
     - {name: compat, mountPath: /compat, readOnly: true}
     - {name: device-plugins, mountPath: /host-device-plugins, readOnly: true}
+  # Copies /work/<tag> to or from another node: snapshotd built with the nixl feature.
+  - name: xfer
+    image: quay.io/wseaton/nixl-regbench@sha256:da96ebb45ccd74f4e6259aa4a744a8c00ad22e9ec3dd1805da1378977536b241
+    command: [sleep, infinity]
+    env: [{name: HOME, value: /tmp}]
+    securityContext: {capabilities: {add: [IPC_LOCK, SYS_RESOURCE]}}
+    resources:
+      requests: {cpu: "8", memory: 16Gi, rdma/ib: "1"}
+      limits: {memory: 256Gi, rdma/ib: "1"}
+    volumeMounts:
+    - {name: models, mountPath: /models}
+    - {name: work, mountPath: /work}
+    - {name: mem, mountPath: /mem}
   volumes:
   - {name: exp, configMap: {name: restore-bench, defaultMode: 0755}}
   - {name: models, persistentVolumeClaim: {claimName: snapshot-bench-models}}
   - {name: compile-cache, persistentVolumeClaim: {claimName: snapshot-bench-compile-cache}}
   - {name: work, emptyDir: {}}
+  # RAM-backed, for checkpoints that should not touch a disk (IMG_DIR=/mem/... in lifecycle.sh).
+  - {name: mem, emptyDir: {medium: Memory, sizeLimit: 256Gi}}
   - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
   - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
   - name: cuinterpose
