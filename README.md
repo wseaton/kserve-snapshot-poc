@@ -13,6 +13,8 @@ against pinned commits, so each change reads as a diff, plus the KServe integrat
 - **The Rust daemon, `snapshotd`**: source in [`daemon/`](daemon) ([README](daemon/README.md)),
   design in [DESIGN.md](DESIGN.md). It replaces Dynamo Snapshot's node agent; the CUDA checkpoint
   and cuInterpose parts are built, the rest is design.
+- **How this differs from Dynamo Snapshot, and what each optimization is worth**:
+  [DIFFERENCES.md](DIFFERENCES.md).
 - **Numbers**: [BENCHMARKS.md](BENCHMARKS.md), summarized under [Results](#results).
 - **Capture on one node, restore on another over RDMA**:
   [experiments/p2p-transfer.md](experiments/p2p-transfer.md), with a
