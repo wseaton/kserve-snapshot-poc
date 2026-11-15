@@ -7,7 +7,7 @@ and where Dynamo Snapshot is ahead.
 Numbers for Dynamo Snapshot come from two places and are marked: **published** is NVIDIA's
 [2026-11-10 post](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot)
 (B200, VAST NFS); **measured** is Dynamo Snapshot run on the same H200 cluster as everything else
-here ([BENCHMARKS.md](BENCHMARKS.md)).
+here ([BENCHMARKS.md](benchmarks.md)).
 
 ## The short version
 
@@ -23,7 +23,7 @@ DeepSeek-V4.1-Flash, vLLM, 8 GPUs with tensor and expert parallel:
 | Restore with no replica serving | 31.0 s | 101.5 s from a cold shared volume |
 
 Different GPUs and storage, one run on our side, and NVIDIA does not say whether its restore was
-on another node. Details in [experiments/p2p-transfer.md](experiments/p2p-transfer.md).
+on another node. Details in [experiments/p2p-transfer.md](cross-node.md).
 
 ## What is the same
 
@@ -45,7 +45,7 @@ capture and put back on the GPUs by the driver at restore. NVIDIA's May post des
 them out as future work.
 
 Here vLLM frees the weights at prepare (`--checkpoint-release-weights`,
-[patches/vllm](patches/vllm)) and loads them again after the driver restore.
+[patches/vllm](../patches/vllm)) and loads them again after the driver restore.
 
 | Effect | Dynamo Snapshot | Here |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ Here vLLM frees the weights at prepare (`--checkpoint-release-weights`,
 | CUDA restore, 8 GPUs | 18 to 29 s published | 7.3 s |
 | Cost moved to restore | none | the weight reload: 7.0 s from a peer, 88.4 s from a cold volume |
 
-The same change is applied to CPU KV offload memory ([patch 0005](patches/vllm)): with a 128 GiB
+The same change is applied to CPU KV offload memory ([patch 0005](../patches/vllm)): with a 128 GiB
 offload region the checkpoint is 139.4 GB kept and 11.4 GB released.
 
 ### 2. Weights come from a serving replica
@@ -85,8 +85,8 @@ DeepSeek TP=8 (10 CUDA processes): 14.4 s with the helper, 3.8 s with `snapshotd
 
 Dynamo Snapshot is a Go DaemonSet agent, driven by its operator, generic over vLLM, SGLang and
 TensorRT-LLM. `snapshotd` is a Rust daemon for vLLM under KServe only. The reasons, the privilege
-model and what KServe has to lifecycle are in [DESIGN.md](DESIGN.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md). The kubelet checkpoint API is not used by either.
+model and what KServe has to lifecycle are in [DESIGN.md](design.md) and
+[ARCHITECTURE.md](architecture.md). The kubelet checkpoint API is not used by either.
 
 ## Our optimizations, and what each is worth
 
@@ -105,7 +105,7 @@ model and what KServe has to lifecycle are in [DESIGN.md](DESIGN.md) and
 | Compile caches on a shared volume | bench pod | | cold boot 104.7 s; the target maps the same files |
 
 What a cross-node restore needed beyond speed, all in
-[experiments/p2p-transfer.md](experiments/p2p-transfer.md#what-a-cross-node-restore-needs):
+[experiments/p2p-transfer.md](cross-node.md#what-a-cross-node-restore-needs):
 
 - **GPU placement by position.** The driver restores each device to the same enumeration position
   it had on the source, so the pod must own those positions on the target and the device map must

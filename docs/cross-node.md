@@ -3,9 +3,9 @@
 2026-11-13. The checkpoint is taken on one node's local disk or streamed straight off CRIU, copied
 to a second node over InfiniBand with NIXL, and restored there. Code:
 [`daemon/src/transfer.rs`](../daemon/src/transfer.rs) (`snapshotd transfer send|stream|receive`,
-behind the `nixl` feature), driven by [`bench/lifecycle.sh`](bench/lifecycle.sh).
+behind the `nixl` feature), driven by [`bench/lifecycle.sh`](../experiments/bench/lifecycle.sh).
 
-![Capture on one node, restore on another](cross-node-lifecycle.png)
+![Capture on one node, restore on another](img/cross-node-lifecycle.png)
 
 ## How the copy works
 
@@ -83,7 +83,7 @@ cuInterpose with the CUDA 13.1 compat `libcuda`, weights released at prepare and
 the shared volume (476 GB on disk), CRIU streamed into the second node's RAM-backed directory
 (`OVERLAP=1 IMG_DIR=/mem/...`, 76 GiB primed in 1.4 s).
 
-![DeepSeek-V4.1-Flash across two nodes](deepseek-cross-node.png)
+![DeepSeek-V4.1-Flash across two nodes](img/deepseek-cross-node.png)
 
 | | Seconds |
 | --- | --- |
@@ -115,7 +115,7 @@ of those to the same prompt on consecutive requests.
 Same configuration with `MX=1 NET=pod PEER=1`: after the capture a server is cold-booted again on
 the source node and the restored workers pull their weights from it over ModelExpress.
 
-![DeepSeek-V4.1-Flash across two nodes, weights from the peer](deepseek-cross-node-peer.png)
+![DeepSeek-V4.1-Flash across two nodes, weights from the peer](img/deepseek-cross-node-peer.png)
 
 | | Seconds |
 | --- | --- |

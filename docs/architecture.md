@@ -3,7 +3,7 @@
 A map of every object, decision and hand-off between an `LLMInferenceService` and a replica that
 serves from a checkpoint, as the proof of concept does it today with Dynamo Snapshot. Each piece
 is marked by who owns it, so the same map says what stays and what is replaced if the snapshot
-engine changes (see [DESIGN.md](DESIGN.md) for the Rust daemon that would replace it, and [`daemon/`](daemon) for the part of it that exists).
+engine changes (see [DESIGN.md](design.md) for the Rust daemon that would replace it, and [`daemon/`](../daemon) for the part of it that exists).
 
 Three owners:
 
@@ -173,7 +173,7 @@ shapes the pod for restore directly, on any node that mounts the checkpoint stor
 ## The engine boundary
 
 Rows 8, 10 to 13 and the signals in 16 and 18 are the whole surface between the integration and
-the engine. DESIGN.md names it as an interface with three calls. Behind it, both engines run the
+the engine. [design.md](design.md) names it as an interface with three calls. Behind it, both engines run the
 same three tools in the same order; they differ in who drives them and how.
 
 ```mermaid
@@ -338,7 +338,7 @@ on the daemon and not yet built:
 - Run it only on GPU nodes that serve snapshotted workloads, in its own namespace, and have it act
   only on pods the integration has labelled and that a request names.
 - Limit its RBAC to reading pods and writing its own objects and one pod condition.
-- Keep the privileged part small. DESIGN.md has a single-threaded worker forked for each job do
+- Keep the privileged part small. [design.md](design.md) has a single-threaded worker forked for each job do
   the namespace entry and the CRIU call, so the long-lived control loop never enters a workload's
   namespaces. Dynamo's agent also sets `hostNetwork` and `hostIPC`; whether the daemon can drop
   them is open.

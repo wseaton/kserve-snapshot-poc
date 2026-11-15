@@ -1,165 +1,99 @@
 # kserve-snapshot-poc
 
-Scale out KServe `LLMInferenceService` replicas by restoring vLLM from a
-[Dynamo Snapshot](https://github.com/ai-dynamo/snapshot) CRIU checkpoint instead of cold-booting it,
-with the weights left out of the checkpoint and refilled on restore from a running replica over
-RDMA through [ModelExpress](https://github.com/ai-dynamo/modelexpress).
+Scale out KServe `LLMInferenceService` replicas by restoring vLLM from a CRIU checkpoint instead
+of cold-booting it. The weights are left out of the checkpoint and pulled on restore from a
+replica that is already serving, over InfiniBand through
+[ModelExpress](https://github.com/ai-dynamo/modelexpress). The checkpoint itself is streamed to the
+target node's RAM while it is being taken.
 
-This repository holds every change the proof of concept makes to upstream projects as patch files
-against pinned commits, so each change reads as a diff, plus the KServe integration as a submodule.
+It starts from [NVIDIA Dynamo Snapshot](https://github.com/ai-dynamo/snapshot) and replaces its
+node agent with `snapshotd`, a Rust daemon written for vLLM.
 
-## Where things are
+![Seconds until a DeepSeek-V4.1-Flash replica serves on 8 GPUs](docs/img/headline.svg)
 
-- **The Rust daemon, `snapshotd`**: source in [`daemon/`](daemon) ([README](daemon/README.md)),
-  design in [DESIGN.md](DESIGN.md). It replaces Dynamo Snapshot's node agent; the CUDA checkpoint
-  and cuInterpose parts are built, the rest is design.
-- **How this differs from Dynamo Snapshot, and what each optimization is worth**:
-  [DIFFERENCES.md](DIFFERENCES.md).
-- **Numbers**: [BENCHMARKS.md](BENCHMARKS.md), summarized under [Results](#results).
-- **Capture on one node, restore on another over RDMA**:
-  [experiments/p2p-transfer.md](experiments/p2p-transfer.md), with a
-  [picture of the whole lifecycle](experiments/cross-node-lifecycle.png).
-- **What KServe has to manage, and where another snapshot engine plugs in**:
-  [ARCHITECTURE.md](ARCHITECTURE.md).
-- **The KServe integration**: [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot).
-- **Upstream changes**: [`patches/`](patches), described under [The patches](#the-patches).
+DeepSeek-V4.1-Flash, tensor and expert parallel on 8 H200s, captured on one node and restored on
+another. One run of each; the published figure is NVIDIA's, on different hardware.
+[How the numbers compare](docs/differences.md).
 
-## Layout
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph source[Source node]
+    direction TB
+    serve[vLLM, serving]
+    prepare["/checkpoint/prepare<br/>free KV cache and weights"]
+    cuda["snapshotd: CUDA checkpoint<br/>every process at once"]
+    dump["criu dump --stream"]
+    send["snapshotd transfer stream"]
+    serve --> prepare --> cuda --> dump --> send
+  end
+  subgraph target[Target node]
+    direction TB
+    receive["snapshotd transfer receive<br/>image held in RAM"]
+    criu[criu restore]
+    gpu["snapshotd: CUDA restore<br/>onto this pod's GPUs"]
+    restore["/checkpoint/restore<br/>reload weights, rebuild KV cache"]
+    ready[vLLM, serving]
+    receive --> criu --> gpu --> restore --> ready
+  end
+  peer[A replica that is serving]
+  send == "InfiniBand, during the dump" ==> receive
+  peer == "weights, GPU to GPU" ==> restore
+```
+
+1. **Prepare.** vLLM drains, then frees its KV cache and its weights. What is left on the GPUs is
+   small, so the driver checkpoints and restores it quickly.
+2. **Capture.** `snapshotd` checkpoints every CUDA process in parallel, and CRIU dumps into a
+   pipe that `snapshotd` sends over RDMA as it fills. Nothing is written on the source.
+3. **Restore.** The target restores from the image in its RAM, the driver puts GPU state back,
+   and vLLM pulls its weights from a serving replica. With no replica serving it reads them from
+   the model volume, which is the slow case in the chart.
+
+A whole run, with the transfer rate and each phase, as the bench harness draws it:
+
+![DeepSeek-V4.1-Flash across two nodes, weights from the peer](docs/img/deepseek-cross-node-peer.png)
+
+## Documentation
+
+| If you want to know | Read |
+| --- | --- |
+| How this differs from Dynamo Snapshot, and what each optimization is worth | [docs/differences.md](docs/differences.md) |
+| Every measurement, with setup and caveats | [docs/benchmarks.md](docs/benchmarks.md) |
+| How capture on one node and restore on another works, and what went wrong on the way | [docs/cross-node.md](docs/cross-node.md) |
+| How the image is held in huge-page memory | [docs/memory-capture.md](docs/memory-capture.md) |
+| Why a Rust daemon, its privilege model, and the experiments behind it | [docs/design.md](docs/design.md) |
+| What KServe has to lifecycle, with diagrams, and where another engine plugs in | [docs/architecture.md](docs/architecture.md) |
+| What `snapshotd` does today and how to build it | [daemon/README.md](daemon/README.md) |
+| What each upstream patch changes | [patches/README.md](patches/README.md) |
+| How to rerun an experiment | [experiments/README.md](experiments/README.md) |
+
+## Results at a glance
+
+| Workload | Cold boot | Restore | Details |
+| --- | --- | --- | --- |
+| DeepSeek-V4.1-Flash, TP=8 with expert parallel, two nodes, weights from a serving replica | 104.7 s | 20.5 s | [cross-node](docs/cross-node.md#weights-from-the-serving-peer) |
+| The same, weights from the model volume | 166.1 s | 42.9 to 101.5 s | [cross-node](docs/cross-node.md#deepseek-v41-flash-tp8-two-whole-nodes) |
+| gpt-oss-120b, TP=4, two nodes, 106 GB checkpoint | 72.5 s | 17.2 to 18.6 s | [cross-node](docs/cross-node.md#results) |
+| Qwen3-8B, TP=4, one node, onto other GPUs | 48.8 s | 8.0 s | [benchmarks](docs/benchmarks.md#snapshotd-against-dynamos-cuda-path) |
+| Qwen3-8B, TP=1, through KServe, pod creation to Ready | 89 s | 37 to 41 s | [benchmarks](docs/benchmarks.md#end-to-end-through-kserve) |
+
+Capture, from the start of the checkpoint to a complete image on the second node: 25.5 s for
+DeepSeek (74 GB), 33.0 s for gpt-oss-120b (106 GB).
+
+## Repository layout
 
 | Path | What it is |
 | --- | --- |
-| [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot) | Submodule. The KServe integration: an `LLMInferenceServiceConfig` layer, the snapshot entrypoint that wraps `vllm serve`, a companion admission webhook and controller that capture a revision on its first scale-up and restore later replicas from it, and the end-to-end smoke tests. |
-| [`patches/vllm/`](patches/vllm) | vLLM changes on `a2bcb565` (a nightly that includes the checkpoint lifecycle from [vllm-project/vllm#62570](https://github.com/vllm-project/vllm/pull/62570)). |
-| [`patches/modelexpress/`](patches/modelexpress) | ModelExpress changes on `main` (`8b2e8787`), which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854). |
-| [`patches/dynamo-snapshot/`](patches/dynamo-snapshot) | Dynamo Snapshot agent changes on `bc9d216` for CoreWeave's GPU device plugin. |
-| [`DESIGN.md`](DESIGN.md) | A Rust node daemon in place of Dynamo Snapshot, and the TP=2 experiments behind it. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | What KServe has to lifecycle for snapshot scale-out, with diagrams, and the boundary a different snapshot engine would plug into. |
-| [`BENCHMARKS.md`](BENCHMARKS.md) | Cold boot against restore at TP=2 and TP=4, `snapshotd` against Dynamo's CUDA path, and CPU KV offload kept or deferred. |
-| [`daemon/`](daemon) | `snapshotd`, the Rust node path so far: CUDA checkpoint through the driver API with GPU remap, and the cuInterpose integration. |
-| [`experiments/`](experiments) | Scripts and pod specs for the experiments in DESIGN.md. |
-| [`upstream.tsv`](upstream.tsv) | Each project's upstream repository, base commit and fork branch. |
-| [`checkout.sh`](checkout.sh) | `./checkout.sh vllm` clones a project at its base commit into `src/` and applies its patches. |
-
-## The patches
-
-**vLLM**
-- `0001`: [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011) (open), carried
-  unchanged. Sleep, wake and in-place reload hooks on `BaseModelLoader`, which ModelExpress uses
-  to stop serving before its memory is freed and to refill weights from a peer.
-- `0002`: `--checkpoint-release-weights`. `/checkpoint/prepare` also discards the weights, so the
-  checkpoint does not contain them, and `/checkpoint/restore` wakes them and reloads them through
-  the model loader before the KV cache. Upstream #62570 keeps the weights in GPU memory, and so in
-  the checkpoint.
-- `0003`: `/checkpoint/prepare` destroys the NCCL communicator and `/checkpoint/restore` creates a
-  new one, releasing CUDA graphs before and capturing them again after. At TP>1 with custom
-  all-reduce off, no CUDA memory is shared between workers when the process is checkpointed, and
-  cuda-checkpoint alone restores them, onto other GPUs too.
-- `0004`: the connector hooks of [vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371)
-  (open), its first commit backported: KV connectors get `checkpoint_prepare` and
-  `checkpoint_restore`, and the engine refuses to prepare with a connector that does not declare
-  `supports_checkpoint`. Its NIXL prefill/decode commit is not carried.
-- `0005`: stacked on those hooks. With the CPU KV offload connector (`--kv-offloading-size`),
-  `/checkpoint/prepare` frees the offload region and `/checkpoint/restore` refills it, so the
-  checkpoint does not grow by the region size. No flag: stock vLLM keeps the region.
-
-**ModelExpress**
-- `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
-  `MX_POD_INFO_DIR`, and resolve the worker host from the network. A process restored into another
-  pod keeps the environment of the pod it was checkpointed in, so without this it would publish
-  itself to the ModelExpress server as the donor.
-
-**Dynamo Snapshot**
-- `0001`: accept CoreWeave's volume-mounts `NVIDIA_VISIBLE_DEVICES`, skip the per-GPU device-list
-  marker mounts at dump, and log every CRIU error line on a failed restore.
-- `0002`: expose cuInterpose's coordinator as a library, so a node agent can run its phases
-  in-process. Proposed for upstream; see [DESIGN.md](DESIGN.md).
-
-## How a scale-out works
-
-1. A new revision's first replica is held unscheduled with a scheduling gate. A `SnapshotJob`
-   donor runs on the capacity it would use, loads the model, warms up and calls
-   `/checkpoint/prepare`, which drains, frees the KV cache and the weights and tears down the
-   communicators. The agent checkpoints it.
-2. The held replica, and every replica added later, restores from that checkpoint and calls
-   `/checkpoint/restore`. vLLM rebuilds the communicators and reloads the weights through
-   ModelExpress, which pulls them from a running replica over RDMA, or from disk when there is
-   none, and publishes the replica as a source for the next one.
-
-## Results
-
-Qwen3-8B on 8x H200 nodes, weights left out of the checkpoint and reloaded from a network volume,
-the restored server checked against the source with a greedy completion. Full tables, setup and
-caveats are in [BENCHMARKS.md](BENCHMARKS.md).
-
-Node path only, one pod, restored onto other GPUs (mean of two runs):
-
-| TP | Configuration | CUDA tool | CUDA checkpoint | Image | Restore | Cold boot |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2 | cuInterpose, CUDA 13.1 `libcuda` | Dynamo helper | 2.0 s | 11.0 GB | 7.4 s | 46.3 s |
-| 2 | cuInterpose, CUDA 13.1 `libcuda` | `snapshotd` | 1.5 s | 11.0 GB | 7.1 s | 46.3 s |
-| 2 | no cuInterpose (`patches/vllm/0003`) | `snapshotd` | 1.6 s | 11.7 GB | 13.6 s | 45.3 s |
-| 4 | cuInterpose, CUDA 13.1 `libcuda` | Dynamo helper | 4.1 s | 20.5 GB | 8.8 s | 49.3 s |
-| 4 | cuInterpose, CUDA 13.1 `libcuda` | `snapshotd` | 1.9 s | 20.4 GB | 8.0 s | 48.8 s |
-| 4 | no cuInterpose (`patches/vllm/0003`) | `snapshotd` | 2.1 s | 22.1 GB | 15.1 s | 46.3 s |
-
-Restore is 3 to 6 times faster than a cold boot. [`snapshotd`](daemon) keeps the CUDA checkpoint near 2 s
-where Dynamo's helper grows with the worker count. Dropping cuInterpose runs on the host's 580
-driver and costs about 7 s of CUDA graph recapture on each restore.
-
-CPU KV offload (`--kv-offloading-size`) at TP=2:
-
-| Offload | Region | Image | Restore | Cold boot |
-| --- | --- | --- | --- | --- |
-| none | | 11.3 GB | 14.7 s | 43.3 s |
-| 128 GiB | kept in the checkpoint (stock vLLM) | 139.4 GB | 82.8 s | 75.5 s |
-| 128 GiB | released (`patches/vllm/0005`) | 11.4 GB | 43.3 s | 74.5 s |
-
-Across two nodes with `snapshotd`, gpt-oss-120b at TP=4 with a 106 GB checkpoint: CRIU streams
-into an RDMA sender while it dumps and the second node restores from RAM
-([details](experiments/p2p-transfer.md)):
-
-| | Local disk, dump then copy | RAM, streamed during the dump |
-| --- | --- | --- |
-| Checkpoint start to image on the second node | 98.0 s | 33.0 to 33.8 s |
-| Restore on the second node | 26.3 s | 17.2 to 18.6 s |
-| Cold boot | 72.5 s | 72.5 s |
-
-DeepSeek-V4.1-Flash at TP=8 with expert parallel, 8 H200s on each of two nodes, weights released
-from the checkpoint ([details](experiments/p2p-transfer.md#deepseek-v41-flash-tp8-two-whole-nodes)):
-
-| | Weights from the shared volume | Weights from the serving peer |
-| --- | --- | --- |
-| Checkpoint start to image on the second node | 27.9 s, 69.9 GB | 25.5 s, 74.3 GB |
-| Restore on the second node | 101.5 s cold page cache, 42.9 s warm | 20.5 s |
-| Cold boot | 166.1 s cold page cache | 104.7 s warm |
-
-![DeepSeek-V4.1-Flash across two nodes](experiments/deepseek-cross-node-peer.png)
-
-End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
-([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):
-
-| Run | Restored replica Ready | Cold boot Ready |
-| --- | --- | --- |
-| TP=1, weights from a peer over InfiniBand | 37 to 41 s | 89 s |
-| TP=2, restored on another node | 62 s | 177 s |
-| TP=8, restored on another node | 97 s | 391 s |
-| DeepSeek-V4.1-Flash, TP=8 + expert parallel, same node | 60 s | 148 s |
+| [`daemon/`](daemon) | `snapshotd`: CUDA checkpoint and restore through the driver API with GPU remap, the cuInterpose integration, image streaming and the RDMA transfer. |
+| [`patches/`](patches) | Changes to vLLM, ModelExpress and Dynamo Snapshot as patch files against pinned commits ([`upstream.tsv`](upstream.tsv)). `./checkout.sh vllm` applies a project's patches to a clean clone in `src/`. |
+| [`experiments/`](experiments) | Pod specs and scripts for every measurement: `in-place/`, `criu/` and `bench/`, which holds the two-node harness and the trace renderer. |
+| [`docs/`](docs) | The documents above and their images. |
+| [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot) | Submodule. The KServe integration on Dynamo Snapshot's agent: config layer, entrypoint, admission webhook and controller, smoke tests. |
 
 ## Status
 
-The restore path built on these patches runs end to end (2026-11-05, Qwen3-8B TP=1 on 8x H200
-with ConnectX-7 InfiniBand, scaled out one replica at a time to 4):
-
-| Replica | Weights | Ready |
-| --- | --- | --- |
-| 1, held for capture | from disk through ModelExpress, no peer yet | 156 s after creation, including the donor's cold boot and the capture |
-| 2 to 4 | 16.4 GB from a running replica over RDMA in 0.64 to 1.73 s (76 to 205 Gbps), inside `/checkpoint/restore` | 37 to 41 s after scale-up |
-| cold boot | ModelExpress's normal load from a peer, 0.73 s | 89 s |
-
-Every completion was token-identical to the first replica's, and each restored replica published
-itself to ModelExpress under its own pod identity.
-
-An earlier version of the restore path (a vLLM worker extension driven over vLLM's dev
-endpoints) also ran at TP=2 and TP=8 with replicas on two nodes: each rank pulled its shard from
-its peer rank on the other node (8.2 GB in 0.24 s at TP=2, 2.06 GB per rank in under 0.2 s at
-TP=8). Those have not been rerun on the patches above yet. Details are in the submodule's README.
+Built and measured from a privileged bench pod: the vLLM patches, `snapshotd`'s CUDA, cuInterpose,
+image and transfer parts, and restore across nodes up to TP=8. Running end to end through KServe:
+the integration on Dynamo Snapshot's agent. Design only: the `snapshotd` DaemonSet that restores
+into a new pod and ties these into KServe ([docs/design.md](docs/design.md)).

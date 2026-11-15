@@ -1,6 +1,6 @@
 # snapshotd
 
-The node path of the Rust snapshot daemon described in [DESIGN.md](../DESIGN.md), as far as it is
+The node path of the Rust snapshot daemon described in [DESIGN.md](../docs/design.md), as far as it is
 built: a CLI that checkpoints and restores the CUDA state of a process tree through the driver
 API, drives cuInterpose around it, holds a CRIU checkpoint in memory, and copies one to another
 node over RDMA. The control loop, the CRI lookup, the CRIU invocation and
@@ -53,7 +53,7 @@ snapshotd image hold --images-dir DIR [--reserve-gib N]
 
 The other end of `criu dump --stream` and `criu restore --stream`: it takes one dump into
 anonymous 2 MiB-aligned huge-page segments and answers restores from them until killed. See
-[experiments/memory-capture.md](../experiments/memory-capture.md).
+[experiments/memory-capture.md](../docs/memory-capture.md).
 
 ## Copy to another node
 
@@ -71,4 +71,4 @@ sends while CRIU dumps and writes nothing on the source. On the target, `--direc
 `O_DIRECT`, `--mmap` copies into RAM-backed files in parallel, and `--hold` keeps the image in
 memory and serves the restore itself. `--trace` writes a per-chunk timeline for
 `experiments/bench/trace-merge.py`. Results are in
-[experiments/p2p-transfer.md](../experiments/p2p-transfer.md).
+[experiments/p2p-transfer.md](../docs/cross-node.md).

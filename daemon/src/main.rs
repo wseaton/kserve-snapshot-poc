@@ -1,4 +1,4 @@
-//! snapshotd: the privileged node path for snapshot scale-out. See DESIGN.md.
+//! snapshotd: the privileged node path for snapshot scale-out. See docs/design.md.
 //!
 //! The subcommands are the daemon's building blocks, usable on their own from
 //! a privileged container while the control loop is written.

@@ -1,9 +1,9 @@
 # Benchmarks
 
 Cold boot against restore from a CRIU checkpoint for vLLM at tensor parallel 2 and 4, with the
-phases broken out, and [`snapshotd`](daemon) against Dynamo Snapshot's CUDA path on the same workload.
-The method and the scripts are in [`experiments/bench`](experiments/bench); the reasoning behind
-the configurations is in [DESIGN.md](DESIGN.md).
+phases broken out, and [`snapshotd`](../daemon) against Dynamo Snapshot's CUDA path on the same workload.
+The method and the scripts are in [`experiments/bench`](../experiments/bench); the reasoning behind
+the configurations is in [DESIGN.md](design.md).
 
 ## Setup
 
@@ -11,7 +11,7 @@ the configurations is in [DESIGN.md](DESIGN.md).
 - Qwen3-8B, bf16, `--max-model-len 4096`, CUDA graphs on, weights released at
   `/checkpoint/prepare` (`--checkpoint-release-weights`) and reloaded from a network volume at
   `/checkpoint/restore`.
-- vLLM nightly `a2bcb565` with [`patches/vllm`](patches/vllm). CRIU 4.2.1 and cuInterpose from
+- vLLM nightly `a2bcb565` with [`patches/vllm`](../patches/vllm). CRIU 4.2.1 and cuInterpose from
   Dynamo Snapshot `bc9d216`.
 - Everything runs in one privileged pod: the server is dumped, then restored into a new network
   namespace onto the next GPU over (rank i onto rank i+1's GPU). This is the node path only. A
@@ -87,7 +87,7 @@ it was not run.
 DeepSeek-V4.1-Flash, TP=8 with expert parallel on one 8x H200 node, cuInterpose and the CUDA 13.1
 compat `libcuda`, weights released from the checkpoint. 2026-11-13.
 
-![Dynamo Snapshot and snapshotd](experiments/dynamo-comparison.png)
+![Dynamo Snapshot and snapshotd](img/dynamo-comparison.png)
 
 | | Dynamo Snapshot | `snapshotd`, local disk | `snapshotd`, huge-page memory |
 | --- | --- | --- | --- |
@@ -103,9 +103,38 @@ Not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and i
 backend is a volume claim, here NFS at about 315 MB/s. The `snapshotd` columns dump and restore
 inside one pod. Most of the capture gap is the storage; the CUDA checkpoint gap is the tool
 (one helper process for each PID in sequence against driver calls in parallel). Two nodes with
-`snapshotd` are in [experiments/p2p-transfer.md](experiments/p2p-transfer.md): 25.5 s to capture
+`snapshotd` are in [experiments/p2p-transfer.md](cross-node.md): 25.5 s to capture
 onto the second node and 20.5 s to restore there with the weights pulled from the serving peer.
 The same model has not been run through Dynamo's agent across nodes on this stack.
+
+## End to end through KServe
+
+End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
+([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):
+
+| Run | Restored replica Ready | Cold boot Ready |
+| --- | --- | --- |
+| TP=1, weights from a peer over InfiniBand | 37 to 41 s | 89 s |
+| TP=2, restored on another node | 62 s | 177 s |
+| TP=8, restored on another node | 97 s | 391 s |
+| DeepSeek-V4.1-Flash, TP=8 + expert parallel, same node | 60 s | 148 s |
+
+The restore path built on these patches runs end to end (2026-11-05, Qwen3-8B TP=1 on 8x H200
+with ConnectX-7 InfiniBand, scaled out one replica at a time to 4):
+
+| Replica | Weights | Ready |
+| --- | --- | --- |
+| 1, held for capture | from disk through ModelExpress, no peer yet | 156 s after creation, including the donor's cold boot and the capture |
+| 2 to 4 | 16.4 GB from a running replica over RDMA in 0.64 to 1.73 s (76 to 205 Gbps), inside `/checkpoint/restore` | 37 to 41 s after scale-up |
+| cold boot | ModelExpress's normal load from a peer, 0.73 s | 89 s |
+
+Every completion was token-identical to the first replica's, and each restored replica published
+itself to ModelExpress under its own pod identity.
+
+An earlier version of the restore path (a vLLM worker extension driven over vLLM's dev
+endpoints) also ran at TP=2 and TP=8 with replicas on two nodes: each rank pulled its shard from
+its peer rank on the other node (8.2 GB in 0.24 s at TP=2, 2.06 GB per rank in under 0.2 s at
+TP=8). Those have not been rerun on the patches above yet. Details are in the submodule's README.
 
 ## Not measured yet
 

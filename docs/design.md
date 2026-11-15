@@ -90,7 +90,7 @@ interception. That run failed one phase earlier, in `RestoreUnicast`, and failed
 all-reduce off too: nothing suspended NCCL at checkpoint then, so NCCL's cuMem peer buffers were the
 shared unicast memory cuInterpose had to re-import.
 
-The scripts and pod spec for these runs are in [`experiments/in-place`](experiments/in-place).
+The scripts and pod spec for these runs are in [`experiments/in-place`](../experiments/in-place).
 
 ### Through CRIU, and onto other GPUs
 
@@ -99,7 +99,7 @@ bundled CRIU 4.2.1, its CUDA plugin disabled), restore it into a fresh network n
 privileged pod, then run the CUDA restore, either onto the same two GPUs or remapped onto two other
 GPUs through `CUcheckpointGpuPair`, then `/checkpoint/restore`. TP=2, the nightly image, custom
 all-reduce off, no cuInterpose. The dump is about 6 to 8 s and 8 to 12 GB of host memory, and the
-CRIU restore about 1.5 to 2 s. The scripts are in [`experiments/criu`](experiments/criu).
+CRIU restore about 1.5 to 2 s. The scripts are in [`experiments/criu`](../experiments/criu).
 
 With NCCL suspended at prepare:
 
@@ -130,7 +130,7 @@ one in `checkpoint_restore`, from a fresh unique id broadcast over the Gloo grou
 restores with its TCP connections. CUDA graphs replay the old communicator and `ncclCommDestroy`
 waits for them, so the worker releases its graphs (the V2 runner's graph managers and the piecewise
 wrappers) before preparing, and captures them again when the KV cache wakes, before the engine
-resumes scheduling. The CUDA checkpoint ran through `snapshotd` from [`daemon/`](daemon) in the last
+resumes scheduling. The CUDA checkpoint ran through `snapshotd` from [`daemon/`](../daemon) in the last
 row, and through the same driver calls from Python in the others.
 
 | GPUs after restore | NCCL transport | Graphs | Result |
@@ -156,7 +156,7 @@ exec'ing vLLM.
 `/dev/shm`, shared by the TP workers, pre-faulted, registered with CUDA by every worker, and
 unlinked as soon as all of them have mapped it. `/checkpoint/prepare` empties its index and leaves
 the memory. Two ways through a checkpoint, both measured with
-[`experiments/bench`](experiments/bench) on Qwen3-8B at TP=2, restored onto the other GPU of the
+[`experiments/bench`](../experiments/bench) on Qwen3-8B at TP=2, restored onto the other GPU of the
 pair, same greedy completion before and after:
 
 | Offload | Region | Cold boot | Prepare | CRIU dump | Image | CRIU restore | CUDA restore | vLLM restore | Restore total |
@@ -177,9 +177,9 @@ pair, same greedy completion before and after:
   of the restore, in the foreground; doing it after serving resumes, with offload off until it
   finishes, would leave about 15 s. The table's deferred rows were measured on an earlier version
   behind a `--checkpoint-release-kv-offload` flag; the current patch has no flag and measures the
-  same (128 GiB: 11.4 GB image, 43.3 s restore; see [BENCHMARKS.md](BENCHMARKS.md)).
+  same (128 GiB: 11.4 GB image, 43.3 s restore; see [BENCHMARKS.md](benchmarks.md)).
 
-After each restore, [`offload-check.sh`](experiments/bench/offload-check.sh) pushes a prompt out of
+After each restore, [`offload-check.sh`](../experiments/bench/offload-check.sh) pushes a prompt out of
 a 1 GiB GPU KV cache and sends it again; 514 MB came back from the CPU region in every offload row,
 so the host registrations work on the new GPUs in both modes.
 `VLLM_USE_SIMPLE_KV_OFFLOAD=1` (`SimpleCPUOffloadConnector`) restores too, with the region always
@@ -366,7 +366,7 @@ vllm: {version, tensorParallelSize, checkpointReleaseWeights: true}
 
 | Component | Language | Where it comes from |
 | --- | --- | --- |
-| daemon, worker, shim | Rust | [`daemon/`](daemon), growing into snapshot-orchestrator's agent |
+| daemon, worker, shim | Rust | [`daemon/`](../daemon), growing into snapshot-orchestrator's agent |
 | cuInterpose core, coordinator, launcher, protocol | Rust | `ai-dynamo/snapshot` at a pinned commit, as a git dependency and a musl build |
 | cuInterpose frontend | C (~480 lines) | same; stays C because the `dlsym` interposer needs a guaranteed tail call (`musttail`) |
 | CRIU | C | upstream release; driven over swrk RPC, the `rust-criu` fork moved to prost |
@@ -374,7 +374,7 @@ vllm: {version, tensorParallelSize, checkpointReleaseWeights: true}
 
 ## Prototype
 
-[`daemon/`](daemon) is a standalone crate, `snapshotd`, with the parts of the node path that are
+[`daemon/`](../daemon) is a standalone crate, `snapshotd`, with the parts of the node path that are
 done:
 
 - `cuda`: the CUDA checkpoint driver API, `checkpoint_job` and `restore_job` over a process tree,
