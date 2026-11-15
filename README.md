@@ -122,6 +122,17 @@ into an RDMA sender while it dumps and the second node restores from RAM
 | Restore on the second node | 26.3 s | 17.2 to 18.6 s |
 | Cold boot | 72.5 s | 72.5 s |
 
+DeepSeek-V4.1-Flash at TP=8 with expert parallel, 8 H200s on each of two nodes, weights released
+from the checkpoint ([details](experiments/p2p-transfer.md#deepseek-v41-flash-tp8-two-whole-nodes)):
+
+| | Weights from the shared volume | Weights from the serving peer |
+| --- | --- | --- |
+| Checkpoint start to image on the second node | 27.9 s, 69.9 GB | 25.5 s, 74.3 GB |
+| Restore on the second node | 101.5 s cold page cache, 42.9 s warm | 20.5 s |
+| Cold boot | 166.1 s cold page cache | 104.7 s warm |
+
+![DeepSeek-V4.1-Flash across two nodes](experiments/deepseek-cross-node-peer.png)
+
 End to end through KServe with Dynamo Snapshot's agent, pod creation to Ready
 ([details](https://github.com/wseaton/kserve-dynamo-snapshot#results)):
 

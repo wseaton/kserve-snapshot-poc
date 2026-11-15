@@ -103,8 +103,9 @@ Not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and i
 backend is a volume claim, here NFS at about 315 MB/s. The `snapshotd` columns dump and restore
 inside one pod. Most of the capture gap is the storage; the CUDA checkpoint gap is the tool
 (one helper process for each PID in sequence against driver calls in parallel). Two nodes with
-`snapshotd` are in [experiments/p2p-transfer.md](experiments/p2p-transfer.md); the same model has
-not been run through Dynamo's agent across nodes on this stack.
+`snapshotd` are in [experiments/p2p-transfer.md](experiments/p2p-transfer.md): 25.5 s to capture
+onto the second node and 20.5 s to restore there with the weights pulled from the serving peer.
+The same model has not been run through Dynamo's agent across nodes on this stack.
 
 ## Not measured yet
 
