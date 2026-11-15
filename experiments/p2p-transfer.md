@@ -105,9 +105,32 @@ The restore is the weight reload. vLLM's prefetch of the checkpoint files into p
 never served the model the reload has to come from somewhere faster than the shared volume: a
 ModelExpress peer, or weights kept in the image.
 
-The cold restore's greedy completion was identical to the source's. The warm restore's was not:
-`Paris.` before, `Paris. The Eiffel Tower is in Paris. The Louvre is in Paris.` after. Coherent,
-but not explained yet.
+The completion check is not usable for this model. The cold restore's greedy completion was
+identical to the source's and the warm restore's was not (`Paris.` against `Paris. The Eiffel
+Tower is in Paris. The Louvre is in Paris.`), but a server that was never checkpointed gives both
+of those to the same prompt on consecutive requests.
+
+#### Weights from the serving peer
+
+Same configuration with `MX=1 NET=pod PEER=1`: after the capture a server is cold-booted again on
+the source node and the restored workers pull their weights from it over ModelExpress.
+
+![DeepSeek-V4.1-Flash across two nodes, weights from the peer](deepseek-cross-node-peer.png)
+
+| | Seconds |
+| --- | --- |
+| Cold boot on the source, weights in page cache | 104.7 |
+| vLLM prepare, cuInterpose prepare, CUDA checkpoint | 1.3, 0.8, 3.8 |
+| CRIU dump, 74.3 GB streamed at 4.13 GB/s (peak 7.2) | 18.0 |
+| **Checkpoint start to image on the second node** | **25.5** |
+| CRIU restore, CUDA restore, cuInterpose restore | 5.0, 7.3, 1.0 |
+| vLLM restore: 64.15 GB to each of 8 workers at 290 Gbps, 1.8 s on the wire | 7.0 |
+| **Restore** | **20.5** |
+
+NVIDIA's published numbers for the same model, engine and parallelism
+([Start and Restore GPU Workloads in Seconds with NVIDIA Snapshot](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot),
+2026-11-10; B200, VAST NFS, weights in the checkpoint, node placement not stated): checkpoint
+274.75 s, 647 GB, restore 30.96 s, cold start 1110.65 s.
 
 Two things failed first:
 

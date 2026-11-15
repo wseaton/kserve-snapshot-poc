@@ -124,6 +124,7 @@ main "$DST_POD" sh -c "echo 4000000 > /proc/sys/kernel/ns_last_pid; rm -f /work/
 end=$(( $(date +%s) + RESTORE_WAIT )); until [ "$(date +%s)" -ge "$end" ]; do sleep 5; done
 until main "$DST_POD" grep -q '^RESULT' /work/restore.log 2>/dev/null; do sleep 10; done
 main "$DST_POD" grep '^RESULT' /work/restore.log | tee "$OUT/restore.json"
+grep -qE '"result": "(MATCH|DIFFER)"' "$OUT/restore.json"
 
 [ "$OVERLAP" = memory ] && xfer "$DST_POD" grep -E '^(HOLD|SERVE)' /work/receive-stream.json.log | tee "$OUT/hold.txt"
 main "$DST_POD" cat "$W/phases.jsonl" > "$OUT/phases.jsonl"
