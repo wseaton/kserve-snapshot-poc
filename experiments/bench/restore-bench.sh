@@ -152,6 +152,7 @@ fi
 CRIU_STREAM=(); [ "$STREAM" != 0 ] && CRIU_STREAM=(--stream)
 RELEASE=(--checkpoint-release-weights); [ "${RELEASE_WEIGHTS:-1}" = 0 ] && RELEASE=()
 if [ "$PHASE" != restore ]; then
+mkdir -p /compile-cache/humming && ln -sfn /compile-cache/humming "$HOME/.humming"
 T=$(now)
 setsid "${LAUNCH[@]}" vllm serve "$MODEL" --served-model-name m --tensor-parallel-size "$TP" \
   --enable-sleep-mode "${RELEASE[@]}" "${MX_ARGS[@]}" --host 127.0.0.1 --port 8000 "$@" \

@@ -74,8 +74,49 @@ Qwen3-8B, TP=4, weights released and reloaded, RAM overlapped: CUDA checkpoint 2
 49.3 s.
 
 DeepSeek-V4.1-Flash TP=8 (69.9 GB with weights released) copied disk to disk in 20.7 s,
-3.38 GB/s; the same image took 3m52s to dump to the shared NFS volume. It was not restored on a
-second node: no second node had 8 free GPUs.
+3.38 GB/s; the same image took 3m52s to dump to the shared NFS volume.
+
+### DeepSeek-V4.1-Flash, TP=8, two whole nodes
+
+2026-11-14. 8 of 8 H200s on each of two nodes in one InfiniBand leaf group, expert parallel,
+cuInterpose with the CUDA 13.1 compat `libcuda`, weights released at prepare and reloaded from
+the shared volume (476 GB on disk), CRIU streamed into the second node's RAM-backed directory
+(`OVERLAP=1 IMG_DIR=/mem/...`, 76 GiB primed in 1.4 s).
+
+![DeepSeek-V4.1-Flash across two nodes](deepseek-cross-node.png)
+
+| | Seconds |
+| --- | --- |
+| Cold boot on the source, weights not in page cache | 166.1 |
+| vLLM prepare, cuInterpose prepare, CUDA checkpoint | 1.1, 0.6, 3.8 |
+| CRIU dump, 69.9 GB streamed at 4.25 GB/s (peak 6.7) | 16.4 |
+| **Checkpoint start to image on the second node** | **27.9** |
+| CRIU restore, CUDA restore, cuInterpose restore | 5.0, 7.3, 0.8 |
+| vLLM restore, weights not in the second node's page cache | 88.4 |
+| **Restore, cold page cache** | **101.5** |
+| vLLM restore, weights in page cache (second restore of the same image) | 30.1 |
+| **Restore, warm page cache** | **42.9** |
+
+The dump and the copy are the same 16 s here as the dump alone into local huge-page memory
+([memory-capture.md](memory-capture.md)): CRIU's serial dump is the limit, not the network.
+
+The restore is the weight reload. vLLM's prefetch of the checkpoint files into page cache took
+80.6 s cold and 17.0 s warm; everything that comes out of the image is 13 s. On a node that has
+never served the model the reload has to come from somewhere faster than the shared volume: a
+ModelExpress peer, or weights kept in the image.
+
+The cold restore's greedy completion was identical to the source's. The warm restore's was not:
+`Paris.` before, `Paris. The Eiffel Tower is in Paris. The Louvre is in Paris.` after. Coherent,
+but not explained yet.
+
+Two things failed first:
+
+- The workers map JIT kernel files under `~/.humming/cache`, which is in the container's own
+  filesystem, so CRIU could not open them on the second node. `restore-bench.sh` now links that
+  directory into the shared compile cache before launch; for this run the 101 MB directory was
+  copied over by hand.
+- A failed restore leaves a half-restored process holding PIDs. The next attempt fails with
+  `Can't fork for 189: File exists` until it is killed.
 
 What limits each column:
 
