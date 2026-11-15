@@ -86,9 +86,9 @@ print('PRIME %.1f s for ${RESERVE_GIB} GiB' % (time.time() - start))" | tee "$OU
 fi ;; esac
 # The receiver goes first: with a reservation it faults its memory in before it listens.
 [ "$OVERLAP" != 0 ] && receive "$IMG" /work/receive-stream.json ${HOLD[@]+"${HOLD[@]}"}
-main "$SRC_POD" sh -c "rm -f /work/capture.log; setsid nohup env $(envs) PHASE=capture STREAM=$STREAM bash /work/rb.sh $TAG $ARGS > /work/capture.log 2>&1 < /dev/null &"
+main "$SRC_POD" sh -c "rm -rf /work/capture.log $IMG; setsid nohup env $(envs) PHASE=capture STREAM=$STREAM bash /work/rb.sh $TAG $ARGS > /work/capture.log 2>&1 < /dev/null &"
 if [ "$OVERLAP" != 0 ]; then
-  until main "$SRC_POD" grep -q '"name": "cold_boot"' "$W/phases.jsonl" 2>/dev/null; do sleep 5; done
+  until main "$SRC_POD" test -d "$IMG" 2>/dev/null; do sleep 1; done
   xfer "$SRC_POD" sh -c "cd /tmp && setsid nohup $XFER transfer stream --images-dir $IMG --to $DST_IP:7700 ${POOL[*]} --trace /work/send-stream.json > /work/stream.log 2>&1 < /dev/null &"
 fi
 until main "$SRC_POD" grep -q '^RESULT' /work/capture.log 2>/dev/null; do sleep 10; done
