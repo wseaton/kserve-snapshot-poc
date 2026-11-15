@@ -217,6 +217,41 @@ Found by failing, in this order:
 An early cuInterpose attempt failed in `RestoreUnicast` with `CUDA_ERROR_NOT_INITIALIZED`. That was
 the placement mistake above, not cuInterpose: with the positions right it restores across nodes.
 
+## What is in the checkpoint
+
+DeepSeek-V4.1-Flash at TP=8 after `/checkpoint/prepare`, read with
+[`mem-breakdown.py`](../experiments/bench/mem-breakdown.py) before any dump. It predicts a
+70.5 GB image; the dump of the same configuration was 69.9 GB.
+
+| | Each worker | All 8 |
+| --- | --- | --- |
+| GPU memory still allocated, which the CUDA checkpoint moves to host memory | 4.93 GB | 39.4 GB |
+| Host heap | 2.05 GB | 17.1 GB |
+| Host anonymous mappings | 1.6 GB | 12.6 GB |
+| API server and engine core | | 1.8 GB |
+
+Prepare takes each GPU from 125.8 GiB to 4.7 GiB, so the weights and the KV cache are gone. What
+is left on a GPU, from the torch allocator's own snapshot in one worker:
+
+| Still allocated on one GPU | Size |
+| --- | --- |
+| About 500 blocks of 2 to 18 MB in the default pool, most of them in sets of 40 (one per layer) | 2.7 GB |
+| One block in a private pool | 1.5 GB |
+| Other private pools, which is where captured CUDA graphs live | 0.4 GB |
+| The rest: CUDA context and what other libraries allocate | 0.3 GB |
+
+The torch allocator also reports the KV cache's 61.8 GB as allocated after prepare, because the
+cache keeps its address range and gives back only the memory behind it. Torch's totals therefore
+say nothing about what is on the device, and the table above assumes the blocks outside the KV
+cache are still backed. They sum to the 4.9 GB the driver reports.
+
+The host side does not shrink for free: `malloc_trim` returns 0.05 GB of a worker's 3.4 GB, and
+its CPU tensors are 0.5 GB. Qwen3-8B's single engine process holds 2.1 GB the same way.
+
+Releasing the 2.7 GB and 1.5 GB at prepare would take about 33 GB off the image, near 8 s of dump
+at CRIU's 4.2 GB/s, and less for the driver to checkpoint and restore. Which vLLM objects own
+them is not identified yet.
+
 ## Open
 
 - **gpt-oss-120b does not survive `--checkpoint-release-weights`.** After the reload every worker
