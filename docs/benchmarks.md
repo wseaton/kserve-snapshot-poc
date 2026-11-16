@@ -3,7 +3,7 @@
 Cold boot against restore from a CRIU checkpoint for vLLM at tensor parallel 2 and 4, with the
 phases broken out, and [`snapshotd`](../daemon) against Dynamo Snapshot's CUDA path on the same workload.
 The method and the scripts are in [`experiments/bench`](../experiments/bench); the reasoning behind
-the configurations is in [DESIGN.md](design.md).
+the configurations is in [docs/design.md](design.md).
 
 ## Setup
 
@@ -103,7 +103,7 @@ Not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and i
 backend is a volume claim, here NFS at about 315 MB/s. The `snapshotd` columns dump and restore
 inside one pod. Most of the capture gap is the storage; the CUDA checkpoint gap is the tool
 (one helper process for each PID in sequence against driver calls in parallel). Two nodes with
-`snapshotd` are in [experiments/p2p-transfer.md](cross-node.md): 25.5 s to capture
+`snapshotd` are in [docs/cross-node.md](cross-node.md): 25.5 s to capture
 onto the second node and 20.5 s to restore there with the weights pulled from the serving peer.
 The same model has not been run through Dynamo's agent across nodes on this stack.
 

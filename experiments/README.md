@@ -1,6 +1,6 @@
 # Experiments
 
-The runs behind [DESIGN.md](../docs/design.md): TP=2 Qwen3-8B on one 8x H200 waldorf node, driver
+The runs behind [docs/design.md](../docs/design.md): TP=2 Qwen3-8B on one 8x H200 waldorf node, driver
 580.126.09, the nightly image `quay.io/wseaton/vllm-checkpoint@sha256:e2659cc1…`. Both pods mount
 Dynamo's agent image for the cuInterpose libraries, coordinator and CRIU, and the compat image for
 its CUDA 13.1 `libcuda`. Put Qwen3-8B at `/models/Qwen3-8B` before running anything.
@@ -95,4 +95,4 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
 - `bench/trace-render.py <output dir> [--png FILE]`: draws a run as a standalone page that reads on
   a phone: capture, transfer, restore and the cold boot beside them. `lifecycle.sh` writes it as
   `lifecycle.html`.
-- Notes and results: [p2p-transfer.md](../docs/cross-node.md), [memory-capture.md](../docs/memory-capture.md).
+- Notes and results: [cross-node.md](../docs/cross-node.md), [memory-capture.md](../docs/memory-capture.md).

@@ -177,7 +177,7 @@ pair, same greedy completion before and after:
   of the restore, in the foreground; doing it after serving resumes, with offload off until it
   finishes, would leave about 15 s. The table's deferred rows were measured on an earlier version
   behind a `--checkpoint-release-kv-offload` flag; the current patch has no flag and measures the
-  same (128 GiB: 11.4 GB image, 43.3 s restore; see [BENCHMARKS.md](benchmarks.md)).
+  same (128 GiB: 11.4 GB image, 43.3 s restore; see [docs/benchmarks.md](benchmarks.md)).
 
 After each restore, [`offload-check.sh`](../experiments/bench/offload-check.sh) pushes a prompt out of
 a 1 GiB GPU KV cache and sends it again; 514 MB came back from the CPU region in every offload row,

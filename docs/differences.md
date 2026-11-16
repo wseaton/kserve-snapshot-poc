@@ -7,7 +7,7 @@ and where Dynamo Snapshot is ahead.
 Numbers for Dynamo Snapshot come from two places and are marked: **published** is NVIDIA's
 [2026-11-10 post](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot)
 (B200, VAST NFS); **measured** is Dynamo Snapshot run on the same H200 cluster as everything else
-here ([BENCHMARKS.md](benchmarks.md)).
+here ([docs/benchmarks.md](benchmarks.md)).
 
 ## The short version
 
@@ -23,7 +23,7 @@ DeepSeek-V4.1-Flash, vLLM, 8 GPUs with tensor and expert parallel:
 | Restore with no replica serving | 31.0 s | 101.5 s from a cold shared volume |
 
 Different GPUs and storage, one run on our side, and NVIDIA does not say whether its restore was
-on another node. Details in [experiments/p2p-transfer.md](cross-node.md).
+on another node. Details in [docs/cross-node.md](cross-node.md).
 
 ## What is the same
 
@@ -91,8 +91,8 @@ DeepSeek TP=8 (10 CUDA processes): 14.4 s with the helper, 3.8 s with `snapshotd
 
 Dynamo Snapshot is a Go DaemonSet agent, driven by its operator, generic over vLLM, SGLang and
 TensorRT-LLM. `snapshotd` is a Rust daemon for vLLM under KServe only. The reasons, the privilege
-model and what KServe has to lifecycle are in [DESIGN.md](design.md) and
-[ARCHITECTURE.md](architecture.md). The kubelet checkpoint API is not used by either.
+model and what KServe has to lifecycle are in [docs/design.md](design.md) and
+[docs/architecture.md](architecture.md). The kubelet checkpoint API is not used by either.
 
 ## Our optimizations, and what each is worth
 
@@ -111,7 +111,7 @@ model and what KServe has to lifecycle are in [DESIGN.md](design.md) and
 | Compile caches on a shared volume | bench pod | | cold boot 104.7 s; the target maps the same files |
 
 What a cross-node restore needed beyond speed, all in
-[experiments/p2p-transfer.md](cross-node.md#what-a-cross-node-restore-needs):
+[docs/cross-node.md](cross-node.md#what-a-cross-node-restore-needs):
 
 - **GPU placement by position.** The driver restores each device to the same enumeration position
   it had on the source, so the pod must own those positions on the target and the device map must
