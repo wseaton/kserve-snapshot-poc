@@ -42,13 +42,13 @@ flowchart LR
   peer == "weights, GPU to GPU" ==> restore
 ```
 
-1. **Prepare.** vLLM drains, then frees its KV cache and its weights. What is left on the GPUs is
-   small, so the driver checkpoints and restores it quickly.
+1. **Prepare.** vLLM drains, then frees its KV cache and its weights. About 5 GB stays on each
+   GPU, which the driver checkpoints in 3.8 s and restores in 7.3 s for 8 GPUs.
 2. **Capture.** `snapshotd` checkpoints every CUDA process in parallel, and CRIU dumps into a
    pipe that `snapshotd` sends over RDMA as it fills. Nothing is written on the source.
 3. **Restore.** The target restores from the image in its RAM, the driver puts GPU state back,
    and vLLM pulls its weights from a serving replica. With no replica serving it reads them from
-   the model volume, which is the slow case in the chart.
+   the model volume (the 101.5 s and 42.9 s rows in the chart).
 
 A whole run, with the transfer rate and each phase, as the bench harness draws it:
 

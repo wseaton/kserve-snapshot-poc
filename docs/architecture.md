@@ -289,8 +289,8 @@ flowchart LR
 
 Checkpointing a process and recreating it somewhere else is privileged work whoever does it: CRIU
 reads another process's memory and file table, recreates PIDs, mounts and sockets, and on restore
-enters the target pod's namespaces and cgroup. The choice is not whether something runs with root
-or its capabilities, but which component does, and how many copies of it there are.
+enters the target pod's namespaces and cgroup. Something runs with root or its capabilities in
+every design. They differ in which component does, and how many copies of it there are.
 
 | | Node agent (this design, and Dynamo Snapshot) | Wrapper in every workload pod | Kubelet and container runtime |
 | --- | --- | --- | --- |
@@ -302,20 +302,20 @@ or its capabilities, but which component does, and how many copies of it there a
 | Pod Security | one namespace at the `privileged` level | every serving namespace needs an exception from `restricted` and `baseline` | none |
 | GPU handling | the agent orders cuInterpose, cuda-checkpoint and CRIU, and maps GPUs to the new pod's | the wrapper must do the same from inside the pod | CRIU's CUDA plugin; no hook for the ordering or for a GPU map |
 
-So yes: the alternative to a privileged node agent is a wrapper in every vLLM pod, and it is the
-more invasive of the two. It does not remove the privilege. It moves it out of one component the
+The alternative to a privileged node agent is a wrapper in every vLLM pod, which changes more of
+the deployment. It does not remove the privilege. It moves it out of one component the
 platform owns into every container that runs user-selected model code, multiplies it by the
 number of replicas, and makes every serving namespace a Pod Security exception. A container
 escape from a model server then starts with checkpoint and ptrace capabilities; with the node
 agent it starts with none.
 
-The kubelet column is out for now, for two reasons. It is generic: it checkpoints a container as
+The kubelet column is excluded for now, for two reasons. It is generic: it checkpoints a container as
 it stands, and this design depends on steps only the application can take, which are quiescing
 vLLM, leaving the weights out and reloading them, ordering cuInterpose and cuda-checkpoint around
 CRIU, and mapping GPUs for the new pod. And the kubelet checkpoint API is not supported on
 OpenShift, which is a target platform. That leaves the node agent and the in-pod wrapper.
 
-This is not hypothetical. [snapshot-orchestrator](https://github.com/neuralmagic/snapshot-orchestrator)
+The in-pod design has been built. [snapshot-orchestrator](https://github.com/neuralmagic/snapshot-orchestrator)
 started as the in-pod design: a supervisor was PID 1 of the vLLM container, its image carried CRIU
 and `cuda-checkpoint`, and the orchestrator ran checkpoints by exec-ing into the workload pods.
 CRIU has only the privileges of the container it runs in, so the vLLM container itself ran
@@ -331,7 +331,7 @@ operational cost counted against anything in-pod: every deployment's entrypoint 
 replaced, so each serving runtime, vLLM version and KServe template needs its own patched variant
 kept in step with upstream.
 
-What the node agent costs, stated plainly: it is root on every GPU node, it can read the memory
+What the node agent costs: it is root on every GPU node, it can read the memory
 of any process there, and a bug in it is a node compromise. Ways to bound that, as requirements
 on the daemon and not yet built:
 

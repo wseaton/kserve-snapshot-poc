@@ -53,11 +53,11 @@ from `vllm serve` to a healthy server with warm compile caches; the first boot i
 - The CUDA checkpoint is where the tools differ: the helper's time grows with the process count
   (2.0 s to 4.1 s to 5.2 s), `snapshotd` stays near 2 s. The CUDA restore is 0.3 to 1.1 s faster
   with `snapshotd`.
-- The configuration matters more than the tool. Without cuInterpose the workers destroy NCCL and
+- The configuration changes restore time more than the tool does. Without cuInterpose the workers destroy NCCL and
   release their CUDA graphs at prepare, and recapturing the graphs is about 7 s of the vLLM
-  restore. cuInterpose keeps both across the checkpoint, at the price of the preload and the 13.1
+  restore. cuInterpose keeps both across the checkpoint, and needs the preload and the 13.1
   `libcuda`.
-- Restore is 3 to 6 times faster than a cold boot in every row.
+- Restore takes 7.1 to 16.6 s; cold boot takes 45.3 to 49.3 s.
 
 ## CPU KV offload
 
@@ -99,7 +99,7 @@ compat `libcuda`, weights released from the checkpoint. 2026-11-13.
 | vLLM restore, with the weight reload | 31.2 s | 28.9 s | 29.6 s |
 | Cold boot | 150 s through KServe | 91.7 s | 90.7 s |
 
-Not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and its only storage
+The columns are not like for like. Dynamo's agent restores into a new pod, as a DaemonSet, and its only storage
 backend is a volume claim, here NFS at about 315 MB/s. The `snapshotd` columns dump and restore
 inside one pod. Most of the capture gap is the storage; the CUDA checkpoint gap is the tool
 (one helper process for each PID in sequence against driver calls in parallel). Two nodes with

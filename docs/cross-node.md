@@ -1,6 +1,6 @@
 # Capture on one node, restore on another: notes
 
-2026-11-13. The checkpoint is taken on one node's local disk or streamed straight off CRIU, copied
+2026-11-13. The checkpoint is taken on one node's local disk or streamed from CRIU, copied
 to a second node over InfiniBand with NIXL, and restored there. Code:
 [`daemon/src/transfer.rs`](../daemon/src/transfer.rs) (`snapshotd transfer send|stream|receive`,
 behind the `nixl` feature), driven by [`bench/lifecycle.sh`](../experiments/bench/lifecycle.sh).
@@ -43,10 +43,9 @@ gpt-oss-120b, TP=4, `--gpu-memory-utilization 0.9`, cuInterpose preloaded and th
 | **Restore total** | **26.3 s** | **17.2 s** | **18.6 s** |
 | Cold boot, for comparison | 72.5 s | 72.4 s | 72.5 s |
 
-This is the fastest configuration measured: cuInterpose keeps NCCL and the CUDA graphs across the
-checkpoint, so nothing is recaptured, and with the weights in the image there is nothing to
-reload. The capture is 3 times faster than the disk path and the restore 1.4 to 1.5 times; the
-restore is about 4 times faster than a cold boot.
+This configuration has the shortest restore measured for this model: cuInterpose keeps NCCL and
+the CUDA graphs across the checkpoint, so nothing is recaptured, and with the weights in the image
+there is nothing to reload.
 
 ### Patched vLLM without cuInterpose
 
@@ -100,10 +99,10 @@ the shared volume (476 GB on disk), CRIU streamed into the second node's RAM-bac
 The dump and the copy are the same 16 s here as the dump alone into local huge-page memory
 ([memory-capture.md](memory-capture.md)): CRIU's serial dump is the limit, not the network.
 
-The restore is the weight reload. vLLM's prefetch of the checkpoint files into page cache took
+Most of the restore is the weight reload. vLLM's prefetch of the checkpoint files into page cache took
 80.6 s cold and 17.0 s warm; everything that comes out of the image is 13 s. On a node that has
-never served the model the reload has to come from somewhere faster than the shared volume: a
-ModelExpress peer, or weights kept in the image.
+never served the model, the alternatives to the shared volume are a ModelExpress peer or weights
+kept in the image.
 
 The completion check is not usable for this model. The cold restore's greedy completion was
 identical to the source's and the warm restore's was not (`Paris.` against `Paris. The Eiffel
@@ -145,7 +144,7 @@ What limits each column:
 
 - **Disk.** The receiver's disk, about 3.4 GB/s with direct I/O. In a traced 33.5 GB copy, 61 of
   64 slots sat in the receiver's write on average, 0.9 in the sender's read and 0.15 in RDMA.
-  Buffered writes are worse (1.5 to 2.8 GB/s): the nodes cap dirty page cache at 600 MB. The
+  Buffered writes are slower (1.5 to 2.8 GB/s): the nodes cap dirty page cache at 600 MB. The
   restore then reads the image back from disk.
 - **RAM.** CRIU's dump, which copies one process at a time: 4.5 GB/s here. The receiver spent
   79 thread-seconds copying 108 GB across 64 slots.
@@ -185,8 +184,8 @@ At 16 GB the three ways of bringing weights back are within two seconds of each 
 releasing them mainly shortens the capture. The gap grows with the model: carrying weights in the
 image costs CRIU's 4.5 GB/s on the way out and CRIU plus CUDA restore on the way in (gpt-oss-120b:
 about 75 GB more image, 23 s more capture, 10 s more restore than its weightless checkpoint),
-while the peer transfer ran at 277 Gbps per worker here. For a large model the released path with
-a peer is the one to want; gpt-oss-120b cannot use it yet (see Open).
+while the peer transfer ran at 277 Gbps per worker here. gpt-oss-120b cannot release its weights
+yet (see Open).
 
 A restore into the pod's own network needs the source's socket addresses rewritten to the new
 pod's. Dynamo's CRIU plugin (`snapshot_inet_remap.so`, loaded with `--libdir`) does it from a
@@ -195,7 +194,7 @@ loopback connections to each other and fails vLLM's restore.
 
 ## What a cross-node restore needs
 
-Found by failing, in this order:
+In the order they were found:
 
 - **Everything the process had open, at the same path, with the same mode and size.** The image
   is not enough: `/dev/shm` files, the server's log file (CRIU checks its size, so a retried
@@ -214,8 +213,8 @@ Found by failing, in this order:
   re-committed after a restore without cuInterpose (138 of 141 GB in use). 0.8 worked there; with
   cuInterpose and the weights kept, 0.9 works.
 
-An early cuInterpose attempt failed in `RestoreUnicast` with `CUDA_ERROR_NOT_INITIALIZED`. That was
-the placement mistake above, not cuInterpose: with the positions right it restores across nodes.
+An early cuInterpose attempt failed in `RestoreUnicast` with `CUDA_ERROR_NOT_INITIALIZED`. The cause
+was the placement mistake above, not cuInterpose: with the positions right it restores across nodes.
 
 ## What is in the checkpoint
 
@@ -245,7 +244,7 @@ cache keeps its address range and gives back only the memory behind it. Torch's 
 say nothing about what is on the device, and the table above assumes the blocks outside the KV
 cache are still backed. They sum to the 4.9 GB the driver reports.
 
-The host side does not shrink for free: `malloc_trim` returns 0.05 GB of a worker's 3.4 GB, and
+Trimming does not reclaim the host side: `malloc_trim` returns 0.05 GB of a worker's 3.4 GB, and
 its CPU tensors are 0.5 GB. Qwen3-8B's single engine process holds 2.1 GB the same way.
 
 Releasing the 2.7 GB and 1.5 GB at prepare would take about 33 GB off the image, near 8 s of dump
@@ -255,7 +254,7 @@ them is not identified yet.
 ## Open
 
 - **gpt-oss-120b does not survive `--checkpoint-release-weights`.** After the reload every worker
-  logs `YaRNScalingRotaryEmbedding: Failed to load weights` and the output is garbage, on the same
+  logs `YaRNScalingRotaryEmbedding: Failed to load weights` and the output is incoherent, on the same
   node too and with CUDA graphs off. The runs above keep the weights in the checkpoint
   (`RELEASE_WEIGHTS=0`), which is why the image is 100 GB.
 - **Weights released at 0.9 utilization.** With `--checkpoint-release-weights` the same

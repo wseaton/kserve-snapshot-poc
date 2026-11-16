@@ -1,15 +1,15 @@
 # How this differs from NVIDIA Dynamo Snapshot
 
 Both systems restore an initialized vLLM server from a CRIU checkpoint instead of cold-booting
-it. This page says what is shared, where the two part ways, what each optimization here is worth,
-and where Dynamo Snapshot is ahead.
+it. This page lists what is shared, where they differ, what each change here measured, and what
+Dynamo Snapshot does that this does not.
 
 Numbers for Dynamo Snapshot come from two places and are marked: **published** is NVIDIA's
 [2026-11-10 post](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot)
 (B200, VAST NFS); **measured** is Dynamo Snapshot run on the same H200 cluster as everything else
 here ([docs/benchmarks.md](benchmarks.md)).
 
-## The short version
+## Summary
 
 DeepSeek-V4.1-Flash, vLLM, 8 GPUs with tensor and expert parallel:
 
@@ -28,7 +28,7 @@ on another node. Details in [docs/cross-node.md](cross-node.md).
 ## What is the same
 
 - **CRIU.** We run the CRIU 4.2.1 build that ships in Dynamo's snapshot agent image, with its
-  restore optimizations. CRIU restore time is a tie: 5.0 s here, 4.2 to 10.8 s published.
+  restore optimizations. CRIU restore time is similar: 5.0 s here, 4.2 to 10.8 s published.
 - **The driver's checkpoint API.** GPU state is saved and restored by the NVIDIA driver
   (`cuCheckpointProcess{Lock,Checkpoint,Restore,Unlock}`), the same calls `cuda-checkpoint` makes.
 - **cuInterpose.** Tensor parallel above 1 on stock vLLM uses Dynamo's `libcuinterpose.so` and its
@@ -69,7 +69,7 @@ InfiniBand through ModelExpress: 64 GB to each of 8 workers at 290 Gbps, 1.8 s o
 for vLLM's whole restore step. From the shared volume the same step is 30.1 s with the files in
 page cache and 88.4 s without.
 
-This is why scale-out is fast and scale-from-zero is not: with nothing serving there is no peer.
+This applies to scale-out only: with nothing serving there is no peer.
 
 ### 3. The checkpoint is streamed to the target, not written to a volume
 
@@ -94,9 +94,9 @@ TensorRT-LLM. `snapshotd` is a Rust daemon for vLLM under KServe only. The reaso
 model and what KServe has to lifecycle are in [docs/design.md](design.md) and
 [docs/architecture.md](architecture.md). The kubelet checkpoint API is not used by either.
 
-## Our optimizations, and what each is worth
+## Changes and their measured effect
 
-| Optimization | Where | Before | After |
+| Change | Where | Before | After |
 | --- | --- | --- | --- |
 | Release weights at prepare | vLLM patch | 647 GB image (published) | 74 GB |
 | Release CPU KV offload memory at prepare | vLLM patch 0005 | 139.4 GB image | 11.4 GB |
@@ -110,7 +110,7 @@ model and what KServe has to lifecycle are in [docs/design.md](design.md) and
 | Direct I/O to disk, mapped writes to tmpfs | `daemon/src/transfer.rs` | 1.5 to 2.8 GB/s buffered | 3.5 GB/s to disk, 4.5 GB/s to RAM |
 | Compile caches on a shared volume | bench pod | | cold boot 104.7 s; the target maps the same files |
 
-What a cross-node restore needed beyond speed, all in
+What a cross-node restore also needed, all in
 [docs/cross-node.md](cross-node.md#what-a-cross-node-restore-needs):
 
 - **GPU placement by position.** The driver restores each device to the same enumeration position
@@ -123,12 +123,12 @@ What a cross-node restore needed beyond speed, all in
 - **Files mapped from outside shared storage.** A JIT cache in the container filesystem has to be
   on a volume both nodes see.
 
-## Where Dynamo Snapshot is ahead
+## What Dynamo Snapshot does that this does not
 
 - **Scale from zero.** With no replica serving, its restore is still 31 s. Ours is 101.5 s from a
-  cold shared volume, 42.9 s if the weights happen to be in page cache.
-- **It needs only a volume.** We need InfiniBand between the nodes and a live peer.
-- **It is a product.** Operator, DaemonSet, restore into a new pod, three engines, published
+  cold shared volume, 42.9 s if the weights are in page cache.
+- **Requirements.** It needs a volume. We need InfiniBand between the nodes and a serving peer.
+- **Scope.** Operator, DaemonSet, restore into a new pod, three engines, published
   results on more than 20 configurations. `snapshotd`'s CUDA, cuInterpose, image and transfer parts are
   built and measured from a privileged bench pod; the daemon that ties them into KServe is design.
 - **Evidence.** Our DeepSeek two-node number is one run. The harness's exact-match output check

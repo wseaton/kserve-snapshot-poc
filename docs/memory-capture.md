@@ -2,8 +2,8 @@
 
 An attempt, on 2026-11-13, to keep the checkpoint off disk: CRIU dumps into anonymous huge-page
 memory, that memory is registered for RDMA and sent to the peer, and the peer restores from
-memory. It works, and the dump ends up about twice as fast as local disk, but it is parked in
-favour of local NVMe plus an RDMA copy until the open items below are dealt with. The code is in
+memory. It works: the DeepSeek dump takes 16.9 s against 37.0 s to local disk. It is set aside in
+favour of local NVMe plus an RDMA copy until the open items below are resolved. The code is in
 [`daemon/src/image.rs`](../daemon/src/image.rs) (`snapshotd image hold`) and the bench harness has
 `STREAM=1` for it.
 
@@ -47,9 +47,9 @@ Faulting the 76 GiB in beforehand took 19.4 s with one thread per 4 GiB segment.
 - **Huge pages allocated during the dump.** The node had 68 to 185 GB free and 1.8 TB of page
   cache. Each first touch of a 2 MiB page waited for the kernel to compact memory: about 75,000
   compaction stalls and 34,000 reclaim stalls over one dump, and each worker took 40 to 140 s
-  instead of 4 s. At TP=2 the 12 GB of huge pages were easy to find and nothing showed.
-  Faulting the pool in before the dump, in parallel, moves that cost out of the dump and made it
-  small. The pool has to exist before the capture starts; a daemon would allocate and register it
+  instead of 4 s. At TP=2 the 12 GB of huge pages were available and the stalls did not occur.
+  Faulting the pool in before the dump, in parallel, moves that cost out of the dump (19.4 s for
+  76 GiB). The pool has to exist before the capture starts; a daemon would allocate and register it
   once and reuse it.
 - **First touch against rewrite.** Writing into memory that is already faulted in ran at 30 GB/s
   on this node, first touch of huge pages at 4.6 GB/s and of 4 KiB pages at 2.3 GB/s.
@@ -69,7 +69,7 @@ Faulting the 76 GiB in beforehand took 19.4 s with one thread per 4 GiB segment.
   next step for this path.
 - **Pool pre-fault time depends on the node's memory state.** 19.4 s was measured right after a
   run that had already forced the kernel to compact. Dropping the page cache or triggering
-  compaction would make it cheap, and both are node-wide, so neither was done on a shared node.
+  compaction would shorten it, and both are node-wide, so neither was done on a shared node.
 - **Memory cost.** The image needs its size in host memory on both nodes for as long as it is
   held, counted against whichever pod runs `snapshotd`.
 - **Host files.** cuInterpose's state and the daemon's manifest are still regular files in the

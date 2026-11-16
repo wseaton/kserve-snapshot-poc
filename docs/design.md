@@ -114,7 +114,7 @@ With NCCL suspended at prepare:
 | other | host shared memory | on, fusion off | off | token-identical |
 | other | host shared memory | on, allreduce-RMS fusion on | fused workspace | workspace rebuild fails: `CUDA_ERROR_NOT_INITIALIZED` |
 
-Three things broke on the move to other GPUs, none of them cuInterpose's business:
+Three things failed on the move to other GPUs, none of them in cuInterpose:
 
 - `ncclCommResume` re-maps cuMem peer buffers but leaves the communicator pointing at memory that
   faults once a kernel uses it, on both drivers. snapshot-orchestrator saw the same class of failure
@@ -195,7 +195,7 @@ kept (16 GiB: 27.7 GB image, 19.2 s restore); 0005 does not cover it or the tier
 - cuInterpose stays as a fallback for workloads that still share memory at checkpoint time: custom
   all-reduce, symmetric memory, NVLS, NCCL over cuMem, or engines without a checkpoint lifecycle. The daemon decides
   at checkpoint time by inspecting, not by configuration.
-- CPU KV offload at production sizes wants `patches/vllm/0005`. On a vLLM without it the daemon
+- CPU KV offload at production sizes needs `patches/vllm/0005`. On a vLLM without it the daemon
   sets CRIU's ghost limit from the pod's `/dev/shm` size.
 - Every TP>1 cuInterpose restore needs the CUDA 13.1+ user-mode driver until host drivers are
   upgraded. The daemon records `cuDriverGetVersion` of the workload's `libcuda` in the manifest and
