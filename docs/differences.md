@@ -41,8 +41,14 @@ on another node. Details in [experiments/p2p-transfer.md](cross-node.md).
 ### 1. Weights are not in the checkpoint
 
 Dynamo Snapshot checkpoints the weights with the process: they are written into the CRIU image at
-capture and put back on the GPUs by the driver at restore. NVIDIA's May post describes splitting
-them out as future work.
+capture and put back on the GPUs by the driver at restore. NVIDIA's
+[2026-05-27 post](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/)
+describes a Global Memory Service that keeps the weights in a separate artifact and restores them
+alongside the process (gpt-oss-120b: 129 GiB checkpoint down to 6.7 GiB plus 74 GiB of weights),
+not shipped then because it needed a driver patch. The
+[2026-11-10 post](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot)
+does not mention it, and its checkpoints are larger than the weights (647 GB for 510 GB of
+DeepSeek-V4.1-Flash weights).
 
 Here vLLM frees the weights at prepare (`--checkpoint-release-weights`,
 [patches/vllm](../patches/vllm)) and loads them again after the driver restore.
