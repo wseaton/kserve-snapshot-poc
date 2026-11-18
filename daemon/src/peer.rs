@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::handshake::{self, Key, Refusal, Revision};
-use crate::state::{State, revision_dir};
+use crate::store::{RevisionKey, RevisionStore, directory_bytes};
 use crate::transfer::{self, Pool};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -97,7 +97,10 @@ impl Peers {
         let peer = stream.peer_addr()?;
         bound(&stream, Some(HANDSHAKE_TIMEOUT))?;
         let asked = handshake::authenticate(&mut stream, &self.key)?;
-        let image = revision_dir(&self.store, &asked.to_string()).map(|dir| dir.join("image"));
+        let image = asked
+            .to_string()
+            .parse::<RevisionKey>()
+            .map(|revision| revision.image_dir(&self.store));
         let turn = self.sending.try_lock();
         let verdict = match &image {
             Ok(image) if image.is_dir() && turn.is_ok() => Ok(()),
@@ -110,13 +113,17 @@ impl Peers {
         };
         bound(&stream, None)?;
         let start = Instant::now();
-        let sent = transfer::send_over(stream, &image, self.pool, None)?;
+        transfer::send_over(stream, &image, self.pool, None)?;
+        let (seconds, bytes) = (
+            start.elapsed().as_secs_f64(),
+            directory_bytes(&image) as f64,
+        );
         info!(
             revision = %asked,
             %peer,
-            seconds = %format_args!("{:.2}", start.elapsed().as_secs_f64()),
-            gb = %format_args!("{:.1}", sent["gb"].as_f64().unwrap_or_default()),
-            gbit_per_s = %format_args!("{:.1}", sent["gbps"].as_f64().unwrap_or_default()),
+            seconds = %format_args!("{seconds:.2}"),
+            gb = %format_args!("{:.1}", bytes / 1e9),
+            gbit_per_s = %format_args!("{:.1}", bytes * 8.0 / 1e9 / seconds),
             "sent a checkpoint to a peer"
         );
         Ok(())
@@ -139,16 +146,21 @@ impl Peers {
     }
 
     /// Get the checkpoint of `revision` from the first peer that has it and
-    /// publish it in `state`'s store. Returns the peer it came from, if any.
-    pub fn pull(&self, revision: &Revision, state: &State) -> Result<Option<SocketAddr>> {
+    /// publish it in `store`. Returns the peer it came from, if any.
+    pub fn pull(
+        &self,
+        revision: &RevisionKey,
+        store: &RevisionStore,
+    ) -> Result<Option<SocketAddr>> {
+        let revision = &Revision::new(revision.to_string())?;
         let deadline = Instant::now() + BUSY_WAIT;
         loop {
             let mut busy = false;
             for peer in self.addresses() {
-                state.clear_staging()?;
-                match self.pull_from(peer, revision, state) {
+                store.clear_staging()?;
+                match self.pull_from(peer, revision, store) {
                     Ok(Ok(())) => {
-                        state.publish()?;
+                        store.publish()?;
                         return Ok(Some(peer));
                     }
                     Ok(Err(Refusal::Busy)) => busy = true,
@@ -156,7 +168,7 @@ impl Peers {
                     Err(error) => warn!(%peer, error = %format_args!("{error:#}"), "pull failed"),
                 }
             }
-            state.clear_staging()?;
+            store.clear_staging()?;
             if !busy || Instant::now() >= deadline {
                 return Ok(None);
             }
@@ -168,7 +180,7 @@ impl Peers {
         &self,
         peer: SocketAddr,
         revision: &Revision,
-        state: &State,
+        store: &RevisionStore,
     ) -> Result<Result<(), Refusal>> {
         let mut stream = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT).context("connect")?;
         bound(&stream, Some(HANDSHAKE_TIMEOUT))?;
@@ -176,7 +188,7 @@ impl Peers {
             return Ok(Err(reason));
         }
         bound(&stream, None)?;
-        transfer::receive_over(stream, state.staging_dir(), true, false, None, None)?;
+        transfer::receive_over(stream, store.staging_dir(), true, false, None, None)?;
         Ok(Ok(()))
     }
 }

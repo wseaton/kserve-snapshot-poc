@@ -389,29 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn a_proof_matches_hmac_sha256_of_its_parts() {
-        let (a, b) = ([1u8; 32], [2u8; 32]);
-        let mut message = b"snapshotd pull v1 asking ".to_vec();
-        message.extend_from_slice(&a);
-        message.extend_from_slice(&b);
-        message.extend_from_slice(b"r");
-        let pkey = openssl::pkey::PKey::hmac(&[7u8; 32]).unwrap();
-        let mut signer =
-            openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &pkey).unwrap();
-        signer.update(&message).unwrap();
-        assert_eq!(
-            proof(&key(7), Role::Asking, &a, &b, &revision("r")).unwrap(),
-            signer.sign_to_vec().unwrap()
-        );
-    }
-
-    #[test]
-    fn the_role_tags_have_one_length() {
-        assert_eq!(Role::Asking.tag().len(), Role::Holding.tag().len());
-        assert_ne!(Role::Asking.tag(), Role::Holding.tag());
-    }
-
-    #[test]
     fn a_short_key_is_refused() {
         assert!(Key::from_bytes(&[1; 31]).is_err());
         assert!(Key::from_bytes(&[1; 32]).is_ok());

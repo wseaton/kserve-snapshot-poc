@@ -24,6 +24,7 @@ use cudarc::driver::sys::{
     CUuuid,
 };
 use libloading::Library;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 const LIBCUDA: &str = "libcuda.so.1";
@@ -180,53 +181,59 @@ pub fn restore_job(driver: &Driver, pids: &[i32], map: &GpuMap) -> Result<()> {
     timed("unlock", || each(pids, |pid| driver.unlock(pid)))
 }
 
-/// The UUID and device minor in one `/proc/driver/nvidia/gpus/*/information`.
-pub fn parse_gpu_information(information: &str) -> Option<(GpuUuid, u32)> {
-    let field = |name: &str| {
-        information
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .map(|value| value.trim_start_matches(':').trim())
-    };
-    Some((
-        field("GPU UUID")?.parse().ok()?,
-        field("Device Minor")?.parse().ok()?,
-    ))
+/// One GPU of a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gpu {
+    pub uuid: GpuUuid,
+    /// Its device minor: the N of `/dev/nvidiaN`, and its place in the
+    /// driver's enumeration.
+    pub minor: u32,
 }
 
-/// Every GPU of this node with its device minor.
-pub fn node_gpus() -> Result<Vec<(GpuUuid, u32)>> {
+impl Gpu {
+    /// Read one `/proc/driver/nvidia/gpus/*/information`.
+    pub fn parse(information: &str) -> Option<Self> {
+        let field = |name: &str| {
+            information
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(|value| value.trim_start_matches(':').trim())
+        };
+        Some(Self {
+            uuid: field("GPU UUID")?.parse().ok()?,
+            minor: field("Device Minor")?.parse().ok()?,
+        })
+    }
+}
+
+/// Every GPU of this node, in the order the driver enumerates them.
+pub fn node_gpus() -> Result<Vec<Gpu>> {
     let mut gpus = Vec::new();
     for entry in fs::read_dir("/proc/driver/nvidia/gpus").context("list the driver's GPUs")? {
         let path = entry?.path().join("information");
         let information =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        gpus.extend(parse_gpu_information(&information));
+        gpus.extend(Gpu::parse(&information));
     }
-    gpus.sort_by_key(|&(_, minor)| minor);
+    gpus.sort_by_key(|gpu| gpu.minor);
     Ok(gpus)
 }
 
-/// `gpus` with their device minors, in the order the driver enumerates them.
-/// Rank i of a checkpoint must land on the GPU at the same position among
-/// its pod's.
-pub fn in_enumeration_order(gpus: &[GpuUuid]) -> Result<Vec<(GpuUuid, u32)>> {
-    order_by_minor(gpus, &node_gpus()?)
-}
-
-fn order_by_minor(gpus: &[GpuUuid], minors: &[(GpuUuid, u32)]) -> Result<Vec<(GpuUuid, u32)>> {
-    let mut ordered = gpus
+/// The GPUs named by `uuids`, picked from `node` and kept in its order. Rank
+/// i of a checkpoint must land on the GPU at the same position among its
+/// pod's.
+pub fn pick(node: &[Gpu], uuids: &[GpuUuid]) -> Result<Vec<Gpu>> {
+    for uuid in uuids {
+        ensure!(
+            node.iter().any(|gpu| gpu.uuid == *uuid),
+            "the driver does not list {uuid}"
+        );
+    }
+    Ok(node
         .iter()
-        .map(|gpu| {
-            minors
-                .iter()
-                .find(|(uuid, _)| uuid == gpu)
-                .copied()
-                .with_context(|| format!("the driver does not list {gpu}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ordered.sort_by_key(|&(_, minor)| minor);
-    Ok(ordered)
+        .filter(|gpu| uuids.contains(&gpu.uuid))
+        .copied()
+        .collect())
 }
 
 /// Every process in the tree rooted at `root`. vLLM forks workers from
@@ -267,6 +274,20 @@ impl FromStr for GpuUuid {
         Ok(Self(
             Uuid::parse_str(raw).with_context(|| format!("{text:?}"))?,
         ))
+    }
+}
+
+impl Serialize for GpuUuid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for GpuUuid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -375,30 +396,48 @@ impl fmt::Display for GpuMap {
 
 #[cfg(test)]
 mod tests {
-    use crate::cuda::{GpuMap, GpuUuid, order_by_minor, parse_gpu_information, process_tree};
+    use crate::cuda::{Gpu, GpuMap, GpuUuid, pick, process_tree};
 
     #[test]
     fn the_driver_information_gives_uuid_and_minor() {
         let information = "Model: \t\t NVIDIA H200\nIRQ:   \t\t 255\nGPU UUID: \t GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\nVideo BIOS: \t 97.00.c4.00.11\nBus Type: \t PCIe\nDevice Minor: \t 3\nGPU Excluded:\t No\n";
-        let (uuid, minor) = parse_gpu_information(information).unwrap();
-        assert_eq!(uuid.to_string(), "GPU-03e97d3f-21d4-1c89-f142-657edeaf3566");
-        assert_eq!(minor, 3);
-        assert!(parse_gpu_information("Model: NVIDIA H200\nDevice Minor: 3\n").is_none());
-        assert!(
-            parse_gpu_information("GPU UUID: GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\n").is_none()
+        let gpu = Gpu::parse(information).unwrap();
+        assert_eq!(
+            gpu.uuid.to_string(),
+            "GPU-03e97d3f-21d4-1c89-f142-657edeaf3566"
         );
+        assert_eq!(gpu.minor, 3);
+        assert!(Gpu::parse("Model: NVIDIA H200\nDevice Minor: 3\n").is_none());
+        assert!(Gpu::parse("GPU UUID: GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\n").is_none());
     }
 
     #[test]
-    fn gpus_are_ordered_by_minor_whatever_order_they_come_in() {
+    fn a_pods_gpus_come_back_in_the_nodes_order() {
         let all = gpus(4);
-        let minors = [(all[0], 5), (all[1], 0), (all[2], 7), (all[3], 2)];
-        let ordered = order_by_minor(&[all[2], all[0], all[3], all[1]], &minors).unwrap();
+        let node: Vec<Gpu> = [(1, 0), (3, 2), (0, 5), (2, 7)]
+            .map(|(index, minor)| Gpu {
+                uuid: all[index],
+                minor,
+            })
+            .to_vec();
+        let picked = pick(&node, &[all[2], all[0], all[1]]).unwrap();
+        assert_eq!(picked, [node[0], node[2], node[3]]);
+        assert!(pick(&node[1..], &[all[1]]).is_err());
+    }
+
+    #[test]
+    fn a_gpu_is_written_as_its_uuid_string() {
+        let gpu = Gpu {
+            uuid: gpus(1)[0],
+            minor: 6,
+        };
+        let json = serde_json::to_string(&gpu).unwrap();
         assert_eq!(
-            ordered,
-            [(all[1], 0), (all[3], 2), (all[0], 5), (all[2], 7)]
+            json,
+            r#"{"uuid":"GPU-00000000-8867-7cb7-7ffd-202baf8a3566","minor":6}"#
         );
-        assert!(order_by_minor(&[all[0]], &minors[1..]).is_err());
+        assert_eq!(serde_json::from_str::<Gpu>(&json).unwrap(), gpu);
+        assert!(serde_json::from_str::<Gpu>(r#"{"uuid":"0","minor":6}"#).is_err());
     }
 
     fn gpus(n: usize) -> Vec<GpuUuid> {

@@ -29,14 +29,18 @@ use rustix::process::{Pid, Signal, WaitOptions};
 use serde::{Deserialize, Serialize};
 
 const TICK: Duration = Duration::from_millis(100);
+/// Where the node daemon expects the shim's socket and the server's log,
+/// in the pod.
+pub const SOCKET: &str = "/run/snapshotd/shim.sock";
+pub const SERVER_LOG: &str = "/run/snapshotd/server.log";
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Where the node daemon connects.
-    #[arg(long, default_value = "/run/snapshotd/shim.sock")]
+    #[arg(long, default_value = SOCKET)]
     socket: PathBuf,
     /// Where the server's output goes; it is copied to this process's output.
-    #[arg(long, default_value = "/run/snapshotd/server.log")]
+    #[arg(long, default_value = SERVER_LOG)]
     log: PathBuf,
     /// Port opened once the server answers requests, for a TCP readiness probe.
     #[arg(long, default_value_t = 8001)]

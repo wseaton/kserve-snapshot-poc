@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::image::{self, Arena, Extent, HugeRegion, Store, huge_page_fraction};
-use crate::state::ensure_room;
+use crate::store::ensure_room;
 use crate::trace::{self, FILE_TRACKS, Trace};
 use walkdir::WalkDir;
 

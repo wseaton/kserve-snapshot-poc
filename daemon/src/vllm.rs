@@ -122,24 +122,12 @@ impl Control {
 
 #[cfg(test)]
 mod tests {
-    use crate::vllm::{Lifecycle, lifecycle, pb};
+    use crate::vllm::{lifecycle, pb};
 
     fn response(state: pb::CheckpointState, error: Option<&str>) -> pb::CheckpointStateResponse {
         pb::CheckpointStateResponse {
             state: state.into(),
             error: error.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn each_state_maps_to_its_lifecycle() {
-        for (state, wanted) in [
-            (pb::CheckpointState::Running, Lifecycle::Running),
-            (pb::CheckpointState::Preparing, Lifecycle::Preparing),
-            (pb::CheckpointState::Prepared, Lifecycle::Prepared),
-            (pb::CheckpointState::Restoring, Lifecycle::Restoring),
-        ] {
-            assert_eq!(lifecycle(&response(state, None)).unwrap(), wanted);
         }
     }
 

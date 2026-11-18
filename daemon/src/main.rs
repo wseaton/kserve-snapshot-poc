@@ -1,7 +1,8 @@
 //! snapshotd: the privileged node path for snapshot scale-out. See docs/design.md.
 //!
-//! The subcommands are the daemon's building blocks, usable on their own from
-//! a privileged container while the control loop is written.
+//! `node` is the daemon and `shim` the workload container's PID 1. The other
+//! subcommands are the daemon's building blocks, usable on their own from a
+//! privileged container.
 mod cri;
 mod cuda;
 mod cuinterpose;
@@ -14,7 +15,7 @@ mod node;
 mod peer;
 mod podresources;
 mod shim;
-mod state;
+mod store;
 #[cfg(feature = "nixl")]
 mod trace;
 #[cfg(feature = "nixl")]
@@ -42,6 +43,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run as PID 1 of a workload container, under the node daemon.
+    Shim(shim::Args),
+    #[command(flatten)]
+    Privileged(Privileged),
+}
+
+#[derive(Subcommand)]
+enum Privileged {
     /// CUDA process checkpoint through the host driver.
     #[command(subcommand)]
     Cuda(CudaCommand),
@@ -49,8 +58,6 @@ enum Command {
     Inject(inject::Args),
     /// Checkpoint and restore the opted-in pods of this node.
     Node(node::Args),
-    /// Run as PID 1 of a workload container, under the node daemon.
-    Shim(shim::Args),
     /// cuInterpose shared-memory tracking.
     #[command(subcommand)]
     Cuinterpose(CuinterposeCommand),
@@ -192,51 +199,65 @@ fn raise_open_file_limit() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let command = match Cli::parse().command {
+    match Cli::parse().command {
         Command::Shim(args) => std::process::exit(shim::run(args)?),
-        command => command,
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("SNAPSHOTD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_ansi(std::io::stdout().is_terminal())
-        .init();
-    raise_open_file_limit()?;
-    match command {
-        Command::Shim(_) => Ok(()),
-        Command::Inject(args) => inject::run(&args),
-        Command::Node(args) => node::run_daemon(args),
-        Command::Cuda(command) => cuda_command(command),
-        Command::Cuinterpose(command) => cuinterpose_command(command),
-        Command::Image(ImageCommand::Hold {
-            images_dir,
-            segment_gib,
-            reserve_gib,
-        }) => image::hold(&images_dir, segment_gib << 30, reserve_gib << 30),
-        #[cfg(feature = "nixl")]
-        Command::Transfer(TransferCommand::Receive {
-            dir,
-            listen,
-            direct,
-            hold,
-            trace,
-        }) => transfer::receive_directory(&dir, &listen, direct, hold, trace),
-        #[cfg(feature = "nixl")]
-        Command::Transfer(TransferCommand::Stream {
-            images_dir,
-            to,
-            pool,
-            trace,
-        }) => transfer::stream_capture(&images_dir, &to, pool, trace),
-        #[cfg(feature = "nixl")]
-        Command::Transfer(TransferCommand::Send {
-            dir,
-            to,
-            pool,
-            trace,
-        }) => transfer::send_directory(&dir, &to, pool, trace),
+        Command::Privileged(command) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_env("SNAPSHOTD_LOG")
+                        .unwrap_or_else(|_| EnvFilter::new("info")),
+                )
+                .with_target(false)
+                .with_ansi(std::io::stdout().is_terminal())
+                .init();
+            raise_open_file_limit()?;
+            command.run()
+        }
+    }
+}
+
+impl Privileged {
+    fn run(self) -> Result<()> {
+        match self {
+            Self::Inject(args) => inject::run(&args),
+            Self::Node(args) => node::run(args),
+            Self::Cuda(command) => cuda_command(command),
+            Self::Cuinterpose(command) => cuinterpose_command(command),
+            Self::Image(ImageCommand::Hold {
+                images_dir,
+                segment_gib,
+                reserve_gib,
+            }) => image::hold(&images_dir, segment_gib << 30, reserve_gib << 30),
+            #[cfg(feature = "nixl")]
+            Self::Transfer(command) => command.run(),
+        }
+    }
+}
+
+#[cfg(feature = "nixl")]
+impl TransferCommand {
+    fn run(self) -> Result<()> {
+        match self {
+            Self::Receive {
+                dir,
+                listen,
+                direct,
+                hold,
+                trace,
+            } => transfer::receive_directory(&dir, &listen, direct, hold, trace),
+            Self::Stream {
+                images_dir,
+                to,
+                pool,
+                trace,
+            } => transfer::stream_capture(&images_dir, &to, pool, trace),
+            Self::Send {
+                dir,
+                to,
+                pool,
+                trace,
+            } => transfer::send_directory(&dir, &to, pool, trace),
+        }
     }
 }
 
