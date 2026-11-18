@@ -1,0 +1,95 @@
+name: snapshotd
+
+on:
+  pull_request:
+    paths:
+      - daemon/**
+      - images/snapshotd/**
+      - experiments/bench/restore-bench.sh
+      - experiments/bench/offload-check.sh
+      - experiments/criu/noiouring.py
+      - .dockerignore
+      - .github/workflows/snapshotd.yaml
+  push:
+    branches: [main]
+    paths:
+      - daemon/**
+      - images/snapshotd/**
+      - experiments/bench/restore-bench.sh
+      - experiments/bench/offload-check.sh
+      - experiments/criu/noiouring.py
+      - .dockerignore
+      - .github/workflows/snapshotd.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: snapshotd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/snapshotd
+  RUST_VERSION: 1.100.0
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt && rustup default "$RUST_VERSION"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --benches --tests --examples -- -D warnings
+      - run: cargo test --locked
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: images/snapshotd/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=snapshotd
+          cache-to: type=gha,scope=snapshotd,mode=max
+
+  references:
+    needs: image
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/image-reference.yaml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      name: snapshotd
+      digest: ${{ needs.image.outputs.digest }}

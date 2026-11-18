@@ -1,0 +1,32 @@
+name: image-reference
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        required: true
+        type: string
+      digest:
+        required: true
+        type: string
+
+jobs:
+  pull-request:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set the digest
+        working-directory: deploy/components/images
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.name }}
+          DIGEST: ${{ inputs.digest }}
+        run: kustomize edit set image "$IMAGE=$IMAGE@$DIGEST"
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: image-reference/${{ inputs.name }}
+          title: "Use ${{ inputs.name }} ${{ inputs.digest }}"
+          commit-message: "Use ${{ inputs.name }} ${{ inputs.digest }}"
+          body: "Built from ${{ github.sha }} by ${{ github.workflow }}."

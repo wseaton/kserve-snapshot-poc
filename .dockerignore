@@ -1,0 +1,5 @@
+.git
+src
+daemon/target
+kserve-dynamo-snapshot
+docs
