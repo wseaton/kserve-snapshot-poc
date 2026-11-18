@@ -55,7 +55,7 @@ impl Revision {
     pub fn new(revision: impl Into<String>) -> Result<Self> {
         let revision = revision.into();
         ensure!(!revision.is_empty(), "the revision is empty");
-        ensure!(revision.len() <= 253, "the revision is too long");
+        ensure!(revision.len() <= 512, "the revision is too long");
         Ok(Self(revision))
     }
 }
@@ -81,8 +81,6 @@ pub enum Refusal {
     NoImage,
     /// It is sending its image to another replica.
     Busy,
-    /// Its image is of another revision.
-    WrongRevision,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,7 +298,7 @@ mod tests {
 
     #[test]
     fn a_refusal_reaches_the_asking_replica() {
-        for reason in [Refusal::NoImage, Refusal::Busy, Refusal::WrongRevision] {
+        for reason in [Refusal::NoImage, Refusal::Busy] {
             let (asked, held) = exchange(key(1), key(1), Err(reason));
             assert_eq!(asked.unwrap(), Err(reason));
             held.unwrap();
@@ -445,7 +443,7 @@ mod tests {
     #[test]
     fn an_empty_revision_is_refused() {
         assert!(Revision::new("").is_err());
-        assert!(Revision::new("x".repeat(254)).is_err());
+        assert!(Revision::new("x".repeat(513)).is_err());
         assert_eq!(revision("abc").to_string(), "abc");
     }
 

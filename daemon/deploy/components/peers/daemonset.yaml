@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshotd
+spec:
+  template:
+    spec:
+      containers:
+        - name: snapshotd
+          args:
+            - --store-dir=/store
+            - --tools-dir=/tools
+            - --peers=snapshotd-peers:7700
+            - --own-ip=$(POD_IP)
+            - --key-file=/etc/snapshot-transfer/key
+          ports:
+            - name: peers
+              containerPort: 7700
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOME
+              value: /tmp
+            - name: UCX_TLS
+              value: tcp,cuda_copy
+          volumeMounts:
+            - name: transfer-key
+              mountPath: /etc/snapshot-transfer
+              readOnly: true
+      volumes:
+        - name: transfer-key
+          secret:
+            secretName: snapshot-transfer-key

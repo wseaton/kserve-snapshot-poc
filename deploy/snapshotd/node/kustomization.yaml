@@ -3,4 +3,5 @@ kind: Kustomization
 resources:
   - ../../../daemon/deploy/node
 components:
+  - ../../../daemon/deploy/components/peers
   - ../../components/images

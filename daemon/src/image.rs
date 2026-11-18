@@ -530,6 +530,7 @@ pub fn serve_forever(store: &Store, restores: &UnixListener) -> Result<()> {
     }
 }
 
+#[cfg(any(test, feature = "nixl"))]
 pub fn serve_socket(images_dir: &Path) -> Result<UnixListener> {
     listen(images_dir, SERVE_SOCKET)
 }

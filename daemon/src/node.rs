@@ -28,6 +28,11 @@ use tokio::time::{Instant, sleep};
 
 use crate::cri::{Runtime, Sandbox};
 use crate::cuda::{self, Driver, GpuMap, GpuUuid};
+use crate::cuinterpose;
+#[cfg(feature = "nixl")]
+use crate::handshake::Revision;
+#[cfg(feature = "nixl")]
+use crate::peer::{self, Peers};
 use crate::podresources;
 use crate::shim::{Reply, Request};
 use crate::state::{State, ensure_room};
@@ -47,6 +52,7 @@ const BOOT: Duration = Duration::from_secs(3600);
 const LIFECYCLE: Duration = Duration::from_secs(900);
 const CUDA_LOCK: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_secs(10);
+const REAP_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -77,6 +83,16 @@ pub struct Args {
     /// Seconds between looks at the runtime's pods.
     #[arg(long, default_value_t = 2)]
     poll_s: u64,
+    #[cfg(feature = "nixl")]
+    #[command(flatten)]
+    peers: peer::Args,
+}
+
+/// What every pod's task shares.
+struct Node {
+    args: Args,
+    #[cfg(feature = "nixl")]
+    peers: Option<Arc<Peers>>,
 }
 
 /// What a restore needs to know about where the checkpoint came from.
@@ -151,6 +167,46 @@ async fn run(command: &mut Command, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// The lines of a CRIU log that say why it failed.
+pub fn criu_errors(log: &str) -> String {
+    let errors: Vec<&str> = log.lines().filter(|line| line.contains("Error")).collect();
+    let shown = if errors.is_empty() {
+        log.lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    } else {
+        errors
+    };
+    shown.join("\n")
+}
+
+async fn run_criu(command: &mut Command, what: &str, log: &Path) -> Result<()> {
+    run(command, what)
+        .await
+        .map_err(|error| match fs::read_to_string(log) {
+            Ok(log) => error.context(criu_errors(&log)),
+            Err(_) => error,
+        })
+}
+
+/// Wait for a process CRIU has dumped and killed to be reaped. Until then
+/// its PID is taken and a restore into the same pod cannot have it back.
+async fn gone(pid: i32) -> Result<()> {
+    let deadline = Instant::now() + REAP_WAIT;
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        ensure!(
+            Instant::now() < deadline,
+            "process {pid} is still there {REAP_WAIT:?} after its dump"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
 async fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
     let mut source = from.as_os_str().to_owned();
@@ -216,6 +272,8 @@ impl Shim {
     }
 }
 
+const CUINTERPOSE: &str = "cuinterpose";
+
 struct Pod<'a> {
     args: &'a Args,
     name: String,
@@ -229,21 +287,37 @@ impl Pod<'_> {
         SocketAddr::new(self.address, self.args.control_port)
     }
 
+    /// CRIU, run in every namespace of the pod and in its cgroup, so what it
+    /// restores is accounted and confined like the pod's own processes. A
+    /// process can only be moved into the pod's cgroup from a cgroup
+    /// namespace that sees both, which is the node's.
+    ///
+    /// ```text
+    /// nsenter (node's cgroup namespace) ─► unshare (mounts) ─► mount cgroup2,
+    ///   join the pod's cgroup ─► nsenter (all of the pod's namespaces) ─► criu
+    /// ```
     fn criu(&self, action: &str) -> Command {
+        let pid = self.shim_pid.to_string();
+        let enter = format!(
+            "mount -t cgroup2 none /mnt \
+             && echo $$ > \"/mnt$(sed -n 's/^0:://p' /proc/{pid}/cgroup)/cgroup.procs\" \
+             && exec nsenter -t {pid} -a -- \"$@\""
+        );
         let mut command = Command::new("nsenter");
         command
-            .args(["-t", &self.shim_pid.to_string(), "-a", "--"])
+            .args([
+                "-t", "1", "-C", "--", "unshare", "-m", "--", "sh", "-c", &enter, "sh",
+            ])
             .arg(format!("{TOOLS}/criu"))
             .arg(action)
             .env("LD_LIBRARY_PATH", format!("{TOOLS}/lib"))
             .args(["--libdir", &format!("{TOOLS}/criu-plugins")])
             .args([
+                "--manage-cgroups=ignore",
                 "--tcp-established",
                 "--ext-unix-sk",
-                "--file-locks",
-                "--link-remap",
-                "-v4",
-            ]);
+            ])
+            .args(["--file-locks", "--link-remap", "-v4"]);
         command
     }
 
@@ -261,7 +335,19 @@ impl Pod<'_> {
         .await
     }
 
+    fn cuinterpose(&self) -> cuinterpose::Config {
+        cuinterpose::Config {
+            bundle_dir: self.args.tools_dir.join(CUINTERPOSE),
+            socket_dir: in_pod(self.shim_pid, "/tmp"),
+        }
+    }
+
+    /// The CUDA processes of the server; none for a pod without GPUs, which
+    /// needs no driver at all.
     async fn cuda_pids(&self, server: i32) -> Result<Vec<i32>> {
+        if self.gpus.is_empty() {
+            return Ok(Vec::new());
+        }
         tokio::task::spawn_blocking(move || -> Result<Vec<i32>> {
             let driver = Driver::load()?;
             Ok(cuda::process_tree(server)
@@ -291,20 +377,25 @@ impl Pod<'_> {
         let server = host_pid(self.shim_pid, root_pid)?;
         let pids = self.cuda_pids(server).await?;
         shim.call(Request::Release).await?;
-        tokio::task::spawn_blocking(move || {
-            cuda::checkpoint_job(&Driver::load()?, &pids, CUDA_LOCK)
-        })
-        .await??;
-        self.mount(&self.args.tools_dir, TOOLS).await?;
+        if !pids.is_empty() {
+            let (config, img) = (self.cuinterpose(), image.join("img"));
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                cuinterpose::prepare_checkpoint(&config, &img, &pids)?;
+                cuda::checkpoint_job(&Driver::load()?, &pids, CUDA_LOCK)
+            })
+            .await??;
+        }
         self.mount(image, IMAGE).await?;
-        run(
+        run_criu(
             self.criu("dump")
                 .args(["-t", &root_pid.to_string()])
                 .args(["-D", &format!("{IMAGE}/img"), "-W", &format!("{IMAGE}/img")])
                 .args(["--ghost-limit", "1G", "-o", "dump.log"]),
             "criu dump",
+            &image.join("img/dump.log"),
         )
         .await?;
+        gone(server).await?;
         copy_tree(&in_pod(self.shim_pid, "/dev/shm"), &image.join("shm")).await?;
         fs::copy(in_pod(self.shim_pid, SERVER_LOG), image.join("server.log"))
             .context("copy the server's log")?;
@@ -362,19 +453,31 @@ impl Pod<'_> {
             "move the pod's PID counter",
         )
         .await?;
-        self.mount(&self.args.tools_dir, TOOLS).await?;
         self.mount(image, IMAGE).await?;
-        run(
+        run_criu(
             criu.args(["-D", &format!("{IMAGE}/img"), "-W", WORK])
                 .args(["--restore-detached", "-o", "restore.log"]),
             "criu restore",
+            &in_pod(self.shim_pid, &format!("{WORK}/restore.log")),
         )
         .await?;
         let server = host_pid(self.shim_pid, manifest.root_pid)?;
         let pids = self.cuda_pids(server).await?;
-        let map = GpuMap::new(&source, &self.gpus, &self.gpus)?;
-        tokio::task::spawn_blocking(move || cuda::restore_job(&Driver::load()?, &pids, &map))
+        if !pids.is_empty() {
+            let map = GpuMap::new(&source, &self.gpus, &self.gpus)?;
+            let (config, img) = (self.cuinterpose(), image.join("img"));
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                cuda::restore_job(&Driver::load()?, &pids, &map)?;
+                match cuinterpose::Manifest::load(&img)? {
+                    Some(manifest) => {
+                        manifest.verify_libraries(&config)?;
+                        cuinterpose::restore(&config, &img, &manifest)
+                    }
+                    None => Ok(()),
+                }
+            })
             .await??;
+        }
         Control::connect(self.control())
             .await?
             .restore(LIFECYCLE)
@@ -389,7 +492,8 @@ impl Pod<'_> {
     }
 }
 
-async fn look_after(args: &Args, sandbox: &Sandbox) -> Result<()> {
+async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
+    let args = &node.args;
     let name = format!("{}/{}", sandbox.namespace, sandbox.name);
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
     let deadline = Instant::now() + CONTAINER_WAIT;
@@ -441,8 +545,26 @@ async fn look_after(args: &Args, sandbox: &Sandbox) -> Result<()> {
         .join(&sandbox.namespace)
         .join(workload)
         .join(revision);
-    let store = State::open(&revision_dir, &revision_dir, &sandbox.uid)?;
+    let store = State::open(&revision_dir, &sandbox.uid)?;
     let gave_up = revision_dir.join(format!("failed-{}", sandbox.uid));
+    pod.mount(&args.tools_dir, TOOLS).await?;
+
+    #[cfg(feature = "nixl")]
+    if let Some(peers) = node
+        .peers
+        .clone()
+        .filter(|_| !store.image_ready() && !gave_up.exists())
+    {
+        let revision = Revision::new(format!("{}/{workload}/{revision}", sandbox.namespace))?;
+        let (directory, uid) = (revision_dir.clone(), sandbox.uid.clone());
+        let pulled = tokio::task::spawn_blocking(move || {
+            peers.pull(&revision, &State::open(&directory, &uid)?)
+        })
+        .await??;
+        if pulled {
+            println!("{name}: pulled the checkpoint from a peer");
+        }
+    }
 
     if store.image_ready() && !gave_up.exists() {
         match pod.restore(&store.image_dir()).await {
@@ -494,7 +616,7 @@ async fn look_after(args: &Args, sandbox: &Sandbox) -> Result<()> {
     }
 }
 
-async fn serve(args: Arc<Args>) -> Result<()> {
+async fn serve(args: Args) -> Result<()> {
     fs::create_dir_all(&args.store_dir)
         .with_context(|| format!("create {}", args.store_dir.display()))?;
     ensure!(
@@ -502,6 +624,12 @@ async fn serve(args: Arc<Args>) -> Result<()> {
         "no criu in {}",
         args.tools_dir.display()
     );
+    let node = Arc::new(Node {
+        #[cfg(feature = "nixl")]
+        peers: Peers::start(&args.peers, &args.store_dir)?,
+        args,
+    });
+    let args = &node.args;
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
     let handled = Arc::new(Mutex::new(HashSet::<String>::new()));
     println!("watching pods labelled {}", args.label);
@@ -516,9 +644,9 @@ async fn serve(args: Arc<Args>) -> Result<()> {
                     if !seen.insert(sandbox.uid.clone()) {
                         continue;
                     }
-                    let (args, handled) = (Arc::clone(&args), Arc::clone(&handled));
+                    let (node, handled) = (Arc::clone(&node), Arc::clone(&handled));
                     tokio::spawn(async move {
-                        if let Err(error) = look_after(&args, &sandbox).await {
+                        if let Err(error) = look_after(&node, &sandbox).await {
                             println!("{}/{}: {error:#}", sandbox.namespace, sandbox.name);
                             sleep(RETRY).await;
                             if let Ok(mut seen) = handled.lock() {
@@ -539,7 +667,7 @@ pub fn run_daemon(args: Args) -> Result<()> {
         .enable_all()
         .build()
         .context("start the runtime")?
-        .block_on(serve(Arc::new(args)))
+        .block_on(serve(args))
 }
 
 #[cfg(test)]
@@ -547,7 +675,7 @@ mod tests {
     use std::fs;
     use std::process::{Command, Stdio};
 
-    use crate::node::{Manifest, host_pid, in_pod};
+    use crate::node::{Manifest, criu_errors, gone, host_pid, in_pod};
 
     #[test]
     fn a_child_is_found_by_its_pid() {
@@ -585,6 +713,36 @@ mod tests {
         assert!(Manifest::load(&dir).is_err());
         fs::remove_dir_all(&dir).unwrap();
         assert!(Manifest::load(&dir).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reaped_process_is_gone() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        child.kill().unwrap();
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            child.wait().unwrap();
+        });
+        gone(pid).await.unwrap();
+        reaper.join().unwrap();
+        gone(i32::MAX).await.unwrap();
+    }
+
+    #[test]
+    fn a_criu_log_is_cut_down_to_its_errors() {
+        let log = "(00.001) Warn  (criu/x.c:1): a\n(00.002) Error (criu/y.c:2): first\n(00.003) fine\n(00.004) Error (criu/z.c:3): second\n";
+        assert_eq!(
+            criu_errors(log),
+            "(00.002) Error (criu/y.c:2): first\n(00.004) Error (criu/z.c:3): second"
+        );
+        let quiet = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        assert_eq!(criu_errors(quiet), "two\nthree\nfour\nfive\nsix");
+        assert_eq!(criu_errors(""), "");
     }
 
     #[test]

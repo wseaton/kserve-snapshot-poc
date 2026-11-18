@@ -48,8 +48,18 @@ jobs:
       - run: cargo clippy --locked --benches --tests --examples -- -D warnings
       - run: cargo test --locked
 
-  image:
+  e2e:
     needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - run: daemon/e2e/run.sh
+
+  image:
+    needs: [check, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: read

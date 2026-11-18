@@ -2,8 +2,6 @@
 //!
 //! The subcommands are the daemon's building blocks, usable on their own from
 //! a privileged container while the control loop is written.
-#[cfg(feature = "nixl")]
-mod agent;
 mod cri;
 mod cuda;
 mod cuinterpose;
@@ -12,6 +10,8 @@ mod handshake;
 mod image;
 mod inject;
 mod node;
+#[cfg(feature = "nixl")]
+mod peer;
 mod podresources;
 mod shim;
 mod state;
@@ -40,9 +40,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pull a checkpoint from a replica that has one, then offer this pod's.
-    #[cfg(feature = "nixl")]
-    Agent(agent::Args),
     /// CUDA process checkpoint through the host driver.
     #[command(subcommand)]
     Cuda(CudaCommand),
@@ -202,8 +199,6 @@ fn main() -> Result<()> {
         Command::Shim(_) => Ok(()),
         Command::Inject(args) => inject::run(&args),
         Command::Node(args) => node::run_daemon(args),
-        #[cfg(feature = "nixl")]
-        Command::Agent(args) => agent::run(args),
         Command::Cuda(command) => cuda_command(command),
         Command::Cuinterpose(command) => cuinterpose_command(command),
         Command::Image(ImageCommand::Hold {

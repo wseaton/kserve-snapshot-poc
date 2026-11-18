@@ -1,39 +1,34 @@
-//! The files an agent shares with the serving container of its pod, and with
-//! the other pods of its revision on the node.
+//! One revision's directory in a node's checkpoint store.
 //!
 //! ```text
-//! <state dir>/pull.status    written once by the agent: `local`, `pulled` or `none`
-//! <store dir>/image/         the checkpoint of this revision; it appears whole, by rename
-//! <store dir>/incoming-<id>/ a pull in progress
+//! <store>/<namespace>/<workload>/<hash>/image/           the checkpoint; it appears whole, by rename
+//! <store>/<namespace>/<workload>/<hash>/incoming-<id>/   a capture or a pull in progress, one per pod
 //! ```
-//!
-//! The state directory belongs to the pod. The store directory is on the
-//! node's disk and outlives it, so the next pod of the revision on this node
-//! restores without a transfer. The serving container publishes an image it
-//! took the same way, by renaming a sibling directory to `image`.
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
-/// How an agent came by an image, if it did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PullOutcome {
-    /// The node already had one.
-    Local,
-    Pulled,
-    None,
-}
-
-impl PullOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Pulled => "pulled",
-            Self::None => "none",
-        }
-    }
+/// Where the store keeps the revision named `<namespace>/<workload>/<hash>`.
+/// The name can come from a peer, so it may not leave the store.
+#[cfg(any(test, feature = "nixl"))]
+pub fn revision_dir(store: &Path, name: &str) -> Result<PathBuf> {
+    let parts: Vec<&str> = name.split('/').collect();
+    ensure!(
+        parts.len() == 3
+            && parts.iter().all(|part| {
+                !part.is_empty()
+                    && !part.starts_with('.')
+                    && part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            }),
+        "{name:?} is not <namespace>/<workload>/<hash>"
+    );
+    Ok(parts
+        .iter()
+        .fold(store.to_path_buf(), |dir, part| dir.join(part)))
 }
 
 /// Fail unless the filesystem holding `dir` has `bytes` free.
@@ -49,19 +44,15 @@ pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
 }
 
 pub struct State {
-    dir: PathBuf,
     store: PathBuf,
     staging: PathBuf,
 }
 
 impl State {
-    /// `id` names this pod's unfinished pull among those of other pods.
-    pub fn open(dir: &Path, store: &Path, id: &str) -> Result<Self> {
-        for dir in [dir, store] {
-            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+    /// `id` names this pod's unfinished capture or pull among those of other pods.
+    pub fn open(store: &Path, id: &str) -> Result<Self> {
+        fs::create_dir_all(store).with_context(|| format!("create {}", store.display()))?;
         Ok(Self {
-            dir: dir.to_path_buf(),
             store: store.to_path_buf(),
             staging: store.join(format!("incoming-{id}")),
         })
@@ -79,45 +70,24 @@ impl State {
         &self.staging
     }
 
-    pub fn pull_outcome(&self) -> Result<Option<PullOutcome>> {
-        let path = self.dir.join("pull.status");
-        let recorded = match fs::read_to_string(&path) {
-            Ok(recorded) => recorded,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        };
-        match recorded.trim() {
-            "local" => Ok(Some(PullOutcome::Local)),
-            "pulled" => Ok(Some(PullOutcome::Pulled)),
-            "none" => Ok(Some(PullOutcome::None)),
-            other => bail!("{} holds {other:?}", path.display()),
-        }
-    }
-
-    pub fn record_pull(&self, outcome: PullOutcome) -> Result<()> {
-        let staged = self.dir.join("pull.status.tmp");
-        fs::write(&staged, format!("{}\n", outcome.as_str()))
-            .with_context(|| format!("write {}", staged.display()))?;
-        fs::rename(&staged, self.dir.join("pull.status")).context("publish pull.status")
-    }
-
-    /// Remove what an unfinished pull left behind.
+    /// Remove what an unfinished capture or pull left behind.
     pub fn clear_staging(&self) -> Result<()> {
         match fs::remove_dir_all(&self.staging) {
             Err(error) if error.kind() != ErrorKind::NotFound => {
-                Err(error).context("remove the unfinished pull")
+                Err(error).context("remove the unfinished image")
             }
             _ => Ok(()),
         }
     }
 
-    /// Make the finished pull the node's image of this revision. If another
-    /// pod published one first, that one stays and the pull is dropped.
+    /// Make the finished staging directory the node's image of this
+    /// revision. If another pod published one first, that one stays and this
+    /// one is dropped.
     pub fn publish(&self) -> Result<()> {
         match fs::rename(&self.staging, self.image_dir()) {
             Ok(()) => Ok(()),
             Err(_) if self.image_ready() => self.clear_staging(),
-            Err(error) => Err(error).context("publish the pulled image"),
+            Err(error) => Err(error).context("publish the image"),
         }
     }
 }
@@ -127,7 +97,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::state::{PullOutcome, State, ensure_room};
+    use crate::state::{State, ensure_room, revision_dir};
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -137,7 +107,30 @@ mod tests {
     }
 
     fn open(dir: &Path, id: &str) -> State {
-        State::open(&dir.join("pod"), &dir.join("store/rev"), id).unwrap()
+        State::open(&dir.join("store/rev"), id).unwrap()
+    }
+
+    #[test]
+    fn a_revision_name_maps_into_the_store() {
+        let store = Path::new("/store");
+        assert_eq!(
+            revision_dir(store, "serving/qwen3-8b/7b9f694bf8").unwrap(),
+            Path::new("/store/serving/qwen3-8b/7b9f694bf8")
+        );
+        for name in [
+            "",
+            "serving/qwen3-8b",
+            "serving/qwen3-8b/7b9f694bf8/extra",
+            "serving//7b9f694bf8",
+            "../qwen3-8b/7b9f694bf8",
+            "serving/../7b9f694bf8",
+            "serving/.hidden/7b9f694bf8",
+            "/etc/passwd/x",
+            "serving/qwen 3/7b9f694bf8",
+            "serving/qwen3-8b/7b9f\\694bf8",
+        ] {
+            assert!(revision_dir(store, name).is_err(), "{name:?}");
+        }
     }
 
     #[test]
@@ -152,45 +145,18 @@ mod tests {
     }
 
     #[test]
-    fn a_new_state_has_no_outcome_and_no_image() {
+    fn a_new_state_has_no_image() {
         let dir = scratch("new");
         let state = open(&dir, "a");
-        assert_eq!(state.pull_outcome().unwrap(), None);
         assert!(!state.image_ready());
         assert_eq!(state.image_dir(), dir.join("store/rev/image"));
         assert_eq!(state.staging_dir(), dir.join("store/rev/incoming-a"));
-        assert!(dir.join("pod").is_dir() && dir.join("store/rev").is_dir());
+        assert!(dir.join("store/rev").is_dir());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn a_recorded_outcome_is_read_back() {
-        let dir = scratch("outcome");
-        let state = open(&dir, "a");
-        for outcome in [PullOutcome::None, PullOutcome::Local, PullOutcome::Pulled] {
-            state.record_pull(outcome).unwrap();
-            assert_eq!(state.pull_outcome().unwrap(), Some(outcome));
-            assert_eq!(open(&dir, "a").pull_outcome().unwrap(), Some(outcome));
-        }
-        assert_eq!(
-            fs::read_to_string(dir.join("pod/pull.status")).unwrap(),
-            "pulled\n"
-        );
-        assert!(!dir.join("pod/pull.status.tmp").exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_unknown_outcome_is_an_error() {
-        let dir = scratch("unknown");
-        let state = open(&dir, "a");
-        fs::write(dir.join("pod/pull.status"), "maybe\n").unwrap();
-        assert!(state.pull_outcome().is_err());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_published_pull_becomes_the_image() {
+    fn a_published_staging_directory_becomes_the_image() {
         let dir = scratch("publish");
         let state = open(&dir, "a");
         fs::create_dir_all(state.staging_dir().join("img")).unwrap();
@@ -224,14 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn publishing_without_a_pull_is_an_error() {
+    fn publishing_nothing_is_an_error() {
         let dir = scratch("nothing");
         assert!(open(&dir, "a").publish().is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn clearing_removes_a_partial_pull_and_tolerates_none() {
+    fn clearing_removes_a_partial_image_and_tolerates_none() {
         let dir = scratch("clear");
         let state = open(&dir, "a");
         state.clear_staging().unwrap();

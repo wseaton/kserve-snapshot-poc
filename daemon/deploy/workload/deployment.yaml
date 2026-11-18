@@ -37,13 +37,17 @@ spec:
             - /snapshot-tools/snapshotd
             - shim
             - --
-            - python3
-            - /snapshot-tools/noiouring.py
+            - sh
+            - -c
+            - >-
+              exec env "LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat:${LD_LIBRARY_PATH}"
+              LD_PRELOAD=/run/snapshotd/tools/cuinterpose/libcuinterpose.so
+              python3 /snapshot-tools/noiouring.py vllm serve "$@"
             - vllm
-            - serve
             - /models/Qwen3-8B
             - --served-model-name=qwen3-8b
             - --enable-sleep-mode
+            - --checkpoint-release-weights
             - --host=0.0.0.0
             - --port=8000
             - --grpc-port=50051

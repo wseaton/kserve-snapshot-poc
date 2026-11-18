@@ -23,7 +23,14 @@ spec:
       initContainers:
         - name: tools
           image: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
-          command: [cp, -a, /snapshot-binaries/., /tools/]
+          command:
+            - sh
+            - -c
+            - >-
+              cp -a /snapshot-binaries/. /tools/ &&
+              mkdir -p /tools/cuinterpose &&
+              cp /tools/snapshot-cuda/libcuinterpose.so /tools/snapshot-cuda/libcuinterpose_core.so
+              /tools/cuinterpose-coordinator /tools/cuinterpose/
           resources:
             requests:
               cpu: 100m
