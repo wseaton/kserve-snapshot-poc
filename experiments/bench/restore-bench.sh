@@ -25,9 +25,9 @@
 #                a restore on another node needs under /work/<tag>; restore: restore a /work/<tag>
 #                captured elsewhere onto this pod's GPUs; serve: cold boot and leave the
 #                server running, as a ModelExpress peer for example (default all)
-#   GPU_POSITIONS  enumeration positions of the GPUs to run on, such as "4 5 6 7"; they must be
-#                allocated to the pod (default: its first TP GPUs). A restore on another node
-#                lands on the same positions there
+#   GPU_POSITIONS  positions, among the GPUs the container can open, of the ones to run on, such
+#                as "4 5 6 7"; they must be allocated to the pod (default: its first TP GPUs).
+#                A restore on another node lands on the same positions there
 #   RELEASE_WEIGHTS  0: keep the weights in the checkpoint instead of releasing them at prepare
 #                and reloading them at restore (default 1)
 #   MX           1: load weights through ModelExpress, from a peer over RDMA when one is serving,
@@ -44,7 +44,7 @@
 #   OVERLAY      tarball of patched vLLM files to unpack over the image's, if set
 #
 # Prints one RESULT line of JSON. Run in a privileged pod whose PID 1 reaps children. Such a pod
-# sees every GPU on the node, so the GPUs to use come from the kubelet's device checkpoint.
+# may see every GPU on the node, so the GPUs to use come from the kubelet's device checkpoint.
 set -u
 TAG=$1; shift
 : "${MODEL:?}" "${TP:=8}" "${MODE:=plain}" "${REMAP:=0}" "${CUDA_TOOL:=snapshotd}" "${STREAM:=0}" "${PHASE:=all}"
@@ -85,9 +85,12 @@ pgrep -f "VLLM::" >/dev/null && fail STALE_VLLM
 rm -f /dev/shm/link_remap.*
 [ -n "${OVERLAY:-}" ] && tar -xzf "$OVERLAY" -C $SITE
 
-# Every GPU on the node in device-minor order, the order the driver enumerates them in.
-mapfile -t ALL < <(for f in /proc/driver/nvidia/gpus/*/information; do
-  awk '/^GPU UUID/ {u=$3} /^Device Minor/ {m=$3} END {print m, u}' "$f"; done | sort -n | awk '{print $2}')
+# Every GPU this container can open, in device-minor order, the order the driver enumerates them
+# in. /proc lists the whole node's; a device node exists only for the ones the pod was given,
+# unless the runtime gives a privileged pod all of them.
+mapfile -t VISIBLE < <(for f in /proc/driver/nvidia/gpus/*/information; do
+  awk '/^GPU UUID/ {u=$3} /^Device Minor/ {m=$3} END {print m, u}' "$f"; done | sort -n |
+  while read -r minor uuid; do [ -e "/dev/nvidia$minor" ] && echo "$uuid"; done)
 mapfile -t MINE < <(python3 - <<'PY'
 import json, os
 entries = json.load(open("/host-device-plugins/kubelet_internal_checkpoint"))["Data"]["PodDeviceEntries"]
@@ -100,9 +103,9 @@ PY
 mine() { [[ " ${MINE[*]} " == *" $1 "* ]]; }
 SRC=()
 if [ -n "${GPU_POSITIONS:-}" ]; then
-  for p in $GPU_POSITIONS; do mine "${ALL[$p]}" || fail GPU_NOT_ALLOCATED; SRC+=("${ALL[$p]}"); done
+  for p in $GPU_POSITIONS; do mine "${VISIBLE[$p]}" || fail GPU_NOT_ALLOCATED; SRC+=("${VISIBLE[$p]}"); done
 else
-  for u in "${ALL[@]}"; do mine "$u" && [ "${#SRC[@]}" -lt "$TP" ] && SRC+=("$u"); done
+  for u in "${VISIBLE[@]}"; do mine "$u" && [ "${#SRC[@]}" -lt "$TP" ] && SRC+=("$u"); done
 fi
 [ "${#SRC[@]}" = "$TP" ] || fail NOT_ENOUGH_GPUS
 if [ "$PHASE" = restore ]; then
@@ -113,11 +116,13 @@ if [ "$PHASE" = restore ]; then
 fi
 TARGET=("${SRC[@]}")
 if [ "$PHASE" = restore ]; then
-  # A privileged pod reaches every GPU, and the driver restores each device onto the GPU at the
-  # same enumeration position as on the source node. Refuse unless those are this pod's GPUs.
+  # The driver restores each device onto the GPU at the same position among the visible ones as
+  # on the source node, so both sides must see the same number. Refuse unless the GPUs it lands
+  # on are this pod's.
+  [ "${#SRC_VISIBLE[@]}" = "${#VISIBLE[@]}" ] || fail VISIBLE_GPU_COUNT_DIFFERS
   TARGET=()
   for u in "${SRC[@]}"; do
-    for p in "${!SRC_VISIBLE[@]}"; do [ "${SRC_VISIBLE[$p]}" = "$u" ] && TARGET+=("${ALL[$p]}"); done
+    for p in "${!SRC_VISIBLE[@]}"; do [ "${SRC_VISIBLE[$p]}" = "$u" ] && TARGET+=("${VISIBLE[$p]}"); done
   done
   [ "${#TARGET[@]}" = "${#SRC[@]}" ] || fail SOURCE_GPU_UNKNOWN
   for u in "${TARGET[@]}"; do mine "$u" || fail TARGET_GPU_NOT_ALLOCATED; done
@@ -213,7 +218,7 @@ elif [ "$STREAM" = 0 ]; then
   R[checkpoint_gb]=$(du -s --block-size=1M "$IMG" | awk '{printf "%.1f", $1/1024}')
 fi
 if [ "$PHASE" = capture ]; then
-  SRC_VISIBLE=("${ALL[@]}")
+  SRC_VISIBLE=("${VISIBLE[@]}")
   SRC_IP=$(hostname -i)
   declare -p PIDS SRC SRC_VISIBLE SRC_IP > "$W/capture.env"
   cp "$W/vllm.log" "$W/vllm.log.captured"
@@ -241,14 +246,14 @@ lap criu_restore "$T"
 NETNS=; [ "${NET:-new}" = pod ] || NETNS="nsenter --net=/proc/$(cat "$W/restored.pid")/ns/net"
 GPUS=(); DEVICE_MAP=
 if [ "$PHASE" = restore ]; then
-  GPUS=(--source "$(IFS=,; echo "${SRC_VISIBLE[*]}")" --target "$(IFS=,; echo "${ALL[*]}")" --visible "$(IFS=,; echo "${ALL[*]}")")
+  GPUS=(--source "$(IFS=,; echo "${SRC_VISIBLE[*]}")" --target "$(IFS=,; echo "${VISIBLE[*]}")" --visible "$(IFS=,; echo "${VISIBLE[*]}")")
 elif [ "$REMAP" = rotate ]; then
   TGT=("${SRC[@]:1}" "${SRC[0]}")
-  for u in "${ALL[@]}"; do
+  for u in "${VISIBLE[@]}"; do
     t=$u; for i in "${!SRC[@]}"; do [ "${SRC[$i]}" = "$u" ] && t=${TGT[$i]}; done
     DEVICE_MAP+=${DEVICE_MAP:+,}$u=$t
   done
-  GPUS=(--source "$(IFS=,; echo "${SRC[*]}")" --target "$(IFS=,; echo "${TGT[*]}")" --visible "$(IFS=,; echo "${ALL[*]}")")
+  GPUS=(--source "$(IFS=,; echo "${SRC[*]}")" --target "$(IFS=,; echo "${TGT[*]}")" --visible "$(IFS=,; echo "${VISIBLE[*]}")")
 fi
 T=$(now); cuda_restore || fail CUDA_RESTORE_FAILED; lap cuda_restore "$T"
 if [ "$MODE" = cuinterpose ]; then
