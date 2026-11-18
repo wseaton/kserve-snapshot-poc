@@ -534,6 +534,7 @@ pub fn serve_socket(images_dir: &Path) -> Result<UnixListener> {
     listen(images_dir, SERVE_SOCKET)
 }
 
+#[cfg(feature = "nixl")]
 pub fn capture_socket(images_dir: &Path) -> Result<UnixListener> {
     listen(images_dir, CAPTURE_SOCKET)
 }
