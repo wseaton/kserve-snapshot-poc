@@ -47,6 +47,10 @@ pub struct Config {
     /// Directory holding the processes' control sockets.
     #[arg(long, default_value = "/tmp")]
     pub socket_dir: PathBuf,
+    /// Where the processes see the bundle directory, when they are in
+    /// another mount namespace and it is not at the same path there.
+    #[arg(long)]
+    pub loaded_from: Option<PathBuf>,
 }
 
 impl Config {
@@ -116,7 +120,7 @@ impl Manifest {
         }
     }
 
-    fn save(&self, ckpt_dir: &Path) -> Result<()> {
+    pub fn save(&self, ckpt_dir: &Path) -> Result<()> {
         let path = Self::path(ckpt_dir);
         let bytes = serde_json::to_vec_pretty(self)?;
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
@@ -194,20 +198,24 @@ fn find_mapping(maps: &str, path: &Path) -> Result<Option<MappedFile>> {
 fn check_loaded_libraries(config: &Config, pids: &[i32]) -> Result<()> {
     for name in LIBRARIES {
         let path = config.library(name);
+        let loaded = config
+            .loaded_from
+            .as_ref()
+            .map_or_else(|| path.clone(), |dir| dir.join(name));
         let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
         for &pid in pids {
             let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
                 .with_context(|| format!("read /proc/{pid}/maps"))?;
-            match find_mapping(&maps, &path)? {
+            match find_mapping(&maps, &loaded)? {
                 Some(mapped) => ensure!(
                     libc::major(metadata.dev()) == mapped.major
                         && libc::minor(metadata.dev()) == mapped.minor
                         && metadata.ino() == mapped.inode,
                     "pid {pid}: {} was replaced after it was loaded",
-                    path.display()
+                    loaded.display()
                 ),
                 None if name == FRONTEND_LIBRARY => {
-                    bail!("pid {pid} did not preload {}", path.display())
+                    bail!("pid {pid} did not preload {}", loaded.display())
                 }
                 None => {}
             }
@@ -320,7 +328,7 @@ pub fn prepare_checkpoint(
             continue;
         }
         let sharing = Sharing::of(&inspect(&config.socket_dir, namespace_pid)?);
-        println!("cuinterpose pid {pid} (ns {namespace_pid}): {sharing:?}");
+        tracing::debug!(pid, namespace_pid, ?sharing, "cuInterpose inspected");
         shared |= !sharing.is_empty();
         host_pids.push(pid);
         namespace_pids.push(namespace_pid);
@@ -398,6 +406,7 @@ mod tests {
         Config {
             bundle_dir: dir,
             socket_dir: PathBuf::from("/tmp"),
+            loaded_from: None,
         }
     }
 

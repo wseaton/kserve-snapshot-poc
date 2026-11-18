@@ -161,7 +161,10 @@ fn each(pids: &[i32], op: impl Fn(i32) -> Result<()> + Sync) -> Result<()> {
 fn timed(phase: &str, run: impl FnOnce() -> Result<()>) -> Result<()> {
     let start = Instant::now();
     run()?;
-    println!("PHASE cuda_{phase} {:.3}s", start.elapsed().as_secs_f64());
+    tracing::debug!(
+        seconds = %format_args!("{:.3}", start.elapsed().as_secs_f64()),
+        "CUDA {phase}"
+    );
     Ok(())
 }
 
@@ -175,6 +178,55 @@ pub fn checkpoint_job(driver: &Driver, pids: &[i32], lock_timeout: Duration) -> 
 pub fn restore_job(driver: &Driver, pids: &[i32], map: &GpuMap) -> Result<()> {
     timed("restore", || each(pids, |pid| driver.restore(pid, map)))?;
     timed("unlock", || each(pids, |pid| driver.unlock(pid)))
+}
+
+/// The UUID and device minor in one `/proc/driver/nvidia/gpus/*/information`.
+pub fn parse_gpu_information(information: &str) -> Option<(GpuUuid, u32)> {
+    let field = |name: &str| {
+        information
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| value.trim_start_matches(':').trim())
+    };
+    Some((
+        field("GPU UUID")?.parse().ok()?,
+        field("Device Minor")?.parse().ok()?,
+    ))
+}
+
+/// Every GPU of this node with its device minor.
+pub fn node_gpus() -> Result<Vec<(GpuUuid, u32)>> {
+    let mut gpus = Vec::new();
+    for entry in fs::read_dir("/proc/driver/nvidia/gpus").context("list the driver's GPUs")? {
+        let path = entry?.path().join("information");
+        let information =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        gpus.extend(parse_gpu_information(&information));
+    }
+    gpus.sort_by_key(|&(_, minor)| minor);
+    Ok(gpus)
+}
+
+/// `gpus` with their device minors, in the order the driver enumerates them.
+/// Rank i of a checkpoint must land on the GPU at the same position among
+/// its pod's.
+pub fn in_enumeration_order(gpus: &[GpuUuid]) -> Result<Vec<(GpuUuid, u32)>> {
+    order_by_minor(gpus, &node_gpus()?)
+}
+
+fn order_by_minor(gpus: &[GpuUuid], minors: &[(GpuUuid, u32)]) -> Result<Vec<(GpuUuid, u32)>> {
+    let mut ordered = gpus
+        .iter()
+        .map(|gpu| {
+            minors
+                .iter()
+                .find(|(uuid, _)| uuid == gpu)
+                .copied()
+                .with_context(|| format!("the driver does not list {gpu}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|&(_, minor)| minor);
+    Ok(ordered)
 }
 
 /// Every process in the tree rooted at `root`. vLLM forks workers from
@@ -323,7 +375,31 @@ impl fmt::Display for GpuMap {
 
 #[cfg(test)]
 mod tests {
-    use crate::cuda::{GpuMap, GpuUuid, process_tree};
+    use crate::cuda::{GpuMap, GpuUuid, order_by_minor, parse_gpu_information, process_tree};
+
+    #[test]
+    fn the_driver_information_gives_uuid_and_minor() {
+        let information = "Model: \t\t NVIDIA H200\nIRQ:   \t\t 255\nGPU UUID: \t GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\nVideo BIOS: \t 97.00.c4.00.11\nBus Type: \t PCIe\nDevice Minor: \t 3\nGPU Excluded:\t No\n";
+        let (uuid, minor) = parse_gpu_information(information).unwrap();
+        assert_eq!(uuid.to_string(), "GPU-03e97d3f-21d4-1c89-f142-657edeaf3566");
+        assert_eq!(minor, 3);
+        assert!(parse_gpu_information("Model: NVIDIA H200\nDevice Minor: 3\n").is_none());
+        assert!(
+            parse_gpu_information("GPU UUID: GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\n").is_none()
+        );
+    }
+
+    #[test]
+    fn gpus_are_ordered_by_minor_whatever_order_they_come_in() {
+        let all = gpus(4);
+        let minors = [(all[0], 5), (all[1], 0), (all[2], 7), (all[3], 2)];
+        let ordered = order_by_minor(&[all[2], all[0], all[3], all[1]], &minors).unwrap();
+        assert_eq!(
+            ordered,
+            [(all[1], 0), (all[3], 2), (all[0], 5), (all[2], 7)]
+        );
+        assert!(order_by_minor(&[all[0]], &minors[1..]).is_err());
+    }
 
     fn gpus(n: usize) -> Vec<GpuUuid> {
         (0..n)

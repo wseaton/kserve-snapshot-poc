@@ -22,12 +22,14 @@ mod transfer;
 mod uds;
 mod vllm;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustix::process::{Resource, getrlimit, setrlimit};
+use tracing_subscriber::EnvFilter;
 
 use crate::cuda::{Driver, GpuMap, GpuUuid};
 
@@ -194,6 +196,13 @@ fn main() -> Result<()> {
         Command::Shim(args) => std::process::exit(shim::run(args)?),
         command => command,
     };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("SNAPSHOTD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
     raise_open_file_limit()?;
     match command {
         Command::Shim(_) => Ok(()),

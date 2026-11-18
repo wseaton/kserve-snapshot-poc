@@ -43,6 +43,21 @@ pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
+/// The bytes of every file under `dir`; what cannot be read counts as nothing.
+pub fn directory_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |metadata| metadata.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 pub struct State {
     store: PathBuf,
     staging: PathBuf,
@@ -97,7 +112,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::state::{State, ensure_room, revision_dir};
+    use crate::state::{State, directory_bytes, ensure_room, revision_dir};
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -141,6 +156,18 @@ mod tests {
         let error = ensure_room(&dir, u64::MAX).unwrap_err();
         assert!(format!("{error:#}").contains("bytes free"));
         assert!(ensure_room(&dir.join("missing"), 1).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_is_sized_through_its_subdirectories() {
+        let dir = scratch("size");
+        fs::create_dir_all(dir.join("img/deep")).unwrap();
+        fs::write(dir.join("manifest.json"), [0; 10]).unwrap();
+        fs::write(dir.join("img/pages-1.img"), [0; 1000]).unwrap();
+        fs::write(dir.join("img/deep/core-1.img"), [0; 100]).unwrap();
+        assert_eq!(directory_bytes(&dir), 1110);
+        assert_eq!(directory_bytes(&dir.join("missing")), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

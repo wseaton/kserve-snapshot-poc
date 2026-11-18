@@ -33,13 +33,13 @@ settle() {
 }
 addresses() { k get pods -l app=stand-in -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'; }
 info() { k -n snapshotd exec ds/snapshotd -c snapshotd -- stand-in info "$1:50051"; }
-restores() { k -n snapshotd logs ds/snapshotd -c snapshotd | grep -c "restored from .*/image " || true; }
+restores() { k -n snapshotd logs ds/snapshotd -c snapshotd | grep -c "restored .*from=.*/image" || true; }
 
 settle 1
 first=$(info "$(addresses)")
 echo "first replica: $first"
 [[ $first == *" Running" ]] || fail "the first replica is not running: $first"
-k -n snapshotd logs ds/snapshotd -c snapshotd | grep -q "restored from .*/incoming-" \
+k -n snapshotd logs ds/snapshotd -c snapshotd | grep -q "restored .*from=.*/incoming-" \
   || fail "the first replica was not checkpointed and restored"
 
 settle 3

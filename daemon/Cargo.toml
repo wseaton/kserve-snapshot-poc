@@ -17,7 +17,7 @@ cuinterpose-protocol = { git = "https://github.com/ai-dynamo/snapshot", rev = "b
 hex = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
-libloading = "0.8"
+libloading = "0.9"
 nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
 openssl = "0.10"
 prost = "0.14"
@@ -28,11 +28,13 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tonic = "0.14"
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
-uuid = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1.29"
 walkdir = { version = "2", optional = true }
 
 [build-dependencies]
-protox = "0.9"
+protox = "0.10"
 tonic-prost-build = "0.14"
 
 [features]

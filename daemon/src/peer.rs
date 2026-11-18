@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tracing::{debug, info, warn};
 
 use crate::handshake::{self, Key, Refusal, Revision};
 use crate::state::{State, revision_dir};
@@ -71,7 +72,7 @@ impl Peers {
         });
         let listener = TcpListener::bind(&args.peer_listen)
             .with_context(|| format!("listen on {}", args.peer_listen))?;
-        println!("answering peers on {}", listener.local_addr()?);
+        info!(address = %listener.local_addr()?, name = %name, "answering peers");
         let answering = Arc::clone(&peers);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -81,11 +82,11 @@ impl Peers {
                         std::thread::spawn(move || {
                             let peer = stream.peer_addr();
                             if let Err(error) = peers.answer(stream) {
-                                println!("peer {peer:?}: {error:#}");
+                                warn!(?peer, error = %format_args!("{error:#}"), "peer request failed");
                             }
                         });
                     }
-                    Err(error) => println!("accept a peer: {error}"),
+                    Err(error) => warn!(%error, "could not accept a peer"),
                 }
             }
         });
@@ -109,10 +110,14 @@ impl Peers {
         };
         bound(&stream, None)?;
         let start = Instant::now();
-        transfer::send_over(stream, &image, self.pool, None)?;
-        println!(
-            "sent {asked} to {peer} in {:.1} s",
-            start.elapsed().as_secs_f64()
+        let sent = transfer::send_over(stream, &image, self.pool, None)?;
+        info!(
+            revision = %asked,
+            %peer,
+            seconds = %format_args!("{:.2}", start.elapsed().as_secs_f64()),
+            gb = %format_args!("{:.1}", sent["gb"].as_f64().unwrap_or_default()),
+            gbit_per_s = %format_args!("{:.1}", sent["gbps"].as_f64().unwrap_or_default()),
+            "sent a checkpoint to a peer"
         );
         Ok(())
     }
@@ -127,15 +132,15 @@ impl Peers {
                 peers
             }
             Err(error) => {
-                println!("no peers at {}: {error}", self.name);
+                debug!(name = %self.name, %error, "the peer name does not resolve");
                 Vec::new()
             }
         }
     }
 
     /// Get the checkpoint of `revision` from the first peer that has it and
-    /// publish it in `state`'s store. Returns whether one arrived.
-    pub fn pull(&self, revision: &Revision, state: &State) -> Result<bool> {
+    /// publish it in `state`'s store. Returns the peer it came from, if any.
+    pub fn pull(&self, revision: &Revision, state: &State) -> Result<Option<SocketAddr>> {
         let deadline = Instant::now() + BUSY_WAIT;
         loop {
             let mut busy = false;
@@ -144,16 +149,16 @@ impl Peers {
                 match self.pull_from(peer, revision, state) {
                     Ok(Ok(())) => {
                         state.publish()?;
-                        return Ok(true);
+                        return Ok(Some(peer));
                     }
                     Ok(Err(Refusal::Busy)) => busy = true,
-                    Ok(Err(Refusal::NoImage)) => {}
-                    Err(error) => println!("peer {peer}: {error:#}"),
+                    Ok(Err(Refusal::NoImage)) => debug!(%peer, "the peer has no checkpoint of it"),
+                    Err(error) => warn!(%peer, error = %format_args!("{error:#}"), "pull failed"),
                 }
             }
             state.clear_staging()?;
             if !busy || Instant::now() >= deadline {
-                return Ok(false);
+                return Ok(None);
             }
             std::thread::sleep(BUSY_RETRY);
         }
@@ -171,12 +176,7 @@ impl Peers {
             return Ok(Err(reason));
         }
         bound(&stream, None)?;
-        let start = Instant::now();
         transfer::receive_over(stream, state.staging_dir(), true, false, None, None)?;
-        println!(
-            "pulled {revision} from {peer} in {:.1} s",
-            start.elapsed().as_secs_f64()
-        );
         Ok(Ok(()))
     }
 }

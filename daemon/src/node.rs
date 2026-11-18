@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::cri::{Runtime, Sandbox};
 use crate::cuda::{self, Driver, GpuMap, GpuUuid};
@@ -35,7 +36,7 @@ use crate::handshake::Revision;
 use crate::peer::{self, Peers};
 use crate::podresources;
 use crate::shim::{Reply, Request};
-use crate::state::{State, ensure_room};
+use crate::state::{State, directory_bytes, ensure_room};
 use crate::vllm::Control;
 
 const REVISION_LABEL: &str = "pod-template-hash";
@@ -53,6 +54,7 @@ const LIFECYCLE: Duration = Duration::from_secs(900);
 const CUDA_LOCK: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_secs(10);
 const REAP_WAIT: Duration = Duration::from_secs(30);
+const SERVER_TAIL: usize = 12;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -101,6 +103,9 @@ pub struct Manifest {
     /// The server's PID inside its pod.
     pub root_pid: i32,
     pub gpus: Vec<String>,
+    /// The device minor of each GPU.
+    #[serde(default)]
+    pub minors: Vec<u32>,
     pub address: IpAddr,
 }
 
@@ -147,6 +152,28 @@ pub fn host_pid(parent: i32, pid: i32) -> Result<i32> {
     bail!("process {parent} has no child that is {pid} in its PID namespace")
 }
 
+/// Why the checkpoint in `image` cannot be restored onto GPUs with these
+/// device minors, if it cannot. Processes that share GPU memory can import it
+/// again only on devices they had initialized when they were checkpointed, so
+/// such a checkpoint needs GPUs with the same minors.
+pub fn unrestorable(image: &Path, minors: &[u32]) -> Result<Option<String>> {
+    let manifest = Manifest::load(image)?;
+    if manifest.minors.len() != minors.len() {
+        return Ok(Some(format!(
+            "it ran on {} GPUs and the pod has {}",
+            manifest.minors.len(),
+            minors.len()
+        )));
+    }
+    if manifest.minors != minors && cuinterpose::Manifest::load(&image.join("img"))?.is_some() {
+        return Ok(Some(format!(
+            "its processes share GPU memory and it was taken on GPUs {:?}; the pod has {:?}",
+            manifest.minors, minors
+        )));
+    }
+    Ok(None)
+}
+
 fn in_pod(pid: i32, path: &str) -> PathBuf {
     PathBuf::from(format!("/proc/{pid}/root{path}"))
 }
@@ -184,13 +211,33 @@ pub fn criu_errors(log: &str) -> String {
     shown.join("\n")
 }
 
+/// Run CRIU; if it fails, log what its own log says about why.
 async fn run_criu(command: &mut Command, what: &str, log: &Path) -> Result<()> {
-    run(command, what)
-        .await
-        .map_err(|error| match fs::read_to_string(log) {
-            Ok(log) => error.context(criu_errors(&log)),
-            Err(_) => error,
-        })
+    let outcome = run(command, what).await;
+    if outcome.is_err() {
+        for line in criu_errors(&fs::read_to_string(log).unwrap_or_default()).lines() {
+            warn!("criu: {}", line.trim());
+        }
+    }
+    outcome
+}
+
+/// `line` without terminal colour sequences.
+pub fn plain(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut rest = line.chars();
+    while let Some(c) = rest.next() {
+        if c == '\u{1b}' {
+            for c in rest.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }
 
 /// Wait for a process CRIU has dumped and killed to be reaped. Until then
@@ -205,6 +252,39 @@ async fn gone(pid: i32) -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     }
     Ok(())
+}
+
+/// What a pod's log lines are tagged with: the part of its name that tells it
+/// from the other pods of its workload.
+pub fn short_id(pod: &str) -> &str {
+    pod.rsplit('-').next().unwrap_or(pod)
+}
+
+fn seconds(since: Instant) -> String {
+    format!("{:.2}", since.elapsed().as_secs_f64())
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Run one step of a checkpoint or restore and log how long it took.
+async fn step<T>(name: &'static str, work: impl Future<Output = Result<T>>) -> Result<T> {
+    let started = Instant::now();
+    let outcome = work.await;
+    match &outcome {
+        Ok(_) => info!(seconds = %seconds(started), "{name}"),
+        Err(_) => warn!(seconds = %seconds(started), "{name} failed"),
+    }
+    outcome
+}
+
+/// Run blocking work off the runtime, inside the caller's span.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(work)).await?
 }
 
 async fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -276,10 +356,13 @@ const CUINTERPOSE: &str = "cuinterpose";
 
 struct Pod<'a> {
     args: &'a Args,
-    name: String,
     shim_pid: i32,
     address: IpAddr,
     gpus: Vec<GpuUuid>,
+    minors: Vec<u32>,
+    /// Every GPU the container can open. More than its own when it is
+    /// privileged; the driver wants a restore map over all of them.
+    visible: Vec<GpuUuid>,
 }
 
 impl Pod<'_> {
@@ -314,6 +397,8 @@ impl Pod<'_> {
             .args(["--libdir", &format!("{TOOLS}/criu-plugins")])
             .args([
                 "--manage-cgroups=ignore",
+                "--network-lock",
+                "skip",
                 "--tcp-established",
                 "--ext-unix-sk",
             ])
@@ -330,15 +415,25 @@ impl Pod<'_> {
                 .arg("--source")
                 .arg(source)
                 .args(["--target", target]),
-            &format!("mount {} in {}", source.display(), self.name),
+            &format!("mount {} in the pod", source.display()),
         )
         .await
+    }
+
+    /// Log the end of the server's own output, after a failure.
+    fn log_server_tail(&self) {
+        let log = fs::read_to_string(in_pod(self.shim_pid, SERVER_LOG)).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        for line in &lines[lines.len().saturating_sub(SERVER_TAIL)..] {
+            warn!("server: {}", plain(line));
+        }
     }
 
     fn cuinterpose(&self) -> cuinterpose::Config {
         cuinterpose::Config {
             bundle_dir: self.args.tools_dir.join(CUINTERPOSE),
             socket_dir: in_pod(self.shim_pid, "/tmp"),
+            loaded_from: Some(PathBuf::from(format!("{TOOLS}/{CUINTERPOSE}"))),
         }
     }
 
@@ -361,7 +456,7 @@ impl Pod<'_> {
     /// Checkpoint the server, whose PID in the pod is `root_pid`, into
     /// `image`. Once the shim is told to release the server it is not coming
     /// back except by a restore. The control connection is closed before the
-    /// dump: CRIU will not dump a process with a TCP connection it cannot lock.
+    /// dump, so CRIU does not carry it into the image.
     async fn checkpoint(
         &self,
         mut control: Control,
@@ -372,43 +467,66 @@ impl Pod<'_> {
         let started = Instant::now();
         fs::create_dir_all(image.join("img"))
             .with_context(|| format!("create {}", image.display()))?;
-        control.prepare(LIFECYCLE).await?;
+        step("vLLM prepare", control.prepare(LIFECYCLE)).await?;
         drop(control);
         let server = host_pid(self.shim_pid, root_pid)?;
         let pids = self.cuda_pids(server).await?;
         shim.call(Request::Release).await?;
         if !pids.is_empty() {
-            let (config, img) = (self.cuinterpose(), image.join("img"));
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                cuinterpose::prepare_checkpoint(&config, &img, &pids)?;
-                cuda::checkpoint_job(&Driver::load()?, &pids, CUDA_LOCK)
-            })
-            .await??;
+            let (config, img, sharing) = (self.cuinterpose(), image.join("img"), pids.clone());
+            step(
+                "cuInterpose prepare",
+                blocking(move || {
+                    match cuinterpose::prepare_checkpoint(&config, &img, &sharing)? {
+                        cuinterpose::SharedMemory::NotShared => {
+                            info!("no CUDA memory is shared between processes");
+                        }
+                        cuinterpose::SharedMemory::Prepared(manifest) => {
+                            info!(processes = manifest.pids.len(), "shared CUDA memory saved");
+                        }
+                    }
+                    Ok(())
+                }),
+            )
+            .await?;
+            step(
+                "CUDA checkpoint",
+                blocking(move || cuda::checkpoint_job(&Driver::load()?, &pids, CUDA_LOCK)),
+            )
+            .await?;
         }
         self.mount(image, IMAGE).await?;
-        run_criu(
-            self.criu("dump")
-                .args(["-t", &root_pid.to_string()])
-                .args(["-D", &format!("{IMAGE}/img"), "-W", &format!("{IMAGE}/img")])
-                .args(["--ghost-limit", "1G", "-o", "dump.log"]),
-            "criu dump",
-            &image.join("img/dump.log"),
-        )
+        step("CRIU dump", async {
+            run_criu(
+                self.criu("dump")
+                    .args(["-t", &root_pid.to_string()])
+                    .args(["-D", &format!("{IMAGE}/img"), "-W", &format!("{IMAGE}/img")])
+                    .args(["--ghost-limit", "1G", "-o", "dump.log"]),
+                "criu dump",
+                &image.join("img/dump.log"),
+            )
+            .await?;
+            gone(server).await
+        })
         .await?;
-        gone(server).await?;
-        copy_tree(&in_pod(self.shim_pid, "/dev/shm"), &image.join("shm")).await?;
-        fs::copy(in_pod(self.shim_pid, SERVER_LOG), image.join("server.log"))
-            .context("copy the server's log")?;
+        step("copy shared memory out", async {
+            copy_tree(&in_pod(self.shim_pid, "/dev/shm"), &image.join("shm")).await?;
+            fs::copy(in_pod(self.shim_pid, SERVER_LOG), image.join("server.log"))
+                .context("copy the server's log")?;
+            Ok(())
+        })
+        .await?;
         Manifest {
             root_pid,
             gpus: self.gpus.iter().map(GpuUuid::to_string).collect(),
+            minors: self.minors.clone(),
             address: self.address,
         }
         .save(image)?;
-        println!(
-            "{}: checkpointed in {:.1} s",
-            self.name,
-            started.elapsed().as_secs_f64()
+        info!(
+            seconds = %seconds(started),
+            gib = %gib(directory_bytes(image)),
+            "checkpointed"
         );
         Ok(())
     }
@@ -430,12 +548,16 @@ impl Pod<'_> {
             source.len(),
             self.gpus.len()
         );
-        copy_tree(&image.join("shm"), &in_pod(self.shim_pid, "/dev/shm")).await?;
-        fs::copy(image.join("server.log"), in_pod(self.shim_pid, SERVER_LOG))
-            .context("put the server's log back")?;
-        fs::create_dir_all(in_pod(self.shim_pid, WORK)).context("create the work directory")?;
+        step("copy shared memory in", async {
+            copy_tree(&image.join("shm"), &in_pod(self.shim_pid, "/dev/shm")).await?;
+            fs::copy(image.join("server.log"), in_pod(self.shim_pid, SERVER_LOG))
+                .context("put the server's log back")?;
+            fs::create_dir_all(in_pod(self.shim_pid, WORK)).context("create the work directory")
+        })
+        .await?;
         let mut criu = self.criu("restore");
         if manifest.address != self.address {
+            info!(from = %manifest.address, to = %self.address, "the pod address differs, sockets are remapped");
             fs::write(
                 in_pod(self.shim_pid, &format!("{WORK}/inet-remap.map")),
                 format!("{} {}\n", manifest.address, self.address),
@@ -454,47 +576,56 @@ impl Pod<'_> {
         )
         .await?;
         self.mount(image, IMAGE).await?;
-        run_criu(
-            criu.args(["-D", &format!("{IMAGE}/img"), "-W", WORK])
-                .args(["--restore-detached", "-o", "restore.log"]),
-            "criu restore",
-            &in_pod(self.shim_pid, &format!("{WORK}/restore.log")),
+        step(
+            "CRIU restore",
+            run_criu(
+                criu.args(["-D", &format!("{IMAGE}/img"), "-W", WORK])
+                    .args(["--restore-detached", "-o", "restore.log"]),
+                "criu restore",
+                &in_pod(self.shim_pid, &format!("{WORK}/restore.log")),
+            ),
         )
         .await?;
         let server = host_pid(self.shim_pid, manifest.root_pid)?;
         let pids = self.cuda_pids(server).await?;
         if !pids.is_empty() {
-            let map = GpuMap::new(&source, &self.gpus, &self.gpus)?;
+            let map = GpuMap::new(&source, &self.gpus, &self.visible)?;
+            if !map.is_identity() {
+                info!(from = ?manifest.minors, to = ?self.minors, "GPUs remapped, by device minor");
+            }
+            step(
+                "CUDA restore",
+                blocking(move || cuda::restore_job(&Driver::load()?, &pids, &map)),
+            )
+            .await?;
             let (config, img) = (self.cuinterpose(), image.join("img"));
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                cuda::restore_job(&Driver::load()?, &pids, &map)?;
-                match cuinterpose::Manifest::load(&img)? {
+            step(
+                "cuInterpose restore",
+                blocking(move || match cuinterpose::Manifest::load(&img)? {
                     Some(manifest) => {
                         manifest.verify_libraries(&config)?;
                         cuinterpose::restore(&config, &img, &manifest)
                     }
                     None => Ok(()),
-                }
-            })
-            .await??;
-        }
-        Control::connect(self.control())
-            .await?
-            .restore(LIFECYCLE)
+                }),
+            )
             .await?;
-        println!(
-            "{}: restored from {} in {:.1} s",
-            self.name,
-            image.display(),
-            started.elapsed().as_secs_f64()
-        );
+        }
+        step("vLLM restore", async {
+            Control::connect(self.control())
+                .await?
+                .restore(LIFECYCLE)
+                .await
+        })
+        .await?;
+        info!(seconds = %seconds(started), from = %image.display(), "restored");
         Ok(manifest.root_pid)
     }
 }
 
 async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     let args = &node.args;
-    let name = format!("{}/{}", sandbox.namespace, sandbox.name);
+    let seen = Instant::now();
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
     let deadline = Instant::now() + CONTAINER_WAIT;
     let shim_pid = loop {
@@ -511,24 +642,42 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     let mut shim = Shim::connect(shim_pid).await?;
     let (started, serving) = shim.state().await?;
     if serving {
+        debug!("already serving, nothing to do");
         return Ok(());
     }
+    let allotted = podresources::gpus(
+        &args.pod_resources_socket,
+        &sandbox.namespace,
+        &sandbox.name,
+        &args.container,
+    )
+    .await?;
+    let ordered = if allotted.is_empty() {
+        Vec::new()
+    } else {
+        cuda::in_enumeration_order(&allotted)?
+    };
     let pod = Pod {
         args,
-        name: name.clone(),
         shim_pid,
         address: runtime.address(sandbox).await?,
-        gpus: podresources::gpus(
-            &args.pod_resources_socket,
-            &sandbox.namespace,
-            &sandbox.name,
-            &args.container,
-        )
-        .await?,
+        gpus: ordered.iter().map(|&(gpu, _)| gpu).collect(),
+        minors: ordered.iter().map(|&(_, minor)| minor).collect(),
+        visible: if ordered.is_empty() {
+            Vec::new()
+        } else {
+            cuda::node_gpus()?
+                .into_iter()
+                .filter(|(_, minor)| in_pod(shim_pid, &format!("/dev/nvidia{minor}")).exists())
+                .map(|(gpu, _)| gpu)
+                .collect()
+        },
     };
     if started {
+        info!("the server was started before this daemon; waiting for it to run");
         Control::connect_when_running(pod.control(), BOOT).await?;
         shim.call(Request::Serving).await?;
+        info!(seconds = %seconds(seen), how = "already started", "serving");
         return Ok(());
     }
 
@@ -547,7 +696,22 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
         .join(revision);
     let store = State::open(&revision_dir, &sandbox.uid)?;
     let gave_up = revision_dir.join(format!("failed-{}", sandbox.uid));
+    info!(
+        pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
+        workload,
+        revision,
+        address = %pod.address,
+        gpus = pod.gpus.len(),
+        visible_gpus = pod.visible.len(),
+        pid = shim_pid,
+        "new pod"
+    );
     pod.mount(&args.tools_dir, TOOLS).await?;
+    if gave_up.exists() {
+        warn!("a checkpoint or restore failed in this pod before; it cold boots");
+    } else if store.image_ready() {
+        info!("this node holds the revision's checkpoint");
+    }
 
     #[cfg(feature = "nixl")]
     if let Some(peers) = node
@@ -555,25 +719,44 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
         .clone()
         .filter(|_| !store.image_ready() && !gave_up.exists())
     {
+        info!("this node has no checkpoint of the revision; asking the other nodes");
         let revision = Revision::new(format!("{}/{workload}/{revision}", sandbox.namespace))?;
         let (directory, uid) = (revision_dir.clone(), sandbox.uid.clone());
-        let pulled = tokio::task::spawn_blocking(move || {
-            peers.pull(&revision, &State::open(&directory, &uid)?)
-        })
-        .await??;
-        if pulled {
-            println!("{name}: pulled the checkpoint from a peer");
+        let asked = Instant::now();
+        let pulled =
+            blocking(move || peers.pull(&revision, &State::open(&directory, &uid)?)).await?;
+        match pulled {
+            Some(peer) => info!(
+                %peer,
+                seconds = %seconds(asked),
+                gib = %gib(directory_bytes(&store.image_dir())),
+                "pulled the checkpoint from a peer"
+            ),
+            None => info!(seconds = %seconds(asked), "no other node has it"),
         }
     }
 
-    if store.image_ready() && !gave_up.exists() {
+    let refused = if store.image_ready() && !gave_up.exists() {
+        unrestorable(&store.image_dir(), &pod.minors)?
+    } else {
+        None
+    };
+    if let Some(reason) = &refused {
+        warn!(
+            reason,
+            "the checkpoint cannot be restored into this pod; it cold boots"
+        );
+    }
+    if store.image_ready() && !gave_up.exists() && refused.is_none() {
         match pod.restore(&store.image_dir()).await {
             Ok(pid) => {
                 shim.call(Request::Adopt { pid }).await?;
                 shim.call(Request::Serving).await?;
+                info!(seconds = %seconds(seen), how = "restored", "serving");
                 return Ok(());
             }
             Err(error) => {
+                pod.log_server_tail();
                 fs::write(&gave_up, format!("{error:#}\n")).context("record the failure")?;
                 shim.call(Request::Fail).await?;
                 return Err(error.context("restore failed; the container starts over cold"));
@@ -581,18 +764,23 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
         }
     }
 
+    info!("cold booting the server");
+    let boot = Instant::now();
     let root_pid = shim.start().await?;
     let control = Control::connect_when_running(pod.control(), BOOT).await?;
-    println!("{name}: cold booted");
+    info!(seconds = %seconds(boot), "the server is running");
     if store.image_ready() || gave_up.exists() {
         shim.call(Request::Serving).await?;
+        info!(seconds = %seconds(seen), how = "cold boot", "serving");
         return Ok(());
     }
     if let Err(error) = ensure_room(&revision_dir, args.min_free_gib << 30) {
-        println!("{name}: no checkpoint: {error:#}");
+        warn!(error = %format_args!("{error:#}"), "no checkpoint is taken");
         shim.call(Request::Serving).await?;
+        info!(seconds = %seconds(seen), how = "cold boot", "serving");
         return Ok(());
     }
+    info!("taking the revision's checkpoint");
     store.clear_staging()?;
     let staging = store.staging_dir().to_path_buf();
     let outcome = async {
@@ -605,10 +793,13 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
         Ok(pid) => {
             shim.call(Request::Adopt { pid }).await?;
             store.publish()?;
+            info!(image = %store.image_dir().display(), "checkpoint published on this node");
             shim.call(Request::Serving).await?;
+            info!(seconds = %seconds(seen), how = "cold boot, checkpoint, restore", "serving");
             Ok(())
         }
         Err(error) => {
+            pod.log_server_tail();
             fs::write(&gave_up, format!("{error:#}\n")).context("record the failure")?;
             shim.call(Request::Fail).await?;
             Err(error.context("checkpoint failed; the container starts over cold"))
@@ -632,7 +823,13 @@ async fn serve(args: Args) -> Result<()> {
     let args = &node.args;
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
     let handled = Arc::new(Mutex::new(HashSet::<String>::new()));
-    println!("watching pods labelled {}", args.label);
+    info!(
+        label = %args.label,
+        store = %args.store_dir.display(),
+        tools = %args.tools_dir.display(),
+        runtime = %args.runtime_socket.display(),
+        "watching this node's pods"
+    );
     loop {
         match runtime.sandboxes(&args.label).await {
             Ok(sandboxes) => {
@@ -645,18 +842,25 @@ async fn serve(args: Args) -> Result<()> {
                         continue;
                     }
                     let (node, handled) = (Arc::clone(&node), Arc::clone(&handled));
-                    tokio::spawn(async move {
-                        if let Err(error) = look_after(&node, &sandbox).await {
-                            println!("{}/{}: {error:#}", sandbox.namespace, sandbox.name);
-                            sleep(RETRY).await;
-                            if let Ok(mut seen) = handled.lock() {
-                                seen.remove(&sandbox.uid);
+                    let span = info_span!("pod", id = short_id(&sandbox.name));
+                    tokio::spawn(
+                        async move {
+                            if let Err(error) = look_after(&node, &sandbox).await {
+                                error!(
+                                    error = %format!("{error:#}").replace('\n', "; "),
+                                    "gave up on this pod for now"
+                                );
+                                sleep(RETRY).await;
+                                if let Ok(mut seen) = handled.lock() {
+                                    seen.remove(&sandbox.uid);
+                                }
                             }
                         }
-                    });
+                        .instrument(span),
+                    );
                 }
             }
-            Err(error) => println!("list pods: {error:#}"),
+            Err(error) => warn!(error = %format_args!("{error:#}"), "could not list pods"),
         }
         sleep(Duration::from_secs(args.poll_s)).await;
     }
@@ -675,7 +879,10 @@ mod tests {
     use std::fs;
     use std::process::{Command, Stdio};
 
-    use crate::node::{Manifest, criu_errors, gone, host_pid, in_pod};
+    use crate::cuinterpose;
+    use crate::node::{
+        Manifest, criu_errors, gone, host_pid, in_pod, plain, short_id, unrestorable,
+    };
 
     #[test]
     fn a_child_is_found_by_its_pid() {
@@ -705,6 +912,7 @@ mod tests {
         let manifest = Manifest {
             root_pid: 57,
             gpus: vec!["GPU-03e97d3f-21d4-1c89-f142-657edeaf3566".to_string()],
+            minors: vec![3],
             address: "10.0.2.165".parse().unwrap(),
         };
         manifest.save(&dir).unwrap();
@@ -743,6 +951,60 @@ mod tests {
         let quiet = "one\ntwo\nthree\nfour\nfive\nsix\n";
         assert_eq!(criu_errors(quiet), "two\nthree\nfour\nfive\nsix");
         assert_eq!(criu_errors(""), "");
+    }
+
+    #[test]
+    fn shared_gpu_memory_ties_a_checkpoint_to_its_device_minors() {
+        let dir = std::env::temp_dir().join(format!("snapshotd-minors-{}", std::process::id()));
+        fs::create_dir_all(dir.join("img")).unwrap();
+        Manifest {
+            root_pid: 57,
+            gpus: vec![
+                "GPU-60432197-b540-ea7e-4d3f-d4688626f64d".to_string(),
+                "GPU-e97d4405-df15-56a3-8ae5-08ec4c1a4b14".to_string(),
+            ],
+            minors: vec![4, 5],
+            address: "10.0.2.165".parse().unwrap(),
+        }
+        .save(&dir)
+        .unwrap();
+        assert_eq!(unrestorable(&dir, &[4, 5]).unwrap(), None);
+        assert_eq!(unrestorable(&dir, &[6, 7]).unwrap(), None);
+        assert!(
+            unrestorable(&dir, &[4])
+                .unwrap()
+                .unwrap()
+                .contains("2 GPUs")
+        );
+
+        cuinterpose::Manifest {
+            libraries: Default::default(),
+            pids: vec![675, 676],
+        }
+        .save(&dir.join("img"))
+        .unwrap();
+        assert_eq!(unrestorable(&dir, &[4, 5]).unwrap(), None);
+        let reason = unrestorable(&dir, &[6, 7]).unwrap().unwrap();
+        assert!(
+            reason.contains("[4, 5]") && reason.contains("[6, 7]"),
+            "{reason}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(unrestorable(&dir, &[4, 5]).is_err());
+    }
+
+    #[test]
+    fn colour_sequences_are_removed() {
+        let line = "\u{1b}[0;36m(RustFrontend pid=421)\u{1b}[0m \u{1b}[32mINFO\u{1b}[0m ready";
+        assert_eq!(plain(line), "(RustFrontend pid=421) INFO ready");
+        assert_eq!(plain("no colours"), "no colours");
+        assert_eq!(plain("cut off \u{1b}[3"), "cut off ");
+    }
+
+    #[test]
+    fn a_pod_is_tagged_with_the_end_of_its_name() {
+        assert_eq!(short_id("snapshot-serve-db6c5d479-ltmws"), "ltmws");
+        assert_eq!(short_id("standalone"), "standalone");
     }
 
     #[test]

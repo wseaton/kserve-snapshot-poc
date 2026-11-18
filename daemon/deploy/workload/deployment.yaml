@@ -69,10 +69,20 @@ spec:
               value: spawn
             - name: VLLM_HOST_IP
               value: 127.0.0.1
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
             - name: NCCL_NVLS_ENABLE
               value: "0"
             - name: NCCL_IB_DISABLE
               value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: lo
+            - name: GLOO_SOCKET_IFNAME
+              value: lo
+            - name: VLLM_ALLREDUCE_USE_SYMM_MEM
+              value: "0"
+            - name: VLLM_USE_NCCL_SYMM_MEM
+              value: "0"
             - name: XDG_CACHE_HOME
               value: /compile-cache/xdg
             - name: TORCHINDUCTOR_CACHE_DIR

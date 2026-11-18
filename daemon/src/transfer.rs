@@ -261,11 +261,18 @@ fn add(nanos: &AtomicU64, since: Instant) {
 /// Send every file under `dir` to a receiver listening at `to`.
 pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
     let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
-    send_over(stream, dir, pool, trace)
+    println!("TRANSFER {}", send_over(stream, dir, pool, trace)?);
+    Ok(())
 }
 
-/// Send every file under `dir` to the receiver at the other end of `stream`.
-pub fn send_over(stream: TcpStream, dir: &Path, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
+/// Send every file under `dir` to the receiver at the other end of `stream`,
+/// and return how the transfer went.
+pub fn send_over(
+    stream: TcpStream,
+    dir: &Path,
+    pool: Pool,
+    trace: Option<PathBuf>,
+) -> Result<serde_json::Value> {
     let trace = Trace::new(trace, "sender");
     let files = list_files(dir)?;
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -431,9 +438,8 @@ pub fn send_over(stream: TcpStream, dir: &Path, pool: Pool, trace: Option<PathBu
     };
     let elapsed = start.elapsed().as_secs_f64();
     let workers = pool.slots as f64;
-    println!(
-        "TRANSFER {}",
-        serde_json::json!({
+    trace.write()?;
+    Ok(serde_json::json!({
             "bytes": total,
             "gb": total as f64 / 1e9,
             "seconds": elapsed,
@@ -449,9 +455,7 @@ pub fn send_over(stream: TcpStream, dir: &Path, pool: Pool, trace: Option<PathBu
             "rdma_s_per_worker": seconds(&rdma_ns) / workers,
             "write_s_per_worker": write_s / workers,
             "receiver_sync_s": sync_s,
-        })
-    );
-    trace.write()
+    }))
 }
 
 /// Post each chunk a worker hands over and tell the worker when it has
