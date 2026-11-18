@@ -48,7 +48,7 @@ number measured here is from the other path, where GPU memory lands in the proce
 it. The weights are in the checkpoint on both. NVIDIA's posts do not say which path produced the
 published numbers. NVIDIA's [2026-05-27
 post](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/)
-describes a Global Memory Service that keeps the weights in a separate artifact and restores them
+describes a GPU Memory Service that keeps the weights in a separate artifact and restores them
 alongside the process (gpt-oss-120b: 129 GiB checkpoint down to 6.7 GiB plus 74 GiB of weights),
 not shipped then because it needed a driver patch. The [2026-11-10
 post](https://developer.nvidia.com/blog/start-and-restore-gpu-workloads-in-seconds-with-nvidia-snapshot)
