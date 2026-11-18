@@ -64,6 +64,7 @@ A whole run, with the transfer rate and each phase, as the bench harness draws i
 | How the image is held in huge-page memory | [docs/memory-capture.md](docs/memory-capture.md) |
 | Why a Rust daemon, its privilege model, and the experiments behind it | [docs/design.md](docs/design.md) |
 | What KServe has to lifecycle, with diagrams, and where another engine plugs in | [docs/architecture.md](docs/architecture.md) |
+| The node daemon: a pod-level diagram, how to run it on kind, and what a control plane still has to add | [docs/orchestration.md](docs/orchestration.md) |
 | How to deploy either path, and the RDMA transfer settings | [deploy/README.md](deploy/README.md) |
 | What `snapshotd` does today and how to build it | [daemon/README.md](daemon/README.md) |
 | What each upstream patch changes | [patches/README.md](patches/README.md) |
