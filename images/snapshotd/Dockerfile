@@ -54,7 +54,8 @@ RUN cd /src/daemon && cargo build --release --locked --features nixl
 
 FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
 RUN dnf install -y --setopt=install_weak_deps=False \
-        rdma-core libibverbs libibverbs-utils librdmacm numactl-libs hwloc-libs \
+        rdma-core libibverbs libibverbs-utils librdmacm libibumad infiniband-diags \
+        numactl-libs hwloc-libs \
         libaio liburing libstdc++ python3 util-linux procps-ng findutils which \
     && dnf clean all
 COPY --from=nixl /usr/local /usr/local
