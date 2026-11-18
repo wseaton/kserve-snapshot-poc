@@ -3,9 +3,6 @@
 //! ```text
 //! open_tree(source, CLONE)  ─►  setns(container's mount namespace)  ─►  move_mount(tree, target)
 //! ```
-//!
-//! `setns` to a mount namespace needs a single-threaded process, so this runs
-//! as its own short-lived `snapshotd inject`.
 use std::fs::{self, File};
 use std::os::fd::AsFd;
 use std::path::PathBuf;

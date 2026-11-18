@@ -1,4 +1,3 @@
-//! The kubelet's PodResources service: which GPUs a container was given.
 use std::path::Path;
 
 use anyhow::{Context, Result};

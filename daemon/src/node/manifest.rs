@@ -1,4 +1,3 @@
-//! What a checkpoint records about the pod it was taken from.
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -12,7 +11,6 @@ use crate::node::process::PodPid;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// The server's process.
     pub root: PodPid,
     /// The pod's GPUs, in the driver's order.
     pub gpus: Vec<Gpu>,
@@ -36,10 +34,6 @@ impl Manifest {
             .with_context(|| format!("write {}", path.display()))
     }
 
-    /// Why this checkpoint, kept in `image`, cannot be restored onto `gpus`,
-    /// if it cannot. Processes that share GPU memory can import it again
-    /// only on devices they had initialized when they were checkpointed, so
-    /// such a checkpoint needs GPUs with the same device minors.
     pub fn refusal(&self, image: &Path, gpus: &[Gpu]) -> Result<Option<String>> {
         if self.gpus.len() != gpus.len() {
             return Ok(Some(format!(

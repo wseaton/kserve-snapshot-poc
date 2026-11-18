@@ -1,4 +1,3 @@
-//! vLLM's gRPC control port: the checkpoint lifecycle of one server.
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -16,7 +15,6 @@ use pb::control_client::ControlClient;
 const POLL: Duration = Duration::from_millis(200);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Where a server is in the checkpoint lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Running,
@@ -58,7 +56,6 @@ impl Control {
         })
     }
 
-    /// Wait for a server that is starting to listen and report `Running`.
     pub async fn connect_when_running(address: SocketAddr, limit: Duration) -> Result<Self> {
         let deadline = Instant::now() + limit;
         loop {
@@ -84,8 +81,7 @@ impl Control {
         lifecycle(response.get_ref())
     }
 
-    /// Drain the server and release what a checkpoint must not hold, and
-    /// return once it is safe to capture.
+    /// Returns once it is safe to capture.
     pub async fn prepare(&mut self, limit: Duration) -> Result<()> {
         self.client
             .checkpoint_prepare(pb::CheckpointPrepareRequest {
@@ -96,7 +92,7 @@ impl Control {
         self.wait_for(Lifecycle::Prepared, limit).await
     }
 
-    /// Bring back what preparing released, and return once the server serves.
+    /// Returns once the server serves.
     pub async fn restore(&mut self, limit: Duration) -> Result<()> {
         self.client
             .checkpoint_restore(pb::CheckpointRestoreRequest {})

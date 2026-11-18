@@ -9,9 +9,6 @@
 //! checkpoint: lock all ─► checkpoint all
 //! restore:    restore all (GPU pairs) ─► unlock all
 //! ```
-//!
-//! Locking every process before any of them checkpoints is the order the
-//! driver requires when processes share memory.
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -37,7 +34,6 @@ type Checkpoint = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
 type Restore = unsafe extern "C" fn(i32, *mut CUcheckpointRestoreArgs) -> CUresult;
 type Unlock = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
 
-/// The checkpoint entry points of the host driver.
 pub struct Driver {
     get_state: GetState,
     get_restore_thread_id: GetRestoreThreadId,
@@ -87,7 +83,6 @@ impl Driver {
         Ok(state)
     }
 
-    /// Whether the driver tracks `pid` as a CUDA process it can checkpoint.
     pub fn is_cuda_process(&self, pid: i32) -> bool {
         let mut tid = 0;
         // SAFETY: `tid` is a valid out pointer.
@@ -169,19 +164,16 @@ fn timed(phase: &str, run: impl FnOnce() -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-/// Lock every process, then checkpoint every process.
 pub fn checkpoint_job(driver: &Driver, pids: &[i32], lock_timeout: Duration) -> Result<()> {
     timed("lock", || each(pids, |pid| driver.lock(pid, lock_timeout)))?;
     timed("checkpoint", || each(pids, |pid| driver.checkpoint(pid)))
 }
 
-/// Restore every process onto the GPUs `map` names, then unlock every process.
 pub fn restore_job(driver: &Driver, pids: &[i32], map: &GpuMap) -> Result<()> {
     timed("restore", || each(pids, |pid| driver.restore(pid, map)))?;
     timed("unlock", || each(pids, |pid| driver.unlock(pid)))
 }
 
-/// One GPU of a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gpu {
     pub uuid: GpuUuid,
@@ -219,9 +211,7 @@ pub fn node_gpus() -> Result<Vec<Gpu>> {
     Ok(gpus)
 }
 
-/// The GPUs named by `uuids`, picked from `node` and kept in its order. Rank
-/// i of a checkpoint must land on the GPU at the same position among its
-/// pod's.
+/// The GPUs named by `uuids`, picked from `node` and kept in its order.
 pub fn pick(node: &[Gpu], uuids: &[GpuUuid]) -> Result<Vec<Gpu>> {
     for uuid in uuids {
         ensure!(
@@ -236,8 +226,6 @@ pub fn pick(node: &[Gpu], uuids: &[GpuUuid]) -> Result<Vec<Gpu>> {
         .collect())
 }
 
-/// Every process in the tree rooted at `root`. vLLM forks workers from
-/// non-main threads, so children are read from every thread.
 pub fn process_tree(root: i32) -> Vec<i32> {
     let mut pids = vec![root];
     let mut next = 0;
@@ -305,9 +293,7 @@ impl GpuUuid {
     }
 }
 
-/// Where each GPU a checkpoint used is restored. The R580 driver needs a
-/// bijection over every GPU the processes can see, so the map is complete
-/// and one-to-one or empty.
+/// Complete and one-to-one over the visible GPUs, or empty.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GpuMap(Vec<(GpuUuid, GpuUuid)>);
 

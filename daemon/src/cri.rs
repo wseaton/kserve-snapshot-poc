@@ -1,5 +1,3 @@
-//! The container runtime's CRI service: which pods on this node opted in,
-//! and the host PID of a pod's container.
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
@@ -19,7 +17,6 @@ use pb::runtime_service_client::RuntimeServiceClient;
 
 const CONTAINER_NAME: &str = "io.kubernetes.container.name";
 
-/// A pod sandbox that is up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sandbox {
     pub id: String,
@@ -39,7 +36,6 @@ struct ContainerInfo {
     pid: i32,
 }
 
-/// The host PID in a verbose container status.
 pub fn container_pid(info: &HashMap<String, String>) -> Result<i32> {
     let info = info
         .get("info")

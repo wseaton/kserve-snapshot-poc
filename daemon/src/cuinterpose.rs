@@ -6,18 +6,13 @@
 //! uses it in three places:
 //!
 //! ```text
-//! pod start   vLLM starts under cuinterpose-launch from the daemon's
-//!             read-only hostPath bundle, at the same path on every node
+//! pod start   vLLM preloads libcuinterpose.so from the tools the daemon mounts into the pod
 //! checkpoint  inspect ─► shared? ─no─► plain cuda-checkpoint
 //!                           │yes
 //!                           ▼
 //!             write cuinterpose.json ─► coordinator --prepare ─► cuda lock+checkpoint ─► CRIU dump
 //! restore     verify library hashes ─► CRIU restore ─► cuda restore+unlock ─► coordinator --restore
 //! ```
-//!
-//! Inspection talks to each process's control socket directly with
-//! `cuinterpose-protocol`. The prepare and restore phases still run NVIDIA's
-//! coordinator binary, which validates the cross-process topology.
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
@@ -37,8 +32,6 @@ const COORDINATOR: &str = "cuinterpose-coordinator";
 const MANIFEST_FILE: &str = "cuinterpose.json";
 const STATE_FILE: &str = "cuinterpose.state";
 
-/// Where the cuInterpose bundle and the workload's control sockets live, as
-/// seen from inside the workload's mount namespace.
 #[derive(Clone, Debug, clap::Args)]
 pub struct Config {
     /// Directory holding the cuInterpose libraries and coordinator.
@@ -96,7 +89,6 @@ mod hex_digest {
     }
 }
 
-/// What a checkpoint needs to find the same cuInterpose build at restore.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub libraries: BTreeMap<String, Sha256Digest>,
@@ -126,7 +118,6 @@ impl Manifest {
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
     }
 
-    /// Refuse a restore whose bundle is not the build the checkpoint loaded.
     pub fn verify_libraries(&self, config: &Config) -> Result<()> {
         let actual = hash_libraries(config)?;
         ensure!(
@@ -239,7 +230,6 @@ fn parse_namespace_pid(status: &str) -> Option<NamespacePid> {
         .and_then(|pid| pid.parse().ok())
 }
 
-/// Ask one participant for the CUDA memory it tracks.
 pub fn inspect(socket_dir: &Path, pid: NamespacePid) -> Result<Vec<Record>> {
     let endpoint = cuinterpose_protocol::socket_path(socket_dir, pid);
     let socket = cuinterpose_protocol::connect(&endpoint, cuinterpose_protocol::control_timeout())
@@ -270,7 +260,6 @@ pub fn inspect(socket_dir: &Path, pid: NamespacePid) -> Result<Vec<Record>> {
     }
 }
 
-/// Cross-process CUDA memory one participant still holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sharing {
     pub shared_allocations: usize,
@@ -301,10 +290,8 @@ impl Sharing {
     }
 }
 
-/// How the checkpoint handles cross-process CUDA memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedMemory {
-    /// No participant shares CUDA memory, so cuda-checkpoint alone is enough.
     NotShared,
     /// The coordinator unmapped shared memory and saved it with the checkpoint.
     /// The source processes cannot resume without a coordinator restore.
@@ -312,8 +299,7 @@ pub enum SharedMemory {
 }
 
 /// Inspect every CUDA process that preloaded cuInterpose and, if any of them
-/// shares memory, run the coordinator's prepare phase. The application must
-/// already be idle, which vLLM's `/checkpoint/prepare` guarantees.
+/// shares memory, run the coordinator's prepare phase.
 pub fn prepare_checkpoint(
     config: &Config,
     ckpt_dir: &Path,
@@ -350,7 +336,6 @@ pub fn prepare_checkpoint(
     Ok(SharedMemory::Prepared(manifest))
 }
 
-/// Re-import shared memory after CRIU and cuda-checkpoint have restored every
 /// participant. The PIDs are the checkpoint's namespace PIDs, which CRIU keeps.
 pub fn restore(config: &Config, ckpt_dir: &Path, manifest: &Manifest) -> Result<()> {
     run_coordinator(config, "--restore", ckpt_dir, &manifest.pids)

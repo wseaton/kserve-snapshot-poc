@@ -1,4 +1,3 @@
-//! gRPC over a Unix socket, for the node's own services.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

@@ -11,10 +11,6 @@
 //!   State            what has happened so far, for a daemon that restarted
 //!   Fail             exit, so the container starts over
 //! ```
-//!
-//! It runs on one thread and forks only to start the server, so it never
-//! holds a PID or thread ID a checkpoint needs. With no node daemon it starts
-//! the server by itself.
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -29,8 +25,6 @@ use rustix::process::{Pid, Signal, WaitOptions};
 use serde::{Deserialize, Serialize};
 
 const TICK: Duration = Duration::from_millis(100);
-/// Where the node daemon expects the shim's socket and the server's log,
-/// in the pod.
 pub const SOCKET: &str = "/run/snapshotd/shim.sock";
 pub const SERVER_LOG: &str = "/run/snapshotd/server.log";
 
@@ -111,8 +105,6 @@ fn termination_signals() -> libc::sigset_t {
     }
 }
 
-/// Wait one tick, or less if a termination signal arrives; they are blocked,
-/// so this is the only place they are seen.
 fn terminated_within(tick: Duration) -> bool {
     let timeout = libc::timespec {
         tv_sec: tick.as_secs() as libc::time_t,

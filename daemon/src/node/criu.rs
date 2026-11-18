@@ -1,4 +1,3 @@
-//! Running CRIU inside a pod, from the node.
 use std::fs;
 use std::path::Path;
 
@@ -9,19 +8,10 @@ use tracing::warn;
 use crate::node::layout::TOOLS;
 use crate::node::process::{self, HostPid};
 
-/// `criu <action>` in every namespace of the pod whose init is `init`, and
-/// in its cgroup, so what it restores is accounted and confined like the
-/// pod's own processes. A process can only be moved into the pod's cgroup
-/// from a cgroup namespace that sees both, which is the node's.
-///
 /// ```text
 /// nsenter (node's cgroup namespace) ─► unshare (mounts) ─► mount cgroup2,
 ///   join the pod's cgroup ─► nsenter (all of the pod's namespaces) ─► criu
 /// ```
-///
-/// CRIU leaves cgroups alone, since its children are already in the right
-/// one, and does not lock the network: the connections it keeps are between
-/// the processes it has frozen.
 pub fn command(init: HostPid, action: &str) -> Command {
     let enter = format!(
         "mount -t cgroup2 none /mnt \
@@ -42,7 +32,6 @@ pub fn command(init: HostPid, action: &str) -> Command {
     command
 }
 
-/// Run CRIU; if it fails, log what its own log at `log` says about why.
 pub async fn run(command: &mut Command, what: &str, log: &Path) -> Result<()> {
     let outcome = process::run(command, what).await;
     if outcome.is_err() {
@@ -53,8 +42,6 @@ pub async fn run(command: &mut Command, what: &str, log: &Path) -> Result<()> {
     outcome
 }
 
-/// The lines of a CRIU log that say why it failed: its errors, or its last
-/// lines when it names none.
 fn errors(log: &str) -> Vec<&str> {
     let lines: Vec<&str> = log.lines().collect();
     let errors: Vec<&str> = lines
