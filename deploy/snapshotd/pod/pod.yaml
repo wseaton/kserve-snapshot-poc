@@ -9,8 +9,6 @@ metadata:
     kubectl.kubernetes.io/default-container: main
 spec:
   restartPolicy: Never
-  imagePullSecrets:
-    - name: quay-wseaton-pull
   initContainers:
     - name: snapshotd
       image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
@@ -28,7 +26,7 @@ spec:
         - name: exp
           mountPath: /exp
     - name: snapshot-binaries
-      image: quay.io/wseaton/snapshot-agent@sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f
+      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
       command: [cp, -a, /snapshot-binaries, /out/]
       resources:
         requests:

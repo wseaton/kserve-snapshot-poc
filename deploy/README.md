@@ -49,8 +49,9 @@ deploy/
 - A `ReadWriteMany` storage class. The manifests name `shared-vast`.
 - For the RDMA parts, an InfiniBand device plugin that offers `rdma/ib`, and transparent huge
   pages on the nodes.
-- The Dynamo agent build and the companion are still private images under `quay.io/wseaton`.
-  Each namespace below needs a pull secret named `quay-wseaton-pull` for them:
+- The companion is still a private image under `quay.io/wseaton`. The companion's namespace and
+  each service namespace need a pull secret named `quay-wseaton-pull` for it; the bench pods and
+  the Dynamo agent pull only public images:
 
   ```bash
   kubectl -n <namespace> create secret docker-registry quay-wseaton-pull \
@@ -67,7 +68,7 @@ deploy/
 | `ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint` | vLLM in both paths | [`images/vllm-checkpoint`](../images/vllm-checkpoint): vLLM nightly `a2bcb565` with files from the patched fork, ModelExpress from its fork branch, and the CUDA 13.1 forward-compat `libcuda` at `/usr/local/cuda-13.1/compat`, off the library path |
 | `ghcr.io/wseaton/kserve-snapshot-poc/snapshotd` | the `xfer` container; an init container copies `snapshotd` and the bench scripts out of it | [`images/snapshotd`](../images/snapshotd): both builds of [`daemon/`](../daemon), with NIXL ([ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672)) and UCX |
 | `quay.io/wseaton/kserve-dynamo-snapshot@sha256:77c68762…` | companion, snapshot entrypoint | `kserve-dynamo-snapshot/Dockerfile` |
-| `quay.io/wseaton/snapshot-agent@sha256:7fe69503…` | Dynamo agent; in the bench pod, an init container copies CRIU, its plugins and cuInterpose out of it | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot) |
+| `ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent` | Dynamo agent; in the bench pod, an init container copies CRIU, its plugins and cuInterpose out of it | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot), from its own Dockerfile, CRIU pinned to `1a93585` |
 | `ghcr.io/ai-dynamo/snapshot/operator:v0.0.0-gbc9d2161`, `…/agent:v0.0.0-gbc9d2161` | Dynamo operator; cuInterpose bundle the companion injects | upstream |
 | `nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.6.0` | ModelExpress server | upstream |
 
@@ -96,15 +97,13 @@ on those nodes:
 ```bash
 kubectl label node <node> snapshot.neuralmagic.com/agent=true
 kustomize build --enable-helm deploy/dynamo-snapshot/agent | kubectl apply --server-side -f -
-kubectl -n kds-snapshot-system create secret docker-registry quay-wseaton-pull \
-  --from-file="$HOME/.docker/config.json"
 kubectl -n kds-snapshot-system rollout status daemonset/kds-snapshot-agent
 kubectl -n kds-snapshot-system rollout status deployment/kds-snapshot-operator
 ```
 
 [`agent/values.yaml`](dynamo-snapshot/agent/values.yaml) turns PageBroker off (it needs a newer
 driver than 580), sets CRIU's `mntnsCompatMode` on and `extMasters` off, and sizes the checkpoint
-volume. The kustomization swaps in the agent built with the CoreWeave patch and removes
+volume, and names the agent built with the CoreWeave patch. The kustomization removes
 `runtimeClassName: nvidia`.
 
 ### 3. Companion
@@ -163,8 +162,6 @@ node's 8 GPUs.
 
 ```bash
 kubectl apply -k deploy/snapshotd/single-node
-kubectl -n snapshot-bench create secret docker-registry quay-wseaton-pull \
-  --from-file="$HOME/.docker/config.json"
 kubectl apply -k deploy/snapshotd/models/qwen3-8b
 kubectl -n snapshot-bench wait job/download-qwen3-8b --for=condition=Complete --timeout=30m
 kubectl -n snapshot-bench wait pod/restore-bench --for=condition=Ready --timeout=10m
@@ -350,9 +347,9 @@ volume when there is none.
 | Setting | Where |
 | --- | --- |
 | Storage class `shared-vast` and volume sizes | `dynamo-snapshot/agent/values.yaml`, `dynamo-snapshot/qwen3-8b/namespace/model.yaml`, `snapshotd/base/storage.yaml` |
-| Pull secret name | `agent/values.yaml`, `companion/companion.yaml`, `config-layer/kustomization.yaml`, `snapshotd/pod/pod.yaml` |
-| Image references | `components/images` for the two images built here; `images:` in `agent/`, `companion/` and `config-layer/` and `snapshotd/pod/pod.yaml` for the rest |
-| CoreWeave agent image, no `runtimeClassName` | `dynamo-snapshot/agent/kustomization.yaml` |
+| Pull secret name | `companion/companion.yaml`, `config-layer/kustomization.yaml` |
+| Image references | `components/images` for the three images built here; `images:` in `companion/` and `config-layer/` for the companion |
+| CoreWeave agent image, no `runtimeClassName` | `dynamo-snapshot/agent/values.yaml` and `kustomization.yaml` |
 | PageBroker and CRIU options for driver 580 | `dynamo-snapshot/agent/values.yaml` |
 | Node label for the agent and for services | `agent/values.yaml`, `qwen3-8b/service/service.yaml` |
 | Namespace label `inference-gateway-access`, which the test cluster's gateway requires | `qwen3-8b/namespace/namespace.yaml` |

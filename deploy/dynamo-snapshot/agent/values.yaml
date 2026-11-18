@@ -2,7 +2,8 @@ image:
   operator:
     tag: v0.0.0-gbc9d2161
   agent:
-    tag: v0.0.0-gbc9d2161
+    repository: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+    tag: main
 pageBroker:
   enabled: false
 storage:
@@ -10,8 +11,6 @@ storage:
     storageClass: shared-vast
     size: 200Gi
 daemonset:
-  imagePullSecrets:
-    - name: quay-wseaton-pull
   nodeSelector:
     nvidia.com/gpu.present: null
     snapshot.neuralmagic.com/agent: "true"
