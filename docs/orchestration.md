@@ -76,6 +76,39 @@ For every pod on its node that carries the label `snapshot.llm-d.ai/workload`:
 Nothing talks to the Kubernetes API. There is no custom resource, webhook, controller or
 scheduling gate.
 
+## A limit on tensor parallel below a whole node
+
+A server whose workers share GPU memory (tensor parallel above 1 with vLLM's defaults, which is why
+it runs under cuInterpose) can be restored only onto GPUs with the same device minors as the ones
+it was checkpointed on. On other GPUs the daemon does not try: it logs why and lets the pod cold
+boot.
+
+The driver moves each restored process to its new GPU, which is why a single-GPU server restores
+anywhere. What fails afterwards is the workers re-importing the memory they share:
+`cuMemImportFromShareableHandle` returns `CUDA_ERROR_INVALID_DEVICE` when the new GPU was not
+visible to the process at checkpoint time, and `CUDA_ERROR_NOT_INITIALIZED` when it was visible but
+CUDA had not initialized it. A process can import only on a device it had initialized when it was
+checkpointed. Qwen3-8B at TP=2 and TP=4 on H200, driver 580.126.09:
+
+| The restore lands on | The container sees | Result |
+| --- | --- | --- |
+| the GPUs it was checkpointed on | its own | works |
+| the same GPUs in another order | its own | works |
+| another node, same device minors | every GPU | works |
+| GPUs with other minors | its own | `CUDA_ERROR_INVALID_DEVICE` |
+| GPUs with other minors | every GPU | `CUDA_ERROR_NOT_INITIALIZED` |
+
+It is the same with cuInterpose from Dynamo Snapshot's `main` of 2026-11-18. Pairing GPUs by PCI
+bus order, aliasing the old `/dev/nvidiaN` paths and widening the restore map to every visible GPU
+change nothing.
+
+Who is affected: a pod that takes a whole node always gets the same minors, so TP=8 on an 8-GPU
+node restores on any node. A pod that takes some of a node's GPUs restores only where the kubelet
+happens to hand it the same minors, which nothing in Kubernetes can ask for. The way out for those
+is to stop sharing memory between workers ([docs/design.md](design.md): `--disable-custom-all-reduce`,
+`NCCL_CUMEM_ENABLE=0`, FlashInfer all-reduce off, with `patches/vllm/0003`), which this path has not
+been run with.
+
 ## What it leaves to an orchestrator
 
 | Concern | Today | What a real solution has to decide or build |
@@ -85,11 +118,11 @@ scheduling gate.
 | Eligibility | None; every labelled pod is tried | Refuse what cannot be checkpointed or would be wrong to restore: multi-node workers, prefill/decode pairs, engines without the checkpoint lifecycle, runtime-loaded LoRA adapters, routing that depends on per-replica cache state. Today such a pod fails its checkpoint and cold boots, after paying for the attempt |
 | Revision identity | Namespace, the label's value and `pod-template-hash` | The hash covers the pod template only. It does not cover model files that change under the same path, an image referenced by tag, or a Deployment deleted and created again with the same template. A real key adds those, and a way to invalidate |
 | Node compatibility | Not checked. A checkpoint is restored on whatever node holds or pulls it | A checkpoint is good for one GPU model, driver, kernel and CPU feature set. Record them with the checkpoint, refuse a mismatch before trying, and invalidate after a driver or kernel upgrade |
-| Scheduling | The scheduler knows nothing. A pod restores if it happens to land on a node with the checkpoint, or one that can pull it | Prefer nodes that hold the checkpoint, and never choose incompatible ones. Without this the benefit depends on luck or on every node pulling |
+| Scheduling | The scheduler knows nothing. A pod restores if it happens to land on a node with the checkpoint, or one that can pull it, and for TP above 1 on part of a node, on the same device minors | Prefer nodes that hold the checkpoint, and never choose incompatible ones. Without this the benefit depends on luck or on every node pulling |
 | When and where to capture | The first pod of a revision on each node is checkpointed in place before it is ready, always | Whether to capture at all for a workload that never scales, where (in place, or a donor pod so the first replica is not delayed), and how many captures may run at once on a node |
 | One capture per revision | Each node decides alone. Several pods of a new revision starting at once on one node all cold boot and capture, and the first to finish publishes | A claim per revision, cluster-wide, so one pod captures and the rest wait or cold boot by policy |
 | Readiness and traffic | The shim opens a TCP port once the server serves; the pod's readiness probe points at it | Readiness owned by the platform: a readiness gate the engine sets, and KServe's own probes moved off the server's port. A stock HTTP readiness probe on the server passes during cold boot, before the checkpoint stops it |
-| Connections during the dump | The daemon closes its own. CRIU refuses to dump a server with any other TCP connection open, and the pod then cold boots | Guarantee nothing else connects before the pod is ready (kubelet probes, an endpoint picker scraping metrics, a mesh sidecar), or change the dump to close connections instead of locking them. Not yet tried |
+| Connections during the dump | The daemon closes its own, and CRIU dumps without locking the network, so a connection someone else holds is carried into the image and is dead after the restore | Keep everything else off the server until the pod is ready (kubelet probes, an endpoint picker scraping metrics, a mesh sidecar), or accept that such a client sees a reset |
 | Rollouts | A new template is a new revision and is captured again on every node it lands on | Surge capacity while old and new revisions overlap, what a rollback reuses, and whether a rollout of a one-replica service should capture at all, since it only makes that replica slower |
 | Checkpoint storage | One directory per revision on the node's disk. Nothing is ever deleted, and the space is not charged to any pod | Retention and eviction per node, deletion when the workload goes away (the daemon cannot see that without the API), quotas per tenant, and accounting. With weights kept in the checkpoint an image is the size of the model per revision per node |
 | What a checkpoint contains | Process memory, written to the node's disk unencrypted | It can hold whatever the server had in memory: credentials from its environment, request data. Decide on encryption at rest, who may read the store, and whether tenants may share nodes |

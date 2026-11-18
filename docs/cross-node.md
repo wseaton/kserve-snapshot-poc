@@ -207,14 +207,17 @@ In the order they were found:
   position i of the target (device-minor order). A privileged pod sees all eight GPUs, so the
   source's positions decide where the restore lands. An early attempt put workers on GPUs that
   belonged to other pods. The harness now refuses a restore unless the target positions are
-  allocated to the pod. An unprivileged workload sees only its own GPUs and does not have this
-  problem.
+  allocated to the pod. An unprivileged workload sees only its own GPUs, so nothing lands on
+  another pod's, but when its workers share GPU memory it still needs the same device minors on the
+  target: see [docs/orchestration.md](orchestration.md#a-limit-on-tensor-parallel-below-a-whole-node).
 - **Headroom, on the patched path.** At `--gpu-memory-utilization 0.9` the KV cache could not be
   re-committed after a restore without cuInterpose (138 of 141 GB in use). 0.8 worked there; with
   cuInterpose and the weights kept, 0.9 works.
 
-An early cuInterpose attempt failed in `RestoreUnicast` with `CUDA_ERROR_NOT_INITIALIZED`. The cause
-was the placement mistake above, not cuInterpose: with the positions right it restores across nodes.
+An early cuInterpose attempt failed in `RestoreUnicast` with `CUDA_ERROR_NOT_INITIALIZED`. With the
+positions right it restores across nodes. Positions mattered because they kept the device minors
+the same: a restored process can import shared memory only on a device it had initialized when it
+was checkpointed.
 
 ## What is in the checkpoint
 
