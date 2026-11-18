@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restore-bench
+spec:
+  containers:
+    - name: main
+      volumeMounts:
+        - name: mem
+          mountPath: /mem
+    # Copies /work/<tag> to or from another node: snapshotd built with the nixl feature.
+    - name: xfer
+      image: quay.io/wseaton/nixl-regbench@sha256:da96ebb45ccd74f4e6259aa4a744a8c00ad22e9ec3dd1805da1378977536b241
+      command: [sleep, infinity]
+      env:
+        - name: HOME
+          value: /tmp
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK, SYS_RESOURCE]
+      resources:
+        requests:
+          cpu: "8"
+          memory: 16Gi
+          rdma/ib: "1"
+        limits:
+          memory: 256Gi
+          rdma/ib: "1"
+      volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: work
+          mountPath: /work
+        - name: mem
+          mountPath: /mem
+  volumes:
+    # RAM-backed, for checkpoints that should not touch a disk (IMG_DIR=/mem/... in lifecycle.sh).
+    - name: mem
+      emptyDir:
+        medium: Memory
+        sizeLimit: 256Gi

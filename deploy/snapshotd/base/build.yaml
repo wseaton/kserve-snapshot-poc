@@ -1,0 +1,69 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-snapshotd
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: quay-wseaton-pull
+      containers:
+        - name: snapshotd
+          image: docker.io/library/rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+          env:
+            - name: SNAPSHOTD_REPO
+              value: https://github.com/wseaton/kserve-snapshot-poc
+            - name: SNAPSHOTD_REF
+              value: main
+          command:
+            - bash
+            - -euxc
+            - |
+              mkdir /tmp/src
+              curl -fsSL "$SNAPSHOTD_REPO/archive/$SNAPSHOTD_REF.tar.gz" | tar -xz -C /tmp/src --strip-components=1
+              cd /tmp/src/daemon
+              cargo build --release --locked
+              install -D target/release/snapshotd /models/bin/snapshotd
+          resources:
+            requests:
+              cpu: "8"
+              memory: 16Gi
+            limits:
+              memory: 32Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+        - name: snapshotd-nixl
+          image: quay.io/wseaton/nixl-regbench@sha256:da96ebb45ccd74f4e6259aa4a744a8c00ad22e9ec3dd1805da1378977536b241
+          env:
+            - name: HOME
+              value: /root
+            - name: SNAPSHOTD_REPO
+              value: https://github.com/wseaton/kserve-snapshot-poc
+            - name: SNAPSHOTD_REF
+              value: main
+          command:
+            - bash
+            - -euxc
+            - |
+              export PATH=/root/.cargo/bin:$PATH
+              mkdir /tmp/src
+              curl -fsSL "$SNAPSHOTD_REPO/archive/$SNAPSHOTD_REF.tar.gz" | tar -xz -C /tmp/src --strip-components=1
+              cd /tmp/src/daemon
+              cargo build --release --locked --features nixl
+              install -D target/release/snapshotd /models/bin/snapshotd-nixl
+          resources:
+            requests:
+              cpu: "8"
+              memory: 16Gi
+            limits:
+              memory: 32Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: snapshot-bench-models

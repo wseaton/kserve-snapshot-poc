@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+rules:
+  - apiGroups: [modelexpress.nvidia.com]
+    resources: [modelmetadatas, modelcacheentries]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [modelexpress.nvidia.com]
+    resources: [modelmetadatas/status, modelcacheentries/status]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+spec:
+  selector:
+    app: modelexpress-server
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: modelexpress-server
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.6.0
+          env:
+            - name: MX_METADATA_BACKEND
+              value: kubernetes
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MODEL_EXPRESS_SERVER_PORT
+              value: "8001"
+            - name: MODEL_EXPRESS_LOG_LEVEL
+              value: info
+          ports:
+            - name: grpc
+              containerPort: 8001
+          readinessProbe:
+            grpc:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi

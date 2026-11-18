@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../kserve-dynamo-snapshot/config/companion
+images:
+  - name: ghcr.io/neuralmagic/kserve-dynamo-snapshot
+    newName: quay.io/wseaton/kserve-dynamo-snapshot
+    digest: sha256:77c68762fdbd7fce6784de14989f813cf0b418b52f8bec7d48522347a0dd012f
+patches:
+  - path: companion.yaml

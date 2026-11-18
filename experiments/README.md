@@ -41,9 +41,11 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
 
 ## `bench/`: timed cold boot, checkpoint and restore of one server
 
-- `pod.yaml`: privileged, with the node and GPU count filled in, a models volume and a compile
-  cache volume. Configmap `restore-bench` from `restore-bench.sh`, `../criu/noiouring.py` and an
-  `overlay.tgz` of the vLLM files the patches change. `snapshotd` goes to `/models/bin/snapshotd`.
+- The pod, its volumes, the `restore-bench` configmap and the `snapshotd` build are kustomize in
+  [`deploy/snapshotd`](../deploy/snapshotd); [deploy/README.md](../deploy/README.md) walks through
+  them. The pod is privileged and takes a whole node's 8 GPUs. An `overlay.tgz` of the vLLM files
+  the patches change goes in a second configmap, `restore-bench-overlay`, which the pod mounts
+  beside the scripts when it exists. `snapshotd` goes to `/models/bin/snapshotd`.
   A privileged pod sees every GPU on the node, so the script takes its GPUs from the kubelet's
   device checkpoint, mounted from the host.
 - `restore-bench.sh <tag> [vllm args]`: cold boot, a greedy completion, prepare,
@@ -89,7 +91,8 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
   target. `restore-bench.sh` does the two halves with `PHASE=capture` and `PHASE=restore`.
 - `MX=1 NET=pod PEER=1` on `lifecycle.sh` loads weights through ModelExpress, restores into the
   pod's network, and cold boots a second server on the source as the peer to pull from. The
-  workload container needs `rdma/ib` and the pod-info volume in `pod.yaml`.
+  workload container needs `rdma/ib` and the pod-info volume, which the `modelexpress-weights`
+  component in `deploy/snapshotd` adds.
 - `bench/trace-merge.py`: merges the transfer's sender and receiver traces with the harness
   phases.
 - `bench/trace-render.py <output dir> [--png FILE]`: draws a run as a standalone page that reads on

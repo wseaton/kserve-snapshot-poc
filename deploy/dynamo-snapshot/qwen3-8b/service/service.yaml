@@ -1,0 +1,41 @@
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: qwen3-8b
+  annotations:
+    serving.kserve.io/exp-modelexpress-mode: layered
+    serving.kserve.io/exp-modelexpress-address: modelexpress-server:8001
+spec:
+  baseRefs:
+    - name: kserve-dynamo-snapshot
+  model:
+    uri: pvc://models/Qwen3-8B
+    name: Qwen/Qwen3-8B
+  replicas: 1
+  router:
+    gateway: {}
+    route: {}
+    scheduler:
+      template:
+        containers:
+          - name: main
+            image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0
+  template:
+    nodeSelector:
+      snapshot.neuralmagic.com/agent: "true"
+    containers:
+      - name: main
+        env:
+          - name: VLLM_ADDITIONAL_ARGS
+            value: --max-model-len 8192 --gpu-memory-utilization 0.85
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            rdma/ib: "1"
+            cpu: "8"
+            memory: 64Gi
+          requests:
+            nvidia.com/gpu: "1"
+            rdma/ib: "1"
+            cpu: "1"
+            memory: 32Gi

@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-qwen3-8b
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: download
+          image: vllm/vllm-openai:v0.27.1-ubuntu2404@sha256:dafea057f24b7d42716331a48e2db4e1f204f877a3aa759cb7e4c37e64ca2eee
+          command: [hf, download, Qwen/Qwen3-8B, --local-dir, /models/Qwen3-8B]
+          env:
+            - name: HF_HUB_DISABLE_XET
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: snapshot-bench-models

@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kds-snapshot-system
+resources:
+  - namespace.yaml
+helmCharts:
+  - name: snapshot
+    releaseName: kds-snapshot
+    namespace: kds-snapshot-system
+    includeCRDs: true
+    valuesFile: values.yaml
+images:
+  - name: ghcr.io/ai-dynamo/snapshot/agent
+    newName: quay.io/wseaton/snapshot-agent
+    digest: sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f
+patches:
+  - target:
+      kind: DaemonSet
+      name: kds-snapshot-agent
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/runtimeClassName

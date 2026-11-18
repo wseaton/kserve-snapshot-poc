@@ -5,7 +5,8 @@
 #   lifecycle.sh <tag> [vllm args]
 #
 # Environment:
-#   SRC_POD, DST_POD   bench pods (pod.yaml) on the two nodes (default restore-bench, restore-bench-b)
+#   SRC_POD, DST_POD   bench pods (deploy/snapshotd/two-node) on the two nodes (default
+#                      restore-bench, restore-bench-b)
 #   NS, CONTEXT        namespace and kube context (default weaton-dev, coreweave-waldorf)
 #   OVERLAP            0: dump to the source's disk, then copy; 1: CRIU streams into
 #                      `snapshotd transfer stream`, which sends while the dump runs and writes
@@ -14,7 +15,8 @@
 #   RESERVE_GIB        memory the target makes available before the dump: faulted in with
 #                      OVERLAP=memory, allocated and freed once with a /mem image directory (default 0)
 #   IMG_DIR            where the CRIU image goes on both nodes (default /work/<tag>/img, the
-#                      node's local disk; /mem/<tag> is RAM-backed in pod.yaml)
+#                      node's local disk; /mem/<tag> is RAM-backed with the rdma-image-transfer
+#                      component)
 #   SLOTS, SLOT_MIB    shape of the registered pool (default 64, 64)
 #   XFER               snapshotd built with the nixl feature (default /models/bin/snapshotd-nixl)
 #   OUT                where the traces and the merged trace go (default ./lifecycle-<tag>)
