@@ -1,0 +1,85 @@
+name: snapshot-agent
+
+on:
+  pull_request:
+    paths:
+      - patches/dynamo-snapshot/**
+      - upstream.tsv
+      - .github/workflows/snapshot-agent.yaml
+  push:
+    branches: [main]
+    paths:
+      - patches/dynamo-snapshot/**
+      - upstream.tsv
+      - .github/workflows/snapshot-agent.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: snapshot-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/snapshot-agent
+  CRIU_REF: 1a9358578d6631ffa06f2280d075f294ed2a0a60
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@v7
+      - name: Check out Dynamo Snapshot with the CoreWeave patch
+        run: |
+          read -r _ repo base _ < <(awk '$1 == "dynamo-snapshot"' upstream.tsv)
+          git init -q src/dynamo-snapshot
+          git -C src/dynamo-snapshot fetch -q --depth 1 "$repo" "$base"
+          git -C src/dynamo-snapshot checkout -q FETCH_HEAD
+          git -C src/dynamo-snapshot apply "$PWD/patches/dynamo-snapshot/0001-coreweave-device-plugin-fixes.patch"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: src/dynamo-snapshot/agent
+          target: agent
+          platforms: linux/amd64
+          build-contexts: |
+            api=src/dynamo-snapshot/api
+            compliance=src/dynamo-snapshot/hack/compliance
+          build-args: |
+            CRIU_REF=${{ env.CRIU_REF }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  references:
+    needs: image
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/image-reference.yaml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      name: snapshot-agent
+      digest: ${{ needs.image.outputs.digest }}
