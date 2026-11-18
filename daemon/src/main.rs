@@ -13,8 +13,9 @@ mod transfer;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rustix::process::{Resource, getrlimit, setrlimit};
 
 use crate::cuda::{Driver, GpuMap, GpuUuid};
 
@@ -164,8 +165,16 @@ enum CuinterposeCommand {
     },
 }
 
+fn raise_open_file_limit() -> Result<()> {
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = limit.maximum;
+    setrlimit(Resource::Nofile, limit).context("raise the open file limit to its hard limit")
+}
+
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    raise_open_file_limit()?;
+    match command {
         Command::Cuda(command) => cuda_command(command),
         Command::Cuinterpose(command) => cuinterpose_command(command),
         Command::Image(ImageCommand::Hold {
@@ -268,4 +277,18 @@ fn cuda_command(command: CudaCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rustix::process::{Resource, getrlimit};
+
+    use crate::raise_open_file_limit;
+
+    #[test]
+    fn open_file_limit_is_raised_to_the_hard_limit() {
+        raise_open_file_limit().unwrap();
+        let limit = getrlimit(Resource::Nofile);
+        assert_eq!(limit.current, limit.maximum);
+    }
 }

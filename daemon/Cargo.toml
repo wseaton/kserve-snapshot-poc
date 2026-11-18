@@ -20,7 +20,7 @@ libloading = "0.8"
 nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
 openssl = "0.10"
 prost = "0.14"
-rustix = { version = "1", features = ["mm", "net", "pipe"] }
+rustix = { version = "1", features = ["mm", "net", "pipe", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
