@@ -27,8 +27,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use cuinterpose_protocol::{NamespacePid, Record, Reply, Request, Response};
+use openssl::hash::{Hasher, MessageDigest};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub const FRONTEND_LIBRARY: &str = "libcuinterpose.so";
 pub const CORE_LIBRARY: &str = "libcuinterpose_core.so";
@@ -66,9 +66,14 @@ impl Sha256Digest {
             "{} is not a regular file",
             path.display()
         );
-        let mut digest = Sha256::new();
-        io::copy(&mut file, &mut digest).with_context(|| format!("read {}", path.display()))?;
-        Ok(Self(digest.finalize().into()))
+        let mut hasher = Hasher::new(MessageDigest::sha256()).context("start SHA-256")?;
+        io::copy(&mut file, &mut hasher).with_context(|| format!("read {}", path.display()))?;
+        let digest = hasher.finish().context("finish SHA-256")?;
+        let bytes = digest
+            .as_ref()
+            .try_into()
+            .context("SHA-256 digest is not 32 bytes")?;
+        Ok(Self(bytes))
     }
 }
 
@@ -380,8 +385,8 @@ mod tests {
     use cuinterpose_protocol::{AllocationReference, MemoryLocation, MulticastProperties, Record};
 
     use crate::cuinterpose::{
-        CORE_LIBRARY, Config, FRONTEND_LIBRARY, Manifest, MappedFile, Sha256Digest, Sharing,
-        find_mapping, hash_libraries, parse_namespace_pid,
+        CORE_LIBRARY, Config, FRONTEND_LIBRARY, Manifest, MappedFile, Sharing, find_mapping,
+        hash_libraries, parse_namespace_pid,
     };
 
     fn bundle(label: &str, frontend: &[u8], core: &[u8]) -> Config {
@@ -424,8 +429,8 @@ mod tests {
             "1cf387c012cd2d02f1923e589f86df4a4802427057dbc90f47b87f04d29d54bc"
         );
         assert_eq!(
-            hashes[CORE_LIBRARY],
-            Sha256Digest(<sha2::Sha256 as sha2::Digest>::digest(b"core").into())
+            hex::encode(hashes[CORE_LIBRARY].0),
+            "0d45f5fd462b8c70bffb10021ac1bcff3f58f29b1faf7568595095427d42812c"
         );
     }
 
@@ -462,11 +467,7 @@ mod tests {
         };
         manifest.save(&config.bundle_dir).unwrap();
         let text = std::fs::read_to_string(Manifest::path(&config.bundle_dir)).unwrap();
-        assert!(
-            text.contains(&hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
-                b"core"
-            )))
-        );
+        assert!(text.contains("0d45f5fd462b8c70bffb10021ac1bcff3f58f29b1faf7568595095427d42812c"));
         assert_eq!(Manifest::load(&config.bundle_dir).unwrap(), Some(manifest));
         assert_eq!(Manifest::load(Path::new("/nonexistent")).unwrap(), None);
     }

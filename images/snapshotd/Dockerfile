@@ -10,7 +10,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         autoconf automake libtool rdma-core rdma-core-devel \
         numactl-devel hwloc-devel libaio-devel liburing-devel libstdc++-devel \
         clang clang-devel llvm-devel python3 python3-devel pybind11-devel \
-        curl ca-certificates findutils which xz \
+        curl ca-certificates findutils which xz openssl-devel \
     && dnf clean all
 
 ARG RUST_VERSION=1.100.0
