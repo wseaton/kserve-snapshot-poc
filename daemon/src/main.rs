@@ -2,13 +2,25 @@
 //!
 //! The subcommands are the daemon's building blocks, usable on their own from
 //! a privileged container while the control loop is written.
+#[cfg(feature = "nixl")]
+mod agent;
+mod cri;
 mod cuda;
 mod cuinterpose;
+#[cfg(any(test, feature = "nixl"))]
+mod handshake;
 mod image;
+mod inject;
+mod node;
+mod podresources;
+mod shim;
+mod state;
 #[cfg(feature = "nixl")]
 mod trace;
 #[cfg(feature = "nixl")]
 mod transfer;
+mod uds;
+mod vllm;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,9 +40,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Pull a checkpoint from a replica that has one, then offer this pod's.
+    #[cfg(feature = "nixl")]
+    Agent(agent::Args),
     /// CUDA process checkpoint through the host driver.
     #[command(subcommand)]
     Cuda(CudaCommand),
+    /// Mount a directory into a container's mount namespace.
+    Inject(inject::Args),
+    /// Checkpoint and restore the opted-in pods of this node.
+    Node(node::Args),
+    /// Run as PID 1 of a workload container, under the node daemon.
+    Shim(shim::Args),
     /// cuInterpose shared-memory tracking.
     #[command(subcommand)]
     Cuinterpose(CuinterposeCommand),
@@ -172,9 +193,17 @@ fn raise_open_file_limit() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let command = Cli::parse().command;
+    let command = match Cli::parse().command {
+        Command::Shim(args) => std::process::exit(shim::run(args)?),
+        command => command,
+    };
     raise_open_file_limit()?;
     match command {
+        Command::Shim(_) => Ok(()),
+        Command::Inject(args) => inject::run(&args),
+        Command::Node(args) => node::run_daemon(args),
+        #[cfg(feature = "nixl")]
+        Command::Agent(args) => agent::run(args),
         Command::Cuda(command) => cuda_command(command),
         Command::Cuinterpose(command) => cuinterpose_command(command),
         Command::Image(ImageCommand::Hold {

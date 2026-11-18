@@ -32,7 +32,8 @@ use nixl_sys::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::image::{self, Arena, Extent, HugeRegion, huge_page_fraction};
+use crate::image::{self, Arena, Extent, HugeRegion, Store, huge_page_fraction};
+use crate::state::ensure_room;
 use crate::trace::{self, FILE_TRACKS, Trace};
 use walkdir::WalkDir;
 
@@ -259,6 +260,12 @@ fn add(nanos: &AtomicU64, since: Instant) {
 
 /// Send every file under `dir` to a receiver listening at `to`.
 pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
+    let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
+    send_over(stream, dir, pool, trace)
+}
+
+/// Send every file under `dir` to the receiver at the other end of `stream`.
+pub fn send_over(stream: TcpStream, dir: &Path, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
     let trace = Trace::new(trace, "sender");
     let files = list_files(dir)?;
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -278,7 +285,6 @@ pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) 
 
     let endpoint = Endpoint::new(SENDER, pool)?;
     let slots = endpoint.slots();
-    let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let stream = Mutex::new(stream);
@@ -682,20 +688,47 @@ pub fn receive_directory(
     hold: Hold,
     trace: Option<PathBuf>,
 ) -> Result<()> {
-    let trace = Trace::new(trace, "receiver");
-    let written = AtomicU64::new(0);
     let reserve = Instant::now();
     let arena = hold
         .hold
         .then(|| Arena::new(hold.segment_gib << 30, hold.reserve_gib << 30))
         .transpose()?;
     let reserve_s = reserve.elapsed().as_secs_f64();
-    let names = Mutex::new(Vec::<String>::new());
-    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let listener = TcpListener::bind(listen).with_context(|| format!("listen on {listen}"))?;
     println!("listening on {}", listener.local_addr()?);
-    let (stream, from) = listener.accept().context("accept the sender")?;
+    let (stream, _) = listener.accept().context("accept the sender")?;
     drop(listener);
+    let Some(store) = receive_over(stream, dir, direct, hold.mmap, arena, trace)? else {
+        return Ok(());
+    };
+    println!(
+        "HOLD {}",
+        serde_json::json!({
+            "gb": store.manifest.bytes() as f64 / 1e9,
+            "files": store.manifest.files.len(),
+            "segments": store.segments.len(),
+            "reserve_s": reserve_s,
+            "huge_page_fraction": huge_page_fraction(&store.ranges()),
+        })
+    );
+    image::serve_forever(&store, &image::serve_socket(dir)?)
+}
+
+/// Write what the sender at the other end of `stream` sends under `dir`, or
+/// into `arena` when there is one; the held image is returned then.
+pub fn receive_over(
+    stream: TcpStream,
+    dir: &Path,
+    direct: bool,
+    mapped: bool,
+    arena: Option<Arena>,
+    trace: Option<PathBuf>,
+) -> Result<Option<Store>> {
+    let trace = Trace::new(trace, "receiver");
+    let written = AtomicU64::new(0);
+    let names = Mutex::new(Vec::<String>::new());
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let from = stream.peer_addr().context("the sender's address")?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let stream = Arc::new(Mutex::new(stream));
@@ -707,6 +740,7 @@ pub fn receive_directory(
     else {
         bail!("{from} did not start with Hello");
     };
+    ensure_room(dir, files.iter().map(|entry| entry.size).sum())?;
     let handles = files
         .iter()
         .map(|entry| {
@@ -810,7 +844,7 @@ pub fn receive_directory(
                         Destination::Memory(Mutex::new(BTreeMap::new()))
                     } else {
                         let created = Destination::create(dir, &path, None, direct)?;
-                        if hold.mmap { created.mapped() } else { created }
+                        if mapped { created.mapped() } else { created }
                     });
                     names
                         .lock()
@@ -863,19 +897,7 @@ pub fn receive_directory(
         },
     )?;
     trace.write()?;
-    let Some(arena) = arena else { return Ok(()) };
-    let store = arena.finish(held)?;
-    println!(
-        "HOLD {}",
-        serde_json::json!({
-            "gb": store.manifest.bytes() as f64 / 1e9,
-            "files": store.manifest.files.len(),
-            "segments": store.segments.len(),
-            "reserve_s": reserve_s,
-            "huge_page_fraction": huge_page_fraction(&store.ranges()),
-        })
-    );
-    image::serve_forever(&store, &image::serve_socket(dir)?)
+    arena.map(|arena| arena.finish(held)).transpose()
 }
 
 /// Take one `criu dump --stream` and send it to a receiver as it arrives:

@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snapshot-serve
+  labels:
+    app: snapshot-serve
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: snapshot-serve
+  template:
+    metadata:
+      labels:
+        app: snapshot-serve
+        snapshot.llm-d.ai/workload: snapshot-serve
+    spec:
+      initContainers:
+        - name: snapshot-tools
+          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          command:
+            - cp
+            - /opt/snapshotd/bin/snapshotd
+            - /opt/snapshotd/exp/noiouring.py
+            - /snapshot-tools/
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: snapshot-tools
+              mountPath: /snapshot-tools
+      containers:
+        - name: main
+          image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+          command:
+            - /snapshot-tools/snapshotd
+            - shim
+            - --
+            - python3
+            - /snapshot-tools/noiouring.py
+            - vllm
+            - serve
+            - /models/Qwen3-8B
+            - --served-model-name=qwen3-8b
+            - --enable-sleep-mode
+            - --host=0.0.0.0
+            - --port=8000
+            - --grpc-port=50051
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: control
+              containerPort: 50051
+            - name: ready
+              containerPort: 8001
+          readinessProbe:
+            tcpSocket:
+              port: ready
+            periodSeconds: 2
+          env:
+            - name: VLLM_USE_RUST_FRONTEND
+              value: "1"
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: spawn
+            - name: VLLM_HOST_IP
+              value: 127.0.0.1
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: XDG_CACHE_HOME
+              value: /compile-cache/xdg
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /compile-cache/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /compile-cache/triton
+            - name: CUDA_CACHE_PATH
+              value: /compile-cache/cuda
+            - name: DG_JIT_CACHE_DIR
+              value: /compile-cache/deepgemm
+            - name: FLASHINFER_WORKSPACE_BASE
+              value: /compile-cache/flashinfer
+            - name: VLLM_CACHE_ROOT
+              value: /compile-cache/vllm
+            - name: TILELANG_CACHE_DIR
+              value: /compile-cache/tilelang
+            - name: PYTORCH_ALLOC_CONF
+              value: pinned_max_round_threshold_mb:1,pinned_max_cached_size_mb:1
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: snapshot-tools
+              mountPath: /snapshot-tools
+            - name: models
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+            - name: dshm
+              mountPath: /compile-cache
+              subPath: compile-cache
+      volumes:
+        - name: snapshot-tools
+          emptyDir: {}
+        - name: models
+          persistentVolumeClaim:
+            claimName: snapshot-bench-models
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

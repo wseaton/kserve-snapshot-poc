@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshotd
+  labels:
+    app: snapshotd
+spec:
+  selector:
+    matchLabels:
+      app: snapshotd
+  template:
+    metadata:
+      labels:
+        app: snapshotd
+    spec:
+      hostPID: true
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers:
+        - name: tools
+          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+          command: [cp, -a, /snapshot-binaries/., /tools/]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+      containers:
+        - name: snapshotd
+          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          command: [snapshotd, node]
+          args:
+            - --store-dir=/store
+            - --tools-dir=/tools
+          securityContext:
+            privileged: true
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+            - name: store
+              mountPath: /store
+            - name: runtime
+              mountPath: /run/containerd
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+      volumes:
+        - name: tools
+          emptyDir: {}
+        - name: store
+          hostPath:
+            path: /var/lib/snapshotd
+            type: DirectoryOrCreate
+        - name: runtime
+          hostPath:
+            path: /run/containerd
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
