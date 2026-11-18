@@ -1,0 +1,48 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: snapshotd-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: snapshotd-peers-ca
+spec:
+  isCA: true
+  commonName: snapshotd-peers-ca
+  secretName: snapshotd-peers-ca
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: snapshotd-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: snapshotd-peers
+spec:
+  ca:
+    secretName: snapshotd-peers-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: snapshotd-peers
+spec:
+  secretName: snapshotd-peers-tls
+  dnsNames:
+    - snapshotd-peers
+  usages:
+    - server auth
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: snapshotd-peers
+    kind: Issuer

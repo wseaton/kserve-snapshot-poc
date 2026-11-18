@@ -13,8 +13,6 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, ensure};
 
-/// One revision of one workload, named `<namespace>/<workload>/<hash>` on
-/// the wire and laid out the same way under the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevisionKey {
     namespace: String,
@@ -23,8 +21,6 @@ pub struct RevisionKey {
 }
 
 impl RevisionKey {
-    /// The parts become directory names and may come from a peer, so each is
-    /// one plain path component.
     pub fn new(namespace: &str, workload: &str, hash: &str) -> Result<Self> {
         for part in [namespace, workload, hash] {
             ensure!(
@@ -50,7 +46,6 @@ impl RevisionKey {
             .join(&self.hash)
     }
 
-    /// Where `store` keeps this revision's published checkpoint.
     #[cfg(any(test, feature = "nixl"))]
     pub fn image_dir(&self, store: &Path) -> PathBuf {
         self.dir(store).join("image")
@@ -75,7 +70,6 @@ impl fmt::Display for RevisionKey {
     }
 }
 
-/// Fail unless the filesystem holding `dir` has `bytes` free.
 pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
     let stat = rustix::fs::statvfs(dir).with_context(|| format!("stat {}", dir.display()))?;
     let free = stat.f_bavail.saturating_mul(stat.f_frsize);
@@ -87,7 +81,7 @@ pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-/// The bytes of every file under `dir`; what cannot be read counts as nothing.
+/// What cannot be read counts as nothing.
 pub fn directory_bytes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -102,8 +96,6 @@ pub fn directory_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
-/// One revision's directory, as one pod of that revision uses it.
-#[derive(Clone)]
 pub struct RevisionStore {
     dir: PathBuf,
     staging: PathBuf,
@@ -129,7 +121,6 @@ impl RevisionStore {
         self.image_dir().is_dir()
     }
 
-    /// Where this pod builds a checkpoint before publishing it.
     pub fn staging_dir(&self) -> &Path {
         &self.staging
     }
@@ -138,7 +129,6 @@ impl RevisionStore {
         ensure_room(&self.dir, bytes)
     }
 
-    /// Remove what an unfinished capture or pull left behind.
     pub fn clear_staging(&self) -> Result<()> {
         match fs::remove_dir_all(&self.staging) {
             Err(error) if error.kind() != ErrorKind::NotFound => {
@@ -148,9 +138,7 @@ impl RevisionStore {
         }
     }
 
-    /// Make the finished staging directory the node's image of this
-    /// revision. If another pod published one first, that one stays and this
-    /// one is dropped.
+    /// If another pod published first, that image stays and this one is dropped.
     pub fn publish(&self) -> Result<()> {
         match fs::rename(&self.staging, self.image_dir()) {
             Ok(()) => Ok(()),
@@ -159,7 +147,6 @@ impl RevisionStore {
         }
     }
 
-    /// Whether a checkpoint or restore already failed in this pod.
     pub fn failed_before(&self) -> bool {
         self.failure.exists()
     }

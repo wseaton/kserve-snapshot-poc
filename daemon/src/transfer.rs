@@ -11,13 +11,15 @@
 //! A slot carries one chunk of one file at a time: a sender worker reads the
 //! chunk into its slot, the NIXL thread writes it into the receiver's slot of
 //! the same index, and the receiver writes it to disk and acknowledges, which
-//! frees the slot on both sides. Control messages are JSON lines on one TCP
-//! connection.
+//! frees the slot on both sides. Control messages are JSON lines on one
+//! connection. Given a key, the sender encrypts each chunk in its slot and the
+//! receiver decrypts it there.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -33,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::image::{self, Arena, Extent, HugeRegion, Store, huge_page_fraction};
+use crate::seal::{Place, Seal, TransferKey};
 use crate::store::ensure_room;
 use crate::trace::{self, FILE_TRACKS, Trace};
 use walkdir::WalkDir;
@@ -40,6 +43,7 @@ use walkdir::WalkDir;
 const BACKEND: &str = "UCX";
 const RECEIVER: &str = "snapshotd-receive";
 const SENDER: &str = "snapshotd-send";
+const HUGE_PAGE: u64 = 2 << 20;
 
 /// How the registered region is cut up.
 #[derive(Clone, Copy, Debug, clap::Args, Serialize, Deserialize)]
@@ -55,6 +59,23 @@ pub struct Pool {
 impl Pool {
     fn slot_bytes(self) -> usize {
         self.slot_mib << 20
+    }
+
+    /// This pool, no larger than `files` can use.
+    fn fitted(self, files: &[FileEntry]) -> Self {
+        let largest = files.iter().map(|file| file.size).max().unwrap_or(0);
+        let slot_mib = self
+            .slot_mib
+            .min((largest.div_ceil(HUGE_PAGE) * (HUGE_PAGE >> 20)) as usize)
+            .max((HUGE_PAGE >> 20) as usize);
+        let chunks: u64 = files
+            .iter()
+            .map(|file| file.size.div_ceil((slot_mib as u64) << 20))
+            .sum();
+        Self {
+            slots: self.slots.min(chunks as usize).max(1),
+            slot_mib,
+        }
     }
 }
 
@@ -88,6 +109,8 @@ enum Message {
         file: usize,
         offset: u64,
         len: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seal: Option<Seal>,
     },
     Ack {
         slot: usize,
@@ -99,7 +122,32 @@ enum Message {
     },
 }
 
-fn send(stream: &Mutex<TcpStream>, message: &Message) -> Result<()> {
+pub trait Control: Read + Write + Send + Sized {
+    fn try_clone(&self) -> std::io::Result<Self>;
+    fn close(&self);
+}
+
+impl Control for TcpStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+impl Control for UnixStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+fn send(stream: &Mutex<impl Write>, message: &Message) -> Result<()> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     stream
@@ -250,6 +298,16 @@ struct Job {
     len: usize,
 }
 
+impl Job {
+    fn place(self) -> Place {
+        Place {
+            file: self.file,
+            offset: self.offset,
+            len: self.len,
+        }
+    }
+}
+
 fn seconds(nanos: &AtomicU64) -> f64 {
     nanos.load(Ordering::Relaxed) as f64 / 1e9
 }
@@ -258,23 +316,24 @@ fn add(nanos: &AtomicU64, since: Instant) {
     nanos.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// Send every file under `dir` to a receiver listening at `to`.
 pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
     let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
-    println!("TRANSFER {}", send_over(stream, dir, pool, trace)?);
+    stream.set_nodelay(true)?;
+    println!("TRANSFER {}", send_over(stream, dir, pool, None, trace)?);
     Ok(())
 }
 
-/// Send every file under `dir` to the receiver at the other end of `stream`,
-/// and return how the transfer went.
+/// Chunks are sealed with `key` when there is one. Returns how the transfer went.
 pub fn send_over(
-    stream: TcpStream,
+    stream: impl Control,
     dir: &Path,
     pool: Pool,
+    key: Option<&TransferKey>,
     trace: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
     let trace = Trace::new(trace, "sender");
     let files = list_files(dir)?;
+    let pool = pool.fitted(&files);
     let total: u64 = files.iter().map(|f| f.size).sum();
     let handles: Vec<File> = files
         .iter()
@@ -292,7 +351,6 @@ pub fn send_over(
 
     let endpoint = Endpoint::new(SENDER, pool)?;
     let slots = endpoint.slots();
-    stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let stream = Mutex::new(stream);
     send(
@@ -323,6 +381,7 @@ pub fn send_over(
     let jobs = Mutex::new(jobs.into_iter());
     let read_ns = AtomicU64::new(0);
     let rdma_ns = AtomicU64::new(0);
+    let sealed = AtomicU64::new(0);
     let (post_tx, post_rx) = mpsc::channel::<(usize, usize)>();
     let mut written_tx = Vec::new();
     let mut ack_tx = Vec::new();
@@ -359,7 +418,7 @@ pub fn send_over(
             .map(|(slot, (written, acked))| {
                 let (jobs, handles, stream, post_tx) = (&jobs, &handles, &stream, post_tx.clone());
                 let trace = &trace;
-                let (read_ns, rdma_ns) = (&read_ns, &rdma_ns);
+                let (read_ns, rdma_ns, sealed) = (&read_ns, &rdma_ns, &sealed);
                 scope.spawn(move || -> Result<()> {
                     loop {
                         let next = jobs
@@ -375,6 +434,12 @@ pub fn send_over(
                         handles[job.file]
                             .read_exact_at(buffer, job.offset)
                             .with_context(|| format!("read file {} at {}", job.file, job.offset))?;
+                        let seal = key
+                            .map(|key| {
+                                let counter = sealed.fetch_add(1, Ordering::Relaxed);
+                                key.seal(counter, job.place(), buffer)
+                            })
+                            .transpose()?;
                         add(read_ns, read);
                         let args =
                             json!({ "file": job.file, "offset": job.offset, "bytes": job.len });
@@ -397,6 +462,7 @@ pub fn send_over(
                                 file: job.file,
                                 offset: job.offset,
                                 len: job.len,
+                                seal,
                             },
                         )?;
                         acked
@@ -684,7 +750,6 @@ pub struct Hold {
     pub segment_gib: usize,
 }
 
-/// Accept one sender on `listen` and write what it sends under `dir`.
 pub fn receive_directory(
     dir: &Path,
     listen: &str,
@@ -702,7 +767,8 @@ pub fn receive_directory(
     println!("listening on {}", listener.local_addr()?);
     let (stream, _) = listener.accept().context("accept the sender")?;
     drop(listener);
-    let Some(store) = receive_over(stream, dir, direct, hold.mmap, arena, trace)? else {
+    stream.set_nodelay(true)?;
+    let Some(store) = receive_over(stream, dir, direct, hold.mmap, arena, None, trace)? else {
         return Ok(());
     };
     println!(
@@ -719,21 +785,21 @@ pub fn receive_directory(
 }
 
 /// Write what the sender at the other end of `stream` sends under `dir`, or
-/// into `arena` when there is one; the held image is returned then.
+/// into `arena` when there is one; the held image is returned then. With a
+/// `key`, every chunk must have been sealed with it.
 pub fn receive_over(
-    stream: TcpStream,
+    stream: impl Control,
     dir: &Path,
     direct: bool,
     mapped: bool,
     arena: Option<Arena>,
+    key: Option<&TransferKey>,
     trace: Option<PathBuf>,
 ) -> Result<Option<Store>> {
     let trace = Trace::new(trace, "receiver");
     let written = AtomicU64::new(0);
     let names = Mutex::new(Vec::<String>::new());
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let from = stream.peer_addr().context("the sender's address")?;
-    stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let stream = Arc::new(Mutex::new(stream));
     let Message::Hello {
@@ -742,7 +808,7 @@ pub fn receive_over(
         files,
     } = receive(&mut reader)?
     else {
-        bail!("{from} did not start with Hello");
+        bail!("the sender did not start with Hello");
     };
     ensure_room(dir, files.iter().map(|entry| entry.size).sum())?;
     let handles = files
@@ -780,18 +846,24 @@ pub fn receive_over(
         let mut writers = Vec::new();
         let mut queues = Vec::new();
         for slot in 0..pool.slots {
-            let (tx, rx) = mpsc::channel::<Job>();
+            let (tx, rx) = mpsc::channel::<(Job, Option<Seal>)>();
             queues.push(tx);
             let (destination, stream, write_ns) = (&destination, Arc::clone(&stream), &write_ns);
             let (trace, written, arena) = (&trace, &written, arena.as_ref());
             writers.push(scope.spawn(move || -> Result<()> {
                 let run = || -> Result<()> {
-                    for job in rx {
+                    for (job, seal) in rx {
                         let write = Instant::now();
                         let write_at = trace::now();
                         // SAFETY: the sender does not reuse a slot before its
                         // acknowledgement, so nothing else touches it now.
                         let buffer = unsafe { slots.slice_mut(slot, job.len) };
+                        match (key, seal) {
+                            (Some(key), Some(seal)) => key.open(&seal, job.place(), buffer)?,
+                            (Some(_), None) => bail!("the sender did not seal a chunk"),
+                            (None, Some(_)) => bail!("a sealed chunk and no key to open it"),
+                            (None, None) => {}
+                        }
                         destination(job.file)?
                             .write(buffer, job.offset, arena)
                             .with_context(|| {
@@ -822,7 +894,7 @@ pub fn receive_over(
                 {
                     // The sender waits for an acknowledgement that will not
                     // come; closing the connection tells it.
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.close();
                 }
                 outcome
             }));
@@ -834,13 +906,14 @@ pub fn receive_over(
                     file,
                     offset,
                     len,
+                    seal,
                 } => {
                     ensure!(
                         slot < pool.slots && len <= pool.slot_bytes(),
                         "chunk out of range"
                     );
                     queues[slot]
-                        .send(Job { file, offset, len })
+                        .send((Job { file, offset, len }, seal))
                         .map_err(|_| anyhow!("the writer for slot {slot} stopped"))?;
                 }
                 Message::Open { file, path } => {
@@ -1062,6 +1135,7 @@ pub fn stream_capture(
                                     file,
                                     offset,
                                     len: filled,
+                                    seal: None,
                                 },
                             )?;
                             trace.counter(

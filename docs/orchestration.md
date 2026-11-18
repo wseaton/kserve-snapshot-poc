@@ -18,7 +18,7 @@ flowchart LR
       SA["snapshotd shim<br/>PID 1, readiness port"]
       VA["vLLM<br/>HTTP :8000, gRPC control :50051"]
     end
-    DA["snapshotd pod<br/>DaemonSet, privileged, hostPID"]
+    DA["snapshotd pod<br/>DaemonSet, privileged, hostPID<br/>kube-rbac-proxy sidecar"]
     STA[("checkpoint store<br/>node data disk")]
     RA["CRI socket<br/>kubelet PodResources socket"]
     DA -- "shim.sock through /proc/PID/root" --> SA
@@ -35,7 +35,7 @@ flowchart LR
     DB --> WB
     DB <--> STB
   end
-  DA <-- "authenticated pull over NIXL<br/>headless Service" --> DB
+  DA <-- "pull through kube-rbac-proxy: TLS, ServiceAccount token<br/>encrypted chunks over NIXL" --> DB
   K["kubelet"] -- "TCP readiness probe" --> SA
   C["clients, through the Service"] --> VA
 ```
@@ -48,7 +48,7 @@ The example is [daemon/deploy/workload](../daemon/deploy/workload).
 ## Trying it
 
 ```bash
-kubectl apply -k deploy/snapshotd/node       # the DaemonSet; set its store path for the cluster first
+kubectl apply -k deploy/snapshotd/node       # the DaemonSet; needs cert-manager; set its store path first
 kubectl apply -k deploy/snapshotd/workload   # an example Deployment, Qwen3-8B
 daemon/e2e/run.sh                            # the whole flow on kind, no GPU, a stand-in for vLLM
 ```
@@ -73,8 +73,51 @@ For every pod on its node that carries the label `snapshot.llm-d.ai/workload`:
 4. If a checkpoint or restore fails, the container exits, starts over, and cold boots with no
    second attempt.
 
-Nothing talks to the Kubernetes API. There is no custom resource, webhook, controller or
-scheduling gate.
+The daemon does not talk to the Kubernetes API. There is no custom resource, webhook, controller
+or scheduling gate.
+
+## Checkpoints between nodes
+
+With the `peers` component ([daemon/deploy/components/peers](../daemon/deploy/components/peers)) a
+daemon whose node lacks a revision's checkpoint asks the daemons of the other nodes for it before
+it lets the pod cold boot.
+
+```mermaid
+sequenceDiagram
+  participant A as snapshotd, node B (asks)
+  participant P as kube-rbac-proxy, node A
+  participant K as API server
+  participant H as snapshotd, node A (holds)
+  A->>P: TLS, checked against the peers' CA
+  A->>P: GET /v1/checkpoints/ns/workload/hash, ServiceAccount token, Upgrade
+  P->>K: TokenReview, SubjectAccessReview
+  K-->>P: snapshotd may get that path
+  P->>H: the request, on localhost
+  H-->>A: 101, then a key made for this transfer
+  H->>A: control messages, through the proxy
+  H-->>A: chunks over NIXL (RDMA or TCP), each sealed with the key
+```
+
+- Each daemon listens on localhost only. What other pods can reach is the
+  [kube-rbac-proxy](https://github.com/brancz/kube-rbac-proxy) in its pod, which has the API server
+  verify the caller's token and check that its ServiceAccount may `get` the path, and forwards the
+  request only then. The token is a projected one: bound to the pod, valid for ten minutes, and
+  accepted only for the audience `snapshotd-peers`.
+- The asking daemon sends its token only after it has verified the proxy's certificate against a
+  CA that cert-manager keeps for the DaemonSet.
+- The chunks do not go through the proxy. They go over NIXL, which authenticates nothing, so the
+  holder makes an AES-256-GCM key for each transfer, hands it over on the proxied connection, and
+  both sides encrypt and decrypt each chunk in its registered buffer. A chunk's file, offset and
+  length are authenticated with it.
+
+Qwen3-8B at TP=1 on H200, one replica scaled to four by KEDA over two nodes: the new replica on
+the node that held the checkpoint was Ready 9 s after its pod was created, and the two on the other
+node after 20 s and 22 s. Each of those pulled the 4.5 GiB checkpoint in 5.8 s, one after the
+other, and restored in 5 to 8 s. A request loop against the Service got only 200s throughout.
+
+Who may pull is then a matter of RBAC: the `snapshotd-peers` ClusterRole, bound to the DaemonSet's
+ServiceAccount. Every daemon runs as that one account, so the proxy tells a daemon of this cluster
+from anything else, not one node's daemon from another's.
 
 ## A limit on tensor parallel below a whole node
 
@@ -126,7 +169,7 @@ been run with.
 | Rollouts | A new template is a new revision and is captured again on every node it lands on | Surge capacity while old and new revisions overlap, what a rollback reuses, and whether a rollout of a one-replica service should capture at all, since it only makes that replica slower |
 | Checkpoint storage | One directory per revision on the node's disk. Nothing is ever deleted, and the space is not charged to any pod | Retention and eviction per node, deletion when the workload goes away (the daemon cannot see that without the API), quotas per tenant, and accounting. With weights kept in the checkpoint an image is the size of the model per revision per node |
 | What a checkpoint contains | Process memory, written to the node's disk unencrypted | It can hold whatever the server had in memory: credentials from its environment, request data. Decide on encryption at rest, who may read the store, and whether tenants may share nodes |
-| Trust between nodes | One shared key for every daemon, from a Secret; the control connection is authenticated but not encrypted, and the data path is plain RDMA or TCP | Key distribution and rotation, per-tenant separation, and transport security that matches the cluster's policy |
+| Trust between nodes | A daemon reaches another through its kube-rbac-proxy with a ServiceAccount token, and the chunks are encrypted with a key made per transfer. Every daemon is the same ServiceAccount, and any daemon may pull any revision | An identity per node, so a compromised node cannot ask for revisions it has no pod of: the holder checking that the asking node runs that revision, or node-attested identities. NetworkPolicy around the proxy and NIXL ports |
 | A bad checkpoint | A failed restore is remembered for that pod only. The next pod on the node tries the same checkpoint again | Reject a checkpoint for the whole revision after a failed restore, on every node, and report it |
 | Failure of the daemon | A pod whose daemon dies mid-operation waits; a pod that starts with no daemon cold boots after 30 s | Timeouts on every step, a daemon restart that resumes or cleans up, and upgrades of the DaemonSet that do not strand pods |
 | Observability | The daemon's log and one marker file | Pod conditions and events, restore and capture timings as metrics, and a way to list which nodes hold which revision |

@@ -8,10 +8,6 @@
 //!           cold boot, checkpoint, restore ─────────────────────────────► serving
 //!           cold boot (no room, or it failed here before) ──────────────► serving
 //! ```
-//!
-//! The pod stays unprivileged. The daemon reaches vLLM on its gRPC control
-//! port, the driver's checkpoint API by host PID, and runs CRIU inside the
-//! pod's namespaces with its own tools and the image directory mounted in.
 mod criu;
 mod layout;
 mod log;
@@ -46,7 +42,6 @@ use crate::store::directory_bytes;
 use crate::store::{RevisionKey, RevisionStore};
 use crate::vllm::Control;
 
-/// The label a ReplicaSet puts on its pods; it names their revision.
 const REVISION_LABEL: &str = "pod-template-hash";
 const CONTAINER_WAIT: Duration = Duration::from_secs(600);
 const BOOT: Duration = Duration::from_secs(3600);
@@ -86,19 +81,16 @@ pub struct Args {
     peers: peer::Args,
 }
 
-/// What every pod's task shares.
 struct Node {
     args: Args,
     #[cfg(feature = "nixl")]
     peers: Option<Arc<Peers>>,
 }
 
-/// The node's checkpoint of a pod's revision, as far as that pod is concerned.
 #[derive(Debug, PartialEq, Eq)]
 enum Image {
     Absent,
     Usable,
-    /// There is one and it cannot be restored into this pod.
     Unusable(String),
 }
 
@@ -115,13 +107,10 @@ impl Image {
     }
 }
 
-/// What to do with a pod that has not started its server.
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     Restore,
-    /// Cold boot, and take the revision's checkpoint from this pod.
     Capture,
-    /// Cold boot and nothing more, and why.
     ColdBoot(String),
 }
 
@@ -142,7 +131,6 @@ impl Plan {
     }
 }
 
-/// How a pod came to serve.
 #[derive(Clone, Copy)]
 enum Served {
     StartedEarlier,
@@ -162,7 +150,6 @@ impl fmt::Display for Served {
     }
 }
 
-/// Wait for the pod's server container and return its PID 1.
 async fn container_init(runtime: &mut Runtime, sandbox: &Sandbox, name: &str) -> Result<HostPid> {
     let deadline = Instant::now() + CONTAINER_WAIT;
     loop {
@@ -188,14 +175,13 @@ fn revision_of(sandbox: &Sandbox, label: &str) -> Result<RevisionKey> {
 
 #[cfg(feature = "nixl")]
 async fn pull_from_peers(
-    peers: &Arc<Peers>,
+    peers: &Peers,
     revision: &RevisionKey,
     store: &RevisionStore,
 ) -> Result<()> {
     info!("this node has no checkpoint of the revision; asking the other nodes");
     let asked = Instant::now();
-    let (peers, revision, into) = (Arc::clone(peers), revision.clone(), store.clone());
-    match process::blocking(move || peers.pull(&revision, &into)).await? {
+    match peers.pull(revision, store).await? {
         Some(peer) => info!(
             %peer,
             seconds = %seconds(asked),
@@ -215,10 +201,7 @@ async fn cold_boot(pod: &Pod, shim: &mut ShimClient) -> Result<(PodPid, Control)
     Ok((server, control))
 }
 
-/// Hand a restored server to the shim. If there is none, the server the pod
-/// had is gone or in an unknown state: the container starts over and this
-/// pod does not try again.
-async fn adopt(
+async fn adopt_or_give_up(
     restored: Result<PodPid>,
     pod: &Pod,
     store: &RevisionStore,
@@ -238,7 +221,6 @@ async fn adopt(
     Err(error.context("the container starts over cold"))
 }
 
-/// Get a pod whose server has not started to a running server.
 async fn bring_up(
     node: &Node,
     sandbox: &Sandbox,
@@ -274,7 +256,7 @@ async fn bring_up(
         Plan::Restore => {
             info!("restoring the revision's checkpoint");
             let restored = pod.restore(&store.image_dir()).await;
-            adopt(restored, pod, &store, shim).await?;
+            adopt_or_give_up(restored, pod, &store, shim).await?;
             Ok(Served::Restored)
         }
         Plan::ColdBoot(because) => {
@@ -292,7 +274,7 @@ async fn bring_up(
                 pod.restore(staging).await
             }
             .await;
-            adopt(cycled, pod, &store, shim).await?;
+            adopt_or_give_up(cycled, pod, &store, shim).await?;
             store.publish()?;
             info!(image = %store.image_dir().display(), "checkpoint published on this node");
             Ok(Served::Captured)
@@ -332,7 +314,6 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     Ok(())
 }
 
-/// Look after one pod until it serves, trying again for as long as it fails.
 fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
     let span = info_span!("pod", id = short_id(&sandbox.name));
     tokio::spawn(
@@ -359,7 +340,7 @@ async fn serve(args: Args) -> Result<()> {
     );
     let node = Arc::new(Node {
         #[cfg(feature = "nixl")]
-        peers: Peers::start(&args.peers, &args.store_dir)?,
+        peers: Peers::start(&args.peers, &args.store_dir).await?,
         args,
     });
     let args = &node.args;

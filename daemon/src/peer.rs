@@ -1,41 +1,41 @@
 //! Checkpoints between the daemons of different nodes: answer a peer that
 //! asks for a revision this node holds, and ask peers for one it lacks.
-//!
-//! Peers are the addresses one DNS name resolves to, a headless Service over
-//! the DaemonSet. A revision is named `<namespace>/<workload>/<hash>`, the
-//! same path it has under each node's store.
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
-use crate::handshake::{self, Key, Refusal, Revision};
 use crate::store::{RevisionKey, RevisionStore, directory_bytes};
 use crate::transfer::{self, Pool};
+use crate::tunnel::{self, Identity, Refusal, Tunnel, Work};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const BUSY_RETRY: Duration = Duration::from_secs(2);
 const BUSY_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Name and port that resolve to the daemons of the other nodes. Without
-    /// it, checkpoints stay on the node that took them.
-    #[arg(long, requires_all = ["own_ip", "key_file"])]
+    /// Name and port that resolve to the kube-rbac-proxy of every node's
+    /// daemon. Without it, checkpoints stay on the node that took them.
+    #[arg(long, requires_all = ["own_ip", "peer_ca_file"])]
     peers: Option<String>,
-    /// Where peers ask this daemon for checkpoints.
-    #[arg(long, default_value = "0.0.0.0:7700")]
-    peer_listen: String,
+    /// Where this daemon answers its own kube-rbac-proxy.
+    #[arg(long, default_value = "127.0.0.1:7700")]
+    peer_listen: SocketAddr,
     /// This daemon's address, left out of the peers.
     #[arg(long)]
     own_ip: Option<IpAddr>,
-    /// File holding the key the daemons share.
+    /// The ServiceAccount token this daemon shows its peers.
+    #[arg(long, default_value = "/var/run/secrets/snapshotd/peers/token")]
+    peer_token_file: PathBuf,
+    /// The authority that signs the certificate of the peers' proxies.
     #[arg(long)]
-    key_file: Option<PathBuf>,
+    peer_ca_file: Option<PathBuf>,
     #[command(flatten)]
     pool: Pool,
 }
@@ -43,94 +43,72 @@ pub struct Args {
 pub struct Peers {
     name: String,
     own_ip: IpAddr,
-    key: Key,
+    identity: Identity,
     store: PathBuf,
     pool: Pool,
-    sending: Mutex<()>,
-}
-
-fn bound(stream: &TcpStream, limit: Option<Duration>) -> Result<()> {
-    stream.set_read_timeout(limit)?;
-    stream.set_write_timeout(limit)?;
-    Ok(())
+    sending: Arc<Semaphore>,
 }
 
 impl Peers {
-    /// Start answering peers, if the daemon was told about any.
-    pub fn start(args: &Args, store: &Path) -> Result<Option<Arc<Self>>> {
-        let (Some(name), Some(own_ip), Some(key_file)) = (&args.peers, args.own_ip, &args.key_file)
+    pub async fn start(args: &Args, store: &Path) -> Result<Option<Arc<Self>>> {
+        let (Some(name), Some(own_ip), Some(ca_file)) =
+            (&args.peers, args.own_ip, &args.peer_ca_file)
         else {
             return Ok(None);
         };
         let peers = Arc::new(Self {
             name: name.clone(),
             own_ip,
-            key: Key::load(key_file)?,
+            identity: Identity {
+                token_file: args.peer_token_file.clone(),
+                ca_file: ca_file.clone(),
+                server_name: tunnel::host(name)?.to_string(),
+            },
             store: store.to_path_buf(),
             pool: args.pool,
-            sending: Mutex::new(()),
+            sending: Arc::new(Semaphore::new(1)),
         });
-        let listener = TcpListener::bind(&args.peer_listen)
+        let listener = TcpListener::bind(args.peer_listen)
+            .await
             .with_context(|| format!("listen on {}", args.peer_listen))?;
-        info!(address = %listener.local_addr()?, name = %name, "answering peers");
-        let answering = Arc::clone(&peers);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let peers = Arc::clone(&answering);
-                        std::thread::spawn(move || {
-                            let peer = stream.peer_addr();
-                            if let Err(error) = peers.answer(stream) {
-                                warn!(?peer, error = %format_args!("{error:#}"), "peer request failed");
-                            }
-                        });
-                    }
-                    Err(error) => warn!(%error, "could not accept a peer"),
-                }
-            }
-        });
+        info!(address = %args.peer_listen, name = %name, "answering peers");
+        let holder = Arc::clone(&peers);
+        tokio::spawn(tunnel::serve(listener, move |revision: &RevisionKey| {
+            holder.admit(revision)
+        }));
         Ok(Some(peers))
     }
 
-    fn answer(&self, mut stream: TcpStream) -> Result<()> {
-        let peer = stream.peer_addr()?;
-        bound(&stream, Some(HANDSHAKE_TIMEOUT))?;
-        let asked = handshake::authenticate(&mut stream, &self.key)?;
-        let image = asked
-            .to_string()
-            .parse::<RevisionKey>()
-            .map(|revision| revision.image_dir(&self.store));
-        let turn = self.sending.try_lock();
-        let verdict = match &image {
-            Ok(image) if image.is_dir() && turn.is_ok() => Ok(()),
-            Ok(image) if image.is_dir() => Err(Refusal::Busy),
-            _ => Err(Refusal::NoImage),
-        };
-        handshake::answer(&mut stream, verdict)?;
-        let (Ok(()), Ok(image)) = (verdict, image) else {
-            return Ok(());
-        };
-        bound(&stream, None)?;
-        let start = Instant::now();
-        transfer::send_over(stream, &image, self.pool, None)?;
-        let (seconds, bytes) = (
-            start.elapsed().as_secs_f64(),
-            directory_bytes(&image) as f64,
-        );
-        info!(
-            revision = %asked,
-            %peer,
-            seconds = %format_args!("{seconds:.2}"),
-            gb = %format_args!("{:.1}", bytes / 1e9),
-            gbit_per_s = %format_args!("{:.1}", bytes * 8.0 / 1e9 / seconds),
-            "sent a checkpoint to a peer"
-        );
-        Ok(())
+    fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
+        let image = revision.image_dir(&self.store);
+        if !image.is_dir() {
+            return Err(Refusal::NoImage);
+        }
+        let turn = Arc::clone(&self.sending)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::Busy)?;
+        let (revision, pool) = (revision.clone(), self.pool);
+        Ok(Box::new(move |tunnel: Tunnel| {
+            let _turn = turn;
+            let start = std::time::Instant::now();
+            transfer::send_over(tunnel.socket, &image, pool, Some(&tunnel.key), None)?;
+            let (seconds, bytes) = (
+                start.elapsed().as_secs_f64(),
+                directory_bytes(&image) as f64,
+            );
+            info!(
+                %revision,
+                seconds = %format_args!("{seconds:.2}"),
+                gb = %format_args!("{:.1}", bytes / 1e9),
+                gbit_per_s = %format_args!("{:.1}", bytes * 8.0 / 1e9 / seconds),
+                "sent a checkpoint to a peer"
+            );
+            Ok(())
+        }))
     }
 
-    fn addresses(&self) -> Vec<SocketAddr> {
-        match self.name.to_socket_addrs() {
+    async fn addresses(&self) -> Vec<SocketAddr> {
+        match tokio::net::lookup_host(&self.name).await {
             Ok(addresses) => {
                 let mut peers: Vec<SocketAddr> =
                     addresses.filter(|a| a.ip() != self.own_ip).collect();
@@ -145,20 +123,24 @@ impl Peers {
         }
     }
 
-    /// Get the checkpoint of `revision` from the first peer that has it and
-    /// publish it in `store`. Returns the peer it came from, if any.
-    pub fn pull(
+    /// Returns the peer the checkpoint came from, if any had it.
+    pub async fn pull(
         &self,
         revision: &RevisionKey,
         store: &RevisionStore,
     ) -> Result<Option<SocketAddr>> {
-        let revision = &Revision::new(revision.to_string())?;
         let deadline = Instant::now() + BUSY_WAIT;
         loop {
             let mut busy = false;
-            for peer in self.addresses() {
+            for peer in self.addresses().await {
                 store.clear_staging()?;
-                match self.pull_from(peer, revision, store) {
+                let staging = store.staging_dir().to_path_buf();
+                let receive = move |tunnel: Tunnel| {
+                    let key = Some(&tunnel.key);
+                    transfer::receive_over(tunnel.socket, &staging, true, false, None, key, None)
+                        .map(drop)
+                };
+                match tunnel::ask(peer, &self.identity, revision, receive).await {
                     Ok(Ok(())) => {
                         store.publish()?;
                         return Ok(Some(peer));
@@ -172,23 +154,7 @@ impl Peers {
             if !busy || Instant::now() >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(BUSY_RETRY);
+            sleep(BUSY_RETRY).await;
         }
-    }
-
-    fn pull_from(
-        &self,
-        peer: SocketAddr,
-        revision: &Revision,
-        store: &RevisionStore,
-    ) -> Result<Result<(), Refusal>> {
-        let mut stream = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT).context("connect")?;
-        bound(&stream, Some(HANDSHAKE_TIMEOUT))?;
-        if let Err(reason) = handshake::ask(&mut stream, &self.key, revision)? {
-            return Ok(Err(reason));
-        }
-        bound(&stream, None)?;
-        transfer::receive_over(stream, store.staging_dir(), true, false, None, None)?;
-        Ok(Ok(()))
     }
 }

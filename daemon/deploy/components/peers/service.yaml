@@ -8,5 +8,5 @@ spec:
     app: snapshotd
   ports:
     - name: peers
-      port: 7700
+      port: 8443
       targetPort: peers

@@ -5,17 +5,15 @@ metadata:
 spec:
   template:
     spec:
+      serviceAccountName: snapshotd
       containers:
         - name: snapshotd
           args:
             - --store-dir=/store
             - --tools-dir=/tools
-            - --peers=snapshotd-peers:7700
+            - --peers=snapshotd-peers:8443
             - --own-ip=$(POD_IP)
-            - --key-file=/etc/snapshot-transfer/key
-          ports:
-            - name: peers
-              containerPort: 7700
+            - --peer-ca-file=/etc/snapshotd/peers/ca.crt
           env:
             - name: POD_IP
               valueFrom:
@@ -26,10 +24,57 @@ spec:
             - name: UCX_TLS
               value: tcp,cuda_copy
           volumeMounts:
-            - name: transfer-key
-              mountPath: /etc/snapshot-transfer
+            - name: peer-token
+              mountPath: /var/run/secrets/snapshotd/peers
+              readOnly: true
+            - name: peer-ca
+              mountPath: /etc/snapshotd/peers
+              readOnly: true
+        - name: kube-rbac-proxy
+          image: quay.io/brancz/kube-rbac-proxy:v0.23.1
+          args:
+            - --secure-listen-address=0.0.0.0:8443
+            - --upstream=http://127.0.0.1:7700/
+            - --auth-token-audiences=snapshotd-peers
+            - --tls-cert-file=/etc/tls/tls.crt
+            - --tls-private-key-file=/etc/tls/tls.key
+          ports:
+            - name: peers
+              containerPort: 8443
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: peer-tls
+              mountPath: /etc/tls
               readOnly: true
       volumes:
-        - name: transfer-key
+        - name: peer-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: snapshotd-peers
+                  expirationSeconds: 600
+                  path: token
+        - name: peer-ca
           secret:
-            secretName: snapshot-transfer-key
+            secretName: snapshotd-peers-tls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: peer-tls
+          secret:
+            secretName: snapshotd-peers-tls
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key

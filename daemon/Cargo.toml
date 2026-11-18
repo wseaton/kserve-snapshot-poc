@@ -15,6 +15,8 @@ clap = { version = "4", features = ["derive"] }
 cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver", "cuda-13000", "dynamic-loading"] }
 cuinterpose-protocol = { git = "https://github.com/ai-dynamo/snapshot", rev = "bc9d2161d2a7f203551e5b7e237defd90b1e9aa1" }
 hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 libloading = "0.9"
@@ -25,6 +27,7 @@ rustix = { version = "1", features = ["fs", "mm", "mount", "net", "pipe", "proce
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-openssl = { version = "0.6", optional = true }
 tonic = "0.14"
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
@@ -33,12 +36,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1.29"
 walkdir = { version = "2", optional = true }
 
+[dev-dependencies]
+tokio-openssl = "0.6"
+
 [build-dependencies]
 protox = "0.10"
 tonic-prost-build = "0.14"
 
 [features]
-nixl = ["dep:nixl-sys", "dep:walkdir"]
+nixl = ["dep:nixl-sys", "dep:tokio-openssl", "dep:walkdir"]
 
 [lints.clippy]
 all = "warn"

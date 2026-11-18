@@ -6,20 +6,22 @@
 mod cri;
 mod cuda;
 mod cuinterpose;
-#[cfg(any(test, feature = "nixl"))]
-mod handshake;
 mod image;
 mod inject;
 mod node;
 #[cfg(feature = "nixl")]
 mod peer;
 mod podresources;
+#[cfg(any(test, feature = "nixl"))]
+mod seal;
 mod shim;
 mod store;
 #[cfg(feature = "nixl")]
 mod trace;
 #[cfg(feature = "nixl")]
 mod transfer;
+#[cfg(any(test, feature = "nixl"))]
+mod tunnel;
 mod uds;
 mod vllm;
 

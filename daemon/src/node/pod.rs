@@ -1,5 +1,3 @@
-//! One workload pod, and the two things the daemon does to it: checkpoint
-//! its server and restore one into it.
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -22,27 +20,22 @@ use crate::shim::SERVER_LOG;
 use crate::store::directory_bytes;
 use crate::vllm::Control;
 
-/// A PID far from the ones a checkpoint holds, for CRIU's own processes.
 const FAR_PID: &str = "4000000";
 const LIFECYCLE: Duration = Duration::from_secs(900);
 const CUDA_LOCK: Duration = Duration::from_secs(60);
 const SERVER_TAIL: usize = 12;
 
 pub struct Pod {
-    /// The pod's PID 1, the shim.
     init: HostPid,
     control: SocketAddr,
-    /// The daemon's directory of criu and cuInterpose.
     tools: PathBuf,
     /// The pod's GPUs, in the driver's order.
     gpus: Vec<Gpu>,
-    /// Every GPU the container can open. More than its own when it is
-    /// privileged; the driver wants a restore map over all of them.
+    /// Every GPU the container can open.
     visible: Vec<GpuUuid>,
 }
 
 impl Pod {
-    /// `allotted` is what the kubelet gave the container.
     pub fn new(
         init: HostPid,
         control: SocketAddr,
@@ -77,7 +70,6 @@ impl Pod {
         self.control.ip()
     }
 
-    /// Where vLLM's gRPC control port is.
     pub fn control(&self) -> SocketAddr {
         self.control
     }
@@ -104,13 +96,10 @@ impl Pod {
         .await
     }
 
-    /// Put criu and cuInterpose where the pod's processes find them. A
-    /// server that preloads cuInterpose needs this before it starts.
     pub async fn mount_tools(&self) -> Result<()> {
         self.mount(&self.tools, TOOLS).await
     }
 
-    /// Log the end of the server's own output, after a failure.
     pub fn log_server_tail(&self) {
         let log = fs::read_to_string(self.init.root(SERVER_LOG)).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
@@ -127,8 +116,6 @@ impl Pod {
         }
     }
 
-    /// The CUDA processes under `server`, as host PIDs; none for a pod
-    /// without GPUs, which needs no driver at all.
     async fn cuda_processes(&self, server: HostPid) -> Result<Vec<i32>> {
         if self.gpus.is_empty() {
             return Ok(Vec::new());
@@ -143,10 +130,6 @@ impl Pod {
         .await
     }
 
-    /// Checkpoint the server `root` into `image`. Once the shim is told to
-    /// release the server it is not coming back except by a restore. The
-    /// control connection is closed before the dump, so CRIU does not carry
-    /// it into the image.
     pub async fn checkpoint(
         &self,
         mut control: Control,
@@ -220,13 +203,14 @@ impl Pod {
         Ok(())
     }
 
-    /// Restore the checkpoint in `image` into this pod and bring vLLM back
-    /// to serving. Returns the server's process.
     pub async fn restore(&self, image: &Path) -> Result<PodPid> {
         let started = Instant::now();
         let manifest = Manifest::load(image)?;
         step("copy shared memory in", async {
-            copy_tree(&image.join("shm"), &self.init.root("/dev/shm")).await?;
+            let shm = image.join("shm");
+            if shm.is_dir() {
+                copy_tree(&shm, &self.init.root("/dev/shm")).await?;
+            }
             fs::copy(image.join("server.log"), self.init.root(SERVER_LOG))
                 .context("put the server's log back")?;
             fs::create_dir_all(self.init.root(WORK)).context("create the work directory")
