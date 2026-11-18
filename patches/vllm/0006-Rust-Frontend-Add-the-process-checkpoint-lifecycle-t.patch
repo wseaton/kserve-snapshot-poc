@@ -1,0 +1,576 @@
+From b3c279b57a69c494a651ac400c1e8dbd8454e8c3 Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Wed, 18 Nov 2026 14:08:47 -0500
+Subject: [PATCH] [Rust Frontend] Add the process checkpoint lifecycle to gRPC
+ Control
+
+The checkpoint lifecycle is reachable only over HTTP, on the inference
+port. An orchestrator that drives vLLM through the gRPC control port
+has no way to prepare a process for a checkpoint or bring it back.
+
+Add CheckpointPrepare, CheckpointRestore and GetCheckpointState to the
+Control service, with the semantics of the /checkpoint routes: preparing
+and restoring are idempotent, and a call the engines cannot honor fails
+with FAILED_PRECONDITION and says why. Like those routes, they need
+sleep mode. An unspecified drain mode means wait, the routes' default.
+
+New methods on the Control server trait break Rust implementers, so
+vllm-proto goes to 0.7.0.
+
+Signed-off-by: Will Eaton <weaton@redhat.com>
+---
+ rust/Cargo.lock                     |   2 +-
+ rust/proto/Cargo.toml               |   2 +-
+ rust/proto/README.md                |   2 +-
+ rust/proto/control.proto            |  40 ++++
+ rust/src/server/src/grpc/control.rs | 102 +++++++++-
+ rust/src/server/src/grpc/tests.rs   | 306 ++++++++++++++++++++++++++++
+ 6 files changed, 450 insertions(+), 4 deletions(-)
+
+diff --git a/rust/Cargo.lock b/rust/Cargo.lock
+index 03246cfbf2..888fcecf06 100644
+--- a/rust/Cargo.lock
++++ b/rust/Cargo.lock
+@@ -5838,7 +5838,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "vllm-proto"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "prost",
+  "prost-types",
+diff --git a/rust/proto/Cargo.toml b/rust/proto/Cargo.toml
+index 11babde435..49b9a6d72d 100644
+--- a/rust/proto/Cargo.toml
++++ b/rust/proto/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "vllm-proto"
+-version = "0.6.0"
++version = "0.7.0"
+ edition.workspace = true
+ license.workspace = true
+ description = "Protobuf messages and gRPC bindings for the vLLM Rust frontend"
+diff --git a/rust/proto/README.md b/rust/proto/README.md
+index d77c301a0a..e105b96884 100644
+--- a/rust/proto/README.md
++++ b/rust/proto/README.md
+@@ -16,7 +16,7 @@ the schemas on pull requests, including on forks.
+ 
+ ```toml
+ [dependencies]
+-vllm-proto = "0.6"
++vllm-proto = "0.7"
+ ```
+ 
+ For example, import `vllm_proto::inference_client::InferenceClient` or
+diff --git a/rust/proto/control.proto b/rust/proto/control.proto
+index 52188ae0df..8e9b39f4c8 100644
+--- a/rust/proto/control.proto
++++ b/rust/proto/control.proto
+@@ -31,6 +31,20 @@ service Control {
+   rpc Sleep (SleepRequest) returns (SleepResponse) {}
+   rpc WakeUp (WakeUpRequest) returns (WakeUpResponse) {}
+   rpc IsSleeping (IsSleepingRequest) returns (IsSleepingResponse) {}
++
++  // Process checkpoint lifecycle. These return FAILED_PRECONDITION unless the
++  // engines were started with sleep mode.
++  //
++  // Start preparing every engine for a process checkpoint: drain, then
++  // release the KV cache and what a checkpoint must not contain. Returns once
++  // started; poll GetCheckpointState until PREPARED. Repeating is a no-op.
++  // FAILED_PRECONDITION if the engines refuse, are restoring, or have failed.
++  rpc CheckpointPrepare (CheckpointPrepareRequest) returns (CheckpointStateResponse) {}
++  // Bring back what preparing released and serve again, in the restored
++  // process or in place. A restore in progress or done succeeds, so callers
++  // may repeat it. FAILED_PRECONDITION while preparing or after a failure.
++  rpc CheckpointRestore (CheckpointRestoreRequest) returns (CheckpointStateResponse) {}
++  rpc GetCheckpointState (GetCheckpointStateRequest) returns (CheckpointStateResponse) {}
+   rpc InitWeightTransferEngine (InitWeightTransferEngineRequest) returns (InitWeightTransferEngineResponse) {}
+   rpc StartWeightUpdate (StartWeightUpdateRequest) returns (StartWeightUpdateResponse) {}
+   rpc StartDraftWeightUpdate (StartDraftWeightUpdateRequest) returns (StartDraftWeightUpdateResponse) {}
+@@ -156,6 +170,32 @@ message WakeUpResponse {}
+ message IsSleepingRequest {}
+ message IsSleepingResponse { bool sleeping = 1; }
+ 
++enum CheckpointState {
++  CHECKPOINT_STATE_UNSPECIFIED = 0;
++  // Serving requests.
++  CHECKPOINT_STATE_RUNNING = 1;
++  // Draining, then releasing what a checkpoint must not contain.
++  CHECKPOINT_STATE_PREPARING = 2;
++  // Safe to capture.
++  CHECKPOINT_STATE_PREPARED = 3;
++  // Bringing back what preparing released.
++  CHECKPOINT_STATE_RESTORING = 4;
++  // Preparing or restoring failed.
++  CHECKPOINT_STATE_FAILED = 5;
++}
++
++message CheckpointPrepareRequest {
++  // How to drain in-flight requests; PAUSE_MODE_UNSPECIFIED means PAUSE_MODE_WAIT.
++  PauseMode mode = 1;
++}
++message CheckpointRestoreRequest {}
++message GetCheckpointStateRequest {}
++message CheckpointStateResponse {
++  CheckpointState state = 1;
++  // Why the lifecycle failed; set only with CHECKPOINT_STATE_FAILED.
++  optional string error = 2;
++}
++
+ // The payloads are backend-specific JSON objects. Tensor data remains on the
+ // configured NCCL, IPC, or sparse-NCCL transport rather than crossing gRPC.
+ message InitWeightTransferEngineRequest { bytes init_info_json = 1; }
+diff --git a/rust/src/server/src/grpc/control.rs b/rust/src/server/src/grpc/control.rs
+index d522c7cc8e..62ee43fc5b 100644
+--- a/rust/src/server/src/grpc/control.rs
++++ b/rust/src/server/src/grpc/control.rs
+@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
+ use tonic::{Code, Request, Response, Status};
+ use vllm_engine_core_client::EngineCoreClient;
+ use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+-use vllm_engine_core_client::protocol::utility::{PauseMode as EnginePauseMode, SleepLevel};
++use vllm_engine_core_client::protocol::utility::{
++    CheckpointState, PauseMode as EnginePauseMode, SleepLevel,
++};
+ 
+ use super::{ControlServer, pb};
+ use crate::config::LoraModulePath;
+@@ -101,6 +103,13 @@ impl ControlServiceImpl {
+         })
+     }
+ 
++    async fn checkpoint_state(&self) -> Result<(CheckpointState, Option<String>), Status> {
++        self.client()
++            .checkpoint_state()
++            .await
++            .map_err(|error| utility_status("checkpoint_state", error))
++    }
++
+     fn require_sleep_mode(&self) -> Result<(), Status> {
+         self.sleep_mode_enabled().then_some(()).ok_or_else(|| {
+             Status::failed_precondition(
+@@ -125,6 +134,37 @@ fn pause_mode(mode: i32) -> Result<EnginePauseMode, Status> {
+     }
+ }
+ 
++fn checkpoint_prepare_mode(mode: i32) -> Result<EnginePauseMode, Status> {
++    match pb::PauseMode::try_from(mode) {
++        Ok(pb::PauseMode::Unspecified) => Ok(EnginePauseMode::Wait),
++        _ => pause_mode(mode),
++    }
++}
++
++fn checkpoint_state_response(
++    state: CheckpointState,
++    error: Option<String>,
++) -> Response<pb::CheckpointStateResponse> {
++    let state = match state {
++        CheckpointState::Running => pb::CheckpointState::Running,
++        CheckpointState::Preparing => pb::CheckpointState::Preparing,
++        CheckpointState::Prepared => pb::CheckpointState::Prepared,
++        CheckpointState::Restoring => pb::CheckpointState::Restoring,
++        CheckpointState::Failed => pb::CheckpointState::Failed,
++    };
++    Response::new(pb::CheckpointStateResponse {
++        state: state.into(),
++        error,
++    })
++}
++
++fn checkpoint_precondition(state: CheckpointState, error: Option<String>) -> Status {
++    Status::failed_precondition(match error {
++        Some(error) => format!("the engines are {state}: {error}"),
++        None => format!("the engines are {state}"),
++    })
++}
++
+ fn json_object(bytes: &[u8], field: &'static str) -> Result<JsonValue, Status> {
+     let value = serde_json::from_slice::<JsonValue>(bytes).map_err(|error| {
+         Status::invalid_argument(format!(
+@@ -417,6 +457,66 @@ impl pb::control_server::Control for ControlServiceImpl {
+         Ok(Response::new(pb::IsSleepingResponse { sleeping }))
+     }
+ 
++    async fn checkpoint_prepare(
++        &self,
++        request: Request<pb::CheckpointPrepareRequest>,
++    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
++        self.require_sleep_mode()?;
++        let mode = checkpoint_prepare_mode(request.into_inner().mode)?;
++        let _guard = self.rl_lock.lock().await;
++        let (mut state, mut error) = self.checkpoint_state().await?;
++        match state {
++            CheckpointState::Running => {
++                if let Some(refusal) = self
++                    .client()
++                    .checkpoint_prepare(mode)
++                    .await
++                    .map_err(|error| utility_status("checkpoint_prepare", error))?
++                {
++                    return Err(Status::failed_precondition(refusal));
++                }
++                (state, error) = self.checkpoint_state().await?;
++            }
++            CheckpointState::Restoring | CheckpointState::Failed => {
++                return Err(checkpoint_precondition(state, error));
++            }
++            CheckpointState::Preparing | CheckpointState::Prepared => {}
++        }
++        Ok(checkpoint_state_response(state, error))
++    }
++
++    async fn checkpoint_restore(
++        &self,
++        _request: Request<pb::CheckpointRestoreRequest>,
++    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
++        self.require_sleep_mode()?;
++        let _guard = self.rl_lock.lock().await;
++        let (mut state, mut error) = self.checkpoint_state().await?;
++        match state {
++            CheckpointState::Preparing | CheckpointState::Failed => {
++                return Err(checkpoint_precondition(state, error));
++            }
++            CheckpointState::Prepared => {
++                self.client()
++                    .checkpoint_restore()
++                    .await
++                    .map_err(|error| utility_status("checkpoint_restore", error))?;
++                (state, error) = self.checkpoint_state().await?;
++            }
++            CheckpointState::Running | CheckpointState::Restoring => {}
++        }
++        Ok(checkpoint_state_response(state, error))
++    }
++
++    async fn get_checkpoint_state(
++        &self,
++        _request: Request<pb::GetCheckpointStateRequest>,
++    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
++        self.require_sleep_mode()?;
++        let (state, error) = self.checkpoint_state().await?;
++        Ok(checkpoint_state_response(state, error))
++    }
++
+     async fn init_weight_transfer_engine(
+         &self,
+         request: Request<pb::InitWeightTransferEngineRequest>,
+diff --git a/rust/src/server/src/grpc/tests.rs b/rust/src/server/src/grpc/tests.rs
+index 8bef76463d..f2eb3ffe68 100644
+--- a/rust/src/server/src/grpc/tests.rs
++++ b/rust/src/server/src/grpc/tests.rs
+@@ -2965,3 +2965,309 @@ async fn grpc_pause_withdraws_readiness_but_not_liveness() {
+ 
+     server_task.abort();
+ }
++
++/// What [`serve_checkpoint_engine`] starts as and how it answers a prepare.
++struct CheckpointEngine {
++    state: &'static str,
++    error: Option<&'static str>,
++    refusal: Option<&'static str>,
++}
++
++/// Serve the checkpoint lifecycle as one engine, in whatever order the client
++/// asks, until `stop` fires. Preparing completes at once; `modes` records the
++/// drain mode of each prepare.
++async fn serve_checkpoint_engine(
++    dealer: &mut DealerSocket,
++    push: &mut PushSocket,
++    mut engine: CheckpointEngine,
++    modes: Arc<std::sync::Mutex<Vec<String>>>,
++    mut stop: tokio::sync::oneshot::Receiver<()>,
++) {
++    loop {
++        let utility = tokio::select! {
++            utility = recv_engine_message(dealer) => utility,
++            _ = &mut stop => return,
++        };
++        assert_eq!(utility[0].as_ref(), &[0x03]);
++        let payload = decode_value(&utility[1]).expect("decode utility payload");
++        let fields = payload.as_array().expect("utility payload array");
++        let call_id = fields[1].as_u64().expect("utility call id");
++        let result = match fields[2].as_str().expect("utility method") {
++            "is_inference_ready" => Value::Boolean(engine.state == "running"),
++            "checkpoint_state" => Value::Array(vec![
++                Value::from(engine.state),
++                engine.error.map_or(Value::Nil, Value::from),
++            ]),
++            "checkpoint_prepare" => {
++                let mode = fields[3][0].as_str().expect("prepare mode").to_string();
++                modes.lock().expect("modes lock").push(mode);
++                match engine.refusal {
++                    Some(refusal) => Value::from(refusal),
++                    None => {
++                        engine.state = "prepared";
++                        Value::Nil
++                    }
++                }
++            }
++            "checkpoint_restore" => {
++                engine.state = "running";
++                Value::Nil
++            }
++            method => panic!("unexpected utility call {method}"),
++        };
++        send_outputs(
++            push,
++            UtilityCallOutput {
++                output: UtilityOutput {
++                    call_id: call_id.into(),
++                    failure_message: None,
++                    result: Some(UtilityResultEnvelope::without_type_info(result)),
++                },
++                ..Default::default()
++            }
++            .into(),
++        )
++        .await;
++    }
++}
++
++/// Start a control client against [`serve_checkpoint_engine`]. Returns the
++/// client, the drain modes the engine saw, and what stops the test.
++async fn connect_checkpoint_engine(
++    engine_id: &'static [u8],
++    engine: CheckpointEngine,
++) -> (
++    ControlClient<Channel>,
++    Arc<std::sync::Mutex<Vec<String>>>,
++    impl Future<Output = ()>,
++) {
++    let mut ready = default_ready_response();
++    ready.enable_sleep_mode = true;
++    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
++    let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
++    let engine_modes = Arc::clone(&modes);
++    let (inference_service, control_service, engine_health, engine_task) =
++        setup_grpc_service_with_engine_script(
++            engine_id.to_vec(),
++            ready,
++            Arc::new(FakeTextBackend::default()),
++            None,
++            move |dealer, push| {
++                boxed_test_future(serve_checkpoint_engine(
++                    dealer,
++                    push,
++                    engine,
++                    engine_modes,
++                    stop_rx,
++                ))
++            },
++        )
++        .await;
++    let (channel, server_task) = start_grpc_test_server(
++        inference_service,
++        control_service,
++        engine_health,
++        tokio_util::sync::CancellationToken::new(),
++    )
++    .await;
++    let finish = async move {
++        let _ = stop_tx.send(());
++        engine_task.await.expect("mock engine task");
++        server_task.abort();
++    };
++    (ControlClient::new(channel), modes, finish)
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn control_checkpoint_prepares_and_restores() {
++    let (mut control, modes, finish) = connect_checkpoint_engine(
++        b"engine-grpc-checkpoint",
++        CheckpointEngine {
++            state: "running",
++            error: None,
++            refusal: None,
++        },
++    )
++    .await;
++
++    let state = control
++        .get_checkpoint_state(pb::GetCheckpointStateRequest {})
++        .await
++        .expect("state")
++        .into_inner();
++    assert_eq!(state.state(), pb::CheckpointState::Running);
++    assert_eq!(state.error, None);
++
++    let prepared = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Unspecified.into(),
++        })
++        .await
++        .expect("prepare")
++        .into_inner();
++    assert_eq!(prepared.state(), pb::CheckpointState::Prepared);
++    assert_eq!(*modes.lock().expect("modes lock"), ["wait"]);
++
++    // Preparing again changes nothing, whatever the mode.
++    let again = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Abort.into(),
++        })
++        .await
++        .expect("second prepare")
++        .into_inner();
++    assert_eq!(again.state(), pb::CheckpointState::Prepared);
++    assert_eq!(*modes.lock().expect("modes lock"), ["wait"]);
++
++    for _ in 0..2 {
++        let restored = control
++            .checkpoint_restore(pb::CheckpointRestoreRequest {})
++            .await
++            .expect("restore")
++            .into_inner();
++        assert_eq!(restored.state(), pb::CheckpointState::Running);
++    }
++
++    finish.await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn control_checkpoint_prepare_passes_the_drain_mode() {
++    let (mut control, modes, finish) = connect_checkpoint_engine(
++        b"engine-grpc-checkpoint-mode",
++        CheckpointEngine {
++            state: "running",
++            error: None,
++            refusal: None,
++        },
++    )
++    .await;
++    control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Abort.into(),
++        })
++        .await
++        .expect("prepare");
++    assert_eq!(*modes.lock().expect("modes lock"), ["abort"]);
++    let status = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest { mode: 99 })
++        .await
++        .expect_err("an unknown mode is rejected");
++    assert_eq!(status.code(), tonic::Code::InvalidArgument);
++    finish.await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn control_checkpoint_prepare_reports_a_refusal() {
++    let (mut control, _modes, finish) = connect_checkpoint_engine(
++        b"engine-grpc-checkpoint-refusal",
++        CheckpointEngine {
++            state: "running",
++            error: None,
++            refusal: Some("a weight update is in progress"),
++        },
++    )
++    .await;
++    let status = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Wait.into(),
++        })
++        .await
++        .expect_err("a refusal fails the call");
++    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
++    assert_eq!(status.message(), "a weight update is in progress");
++    finish.await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn control_checkpoint_reports_a_failed_lifecycle() {
++    let (mut control, modes, finish) = connect_checkpoint_engine(
++        b"engine-grpc-checkpoint-failed",
++        CheckpointEngine {
++            state: "failed",
++            error: Some("could not release the weights"),
++            refusal: None,
++        },
++    )
++    .await;
++
++    let state = control
++        .get_checkpoint_state(pb::GetCheckpointStateRequest {})
++        .await
++        .expect("state")
++        .into_inner();
++    assert_eq!(state.state(), pb::CheckpointState::Failed);
++    assert_eq!(
++        state.error.as_deref(),
++        Some("could not release the weights")
++    );
++
++    let prepare = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Wait.into(),
++        })
++        .await
++        .expect_err("prepare after a failure");
++    let restore = control
++        .checkpoint_restore(pb::CheckpointRestoreRequest {})
++        .await
++        .expect_err("restore after a failure");
++    for status in [prepare, restore] {
++        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
++        assert_eq!(
++            status.message(),
++            "the engines are failed: could not release the weights"
++        );
++    }
++    assert!(modes.lock().expect("modes lock").is_empty());
++    finish.await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn control_checkpoint_requires_sleep_mode() {
++    let (inference_service, control_service, engine_health, engine_task) =
++        setup_grpc_service_with_engine_script(
++            b"engine-grpc-checkpoint-no-sleep".to_vec(),
++            default_ready_response(),
++            Arc::new(FakeTextBackend::default()),
++            None,
++            |_, _| boxed_test_future(async {}),
++        )
++        .await;
++    let (channel, server_task) = start_grpc_test_server(
++        inference_service,
++        control_service,
++        engine_health,
++        tokio_util::sync::CancellationToken::new(),
++    )
++    .await;
++    let mut control = ControlClient::new(channel);
++    let prepare = control
++        .checkpoint_prepare(pb::CheckpointPrepareRequest {
++            mode: pb::PauseMode::Wait.into(),
++        })
++        .await
++        .expect_err("prepare without sleep mode");
++    let restore = control
++        .checkpoint_restore(pb::CheckpointRestoreRequest {})
++        .await
++        .expect_err("restore without sleep mode");
++    let state = control
++        .get_checkpoint_state(pb::GetCheckpointStateRequest {})
++        .await
++        .expect_err("state without sleep mode");
++    for status in [prepare, restore, state] {
++        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
++        assert_eq!(
++            status.message(),
++            "sleep mode is not configured; start vLLM with --enable-sleep-mode"
++        );
++    }
++    engine_task.await.expect("mock engine task");
++    server_task.abort();
++}
+-- 
+2.54.0 (Apple Git-157)
+

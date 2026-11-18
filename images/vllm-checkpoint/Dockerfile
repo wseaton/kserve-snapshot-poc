@@ -1,4 +1,16 @@
 ARG BASE_IMAGE=vllm/vllm-openai:nightly-a2bcb5657a881a002e79d0adab3c6b5e39436121@sha256:bd419f1669b420e7dfcfa2545a9f3b05c2312c858a215b1f287284d7398d3367
+
+FROM docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS frontend
+ARG VLLM_REPO=wseaton/vllm
+ARG FRONTEND_REF=b3c279b57a69c494a651ac400c1e8dbd8454e8c3
+RUN set -eux; \
+    git init -q /src/vllm; \
+    cd /src/vllm; \
+    git fetch -q --depth 1 "https://github.com/${VLLM_REPO}.git" "${FRONTEND_REF}"; \
+    git checkout -q FETCH_HEAD; \
+    cd rust; \
+    cargo build --release --locked -p vllm-cmd --bin vllm-rs
+
 FROM ${BASE_IMAGE}
 
 ARG VLLM_REPO=wseaton/vllm
@@ -34,3 +46,11 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends "${pkg}"; \
     rm -rf /var/lib/apt/lists/*; \
     test -e "/usr/local/cuda-${CUDA_COMPAT_VERSION}/compat/libcuda.so.1"
+
+COPY --from=frontend /src/vllm/rust/target/release/vllm-rs /tmp/vllm-rs
+RUN set -eux; \
+    target="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm.__file__).parent / "vllm-rs")')"; \
+    install -m 0755 /tmp/vllm-rs "${target}"; \
+    rm /tmp/vllm-rs; \
+    "${target}" --version; \
+    grep -q CheckpointPrepare "${target}"
