@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set the digest
-        working-directory: deploy/components/images
+        working-directory: deploy/components/images/${{ inputs.name }}
         env:
           IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.name }}
           DIGEST: ${{ inputs.digest }}

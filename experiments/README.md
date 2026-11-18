@@ -41,11 +41,11 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
 
 ## `bench/`: timed cold boot, checkpoint and restore of one server
 
-- The pod, its volumes, the `restore-bench` configmap and the `snapshotd` build are kustomize in
-  [`deploy/snapshotd`](../deploy/snapshotd); [deploy/README.md](../deploy/README.md) walks through
-  them. The pod is privileged and takes a whole node's 8 GPUs. An `overlay.tgz` of the vLLM files
-  the patches change goes in a second configmap, `restore-bench-overlay`, which the pod mounts
-  beside the scripts when it exists. `snapshotd` goes to `/models/bin/snapshotd`.
+- The pod and its volumes are kustomize in [`deploy/snapshotd`](../deploy/snapshotd);
+  [deploy/README.md](../deploy/README.md) walks through them. The pod is privileged and takes a
+  whole node's 8 GPUs. An init container copies `snapshotd` to `/models/bin` and these scripts to
+  `/exp` out of the `snapshotd` image. An `overlay.tgz` of the vLLM files the patches change is
+  copied in by hand: `kubectl cp overlay.tgz restore-bench:/exp/overlay.tgz`.
   A privileged pod sees every GPU on the node, so the script takes its GPUs from the kubelet's
   device checkpoint, mounted from the host.
 - `restore-bench.sh <tag> [vllm args]`: cold boot, a greedy completion, prepare,
@@ -74,7 +74,7 @@ The comparison rows in [benchmarks.md](../docs/benchmarks.md), with `TP=2` and `
 ```bash
 export MODEL=/models/Qwen3-8B TP=4 REMAP=rotate
 B=(--max-model-len 4096 --gpu-memory-utilization 0.6)
-MODE=cuinterpose COMPAT=/compat/usr/local/cuda-13.1/compat CUDA_TOOL=helper \
+MODE=cuinterpose COMPAT=/usr/local/cuda-13.1/compat CUDA_TOOL=helper \
   /exp/restore-bench.sh dynamo "${B[@]}"
 OVERLAY=/exp/overlay.tgz NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 \
   /exp/restore-bench.sh ours "${B[@]}" --disable-custom-all-reduce \

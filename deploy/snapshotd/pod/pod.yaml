@@ -11,9 +11,35 @@ spec:
   restartPolicy: Never
   imagePullSecrets:
     - name: quay-wseaton-pull
+  initContainers:
+    - name: snapshotd
+      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+      command:
+        - sh
+        - -c
+        - cp -a /opt/snapshotd/bin/. /models/bin/ && cp -a /opt/snapshotd/exp/. /exp/
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+      volumeMounts:
+        - name: snapshot-bin
+          mountPath: /models/bin
+        - name: exp
+          mountPath: /exp
+    - name: snapshot-binaries
+      image: quay.io/wseaton/snapshot-agent@sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f
+      command: [cp, -a, /snapshot-binaries, /out/]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+      volumeMounts:
+        - name: snapshot-cuda
+          mountPath: /out
   containers:
     - name: main
-      image: quay.io/wseaton/vllm-checkpoint@sha256:e2659cc191b90c0bceb8e40fa037020e609715774523d0d29422fc0bf23895ee
+      image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
       command: [python3, -c, "import os,time\nwhile True:\n  try: os.waitpid(-1,0)\n  except ChildProcessError: time.sleep(1)"]
       securityContext:
         privileged: true
@@ -53,31 +79,27 @@ spec:
           mountPath: /exp
         - name: models
           mountPath: /models
+        - name: snapshot-bin
+          mountPath: /models/bin
         - name: compile-cache
           mountPath: /compile-cache
         - name: work
           mountPath: /work
         - name: dshm
           mountPath: /dev/shm
-        - name: cuinterpose
+        - name: snapshot-cuda
           mountPath: /tmp/snapshot-cuda
-          readOnly: true
-        - name: compat
-          mountPath: /compat
           readOnly: true
         - name: device-plugins
           mountPath: /host-device-plugins
           readOnly: true
   volumes:
     - name: exp
-      projected:
-        defaultMode: 0755
-        sources:
-          - configMap:
-              name: restore-bench
-          - configMap:
-              name: restore-bench-overlay
-              optional: true
+      emptyDir: {}
+    - name: snapshot-bin
+      emptyDir: {}
+    - name: snapshot-cuda
+      emptyDir: {}
     - name: models
       persistentVolumeClaim:
         claimName: snapshot-bench-models
@@ -93,11 +115,3 @@ spec:
     - name: device-plugins
       hostPath:
         path: /var/lib/kubelet/device-plugins
-    - name: cuinterpose
-      image:
-        reference: quay.io/wseaton/snapshot-agent@sha256:7fe695035e6506bed4cb38b8678de8d0825d515fbabded58220194d17b4bce6f
-        pullPolicy: IfNotPresent
-    - name: compat
-      image:
-        reference: quay.io/wseaton/vllm-openai@sha256:20fd867e86bdae3f5f2689d0a32661619560b8054d1a7c10fd303c71a8b2a8a0
-        pullPolicy: IfNotPresent

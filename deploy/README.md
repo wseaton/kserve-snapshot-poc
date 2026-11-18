@@ -21,6 +21,7 @@ been applied end to end from it.
 
 ```
 deploy/
+  components/images/         digests of the images built in this repository; CI opens a pull request to change them
   modelexpress/
     crds/                    ModelExpress CRDs, v0.6.0 (cluster-scoped)
     server/                  ModelExpress server, Kubernetes metadata backend, one per namespace
@@ -31,8 +32,8 @@ deploy/
     qwen3-8b/namespace/      namespace, model volume and download, config layer, ModelExpress server
     qwen3-8b/service/        the LLMInferenceService
   snapshotd/
-    base/                    namespace, volumes, script configmap, snapshotd build Job
-    pod/                     the bench pod
+    base/                    namespace and volumes
+    pod/                     the bench pod; init containers copy snapshotd, the scripts, CRIU and cuInterpose into it
     components/
       rdma-image-transfer/   xfer container and RAM-backed image directory
       modelexpress-weights/  rdma/ib for the workload, pod-info volume, ModelExpress server
@@ -48,8 +49,8 @@ deploy/
 - A `ReadWriteMany` storage class. The manifests name `shared-vast`.
 - For the RDMA parts, an InfiniBand device plugin that offers `rdma/ib`, and transparent huge
   pages on the nodes.
-- The images under `quay.io/wseaton` are private. Each namespace below needs a pull secret named
-  `quay-wseaton-pull`:
+- The Dynamo agent build and the companion are still private images under `quay.io/wseaton`.
+  Each namespace below needs a pull secret named `quay-wseaton-pull` for them:
 
   ```bash
   kubectl -n <namespace> create secret docker-registry quay-wseaton-pull \
@@ -63,12 +64,11 @@ deploy/
 
 | Image | Used for | Built from |
 | --- | --- | --- |
-| `quay.io/wseaton/vllm-checkpoint@sha256:e2659cc1…` | vLLM in both paths | `kserve-dynamo-snapshot/images/vllm-checkpoint`: vLLM nightly `a2bcb565` with files from the patched fork, and ModelExpress from its fork branch |
+| `ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint` | vLLM in both paths | [`images/vllm-checkpoint`](../images/vllm-checkpoint): vLLM nightly `a2bcb565` with files from the patched fork, ModelExpress from its fork branch, and the CUDA 13.1 forward-compat `libcuda` at `/usr/local/cuda-13.1/compat`, off the library path |
+| `ghcr.io/wseaton/kserve-snapshot-poc/snapshotd` | the `xfer` container; an init container copies `snapshotd` and the bench scripts out of it | [`images/snapshotd`](../images/snapshotd): both builds of [`daemon/`](../daemon), with NIXL ([ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672)) and UCX |
 | `quay.io/wseaton/kserve-dynamo-snapshot@sha256:77c68762…` | companion, snapshot entrypoint | `kserve-dynamo-snapshot/Dockerfile` |
-| `quay.io/wseaton/snapshot-agent@sha256:7fe69503…` | Dynamo agent; in the bench pod, an image volume for CRIU, its plugins and cuInterpose | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot) |
+| `quay.io/wseaton/snapshot-agent@sha256:7fe69503…` | Dynamo agent; in the bench pod, an init container copies CRIU, its plugins and cuInterpose out of it | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot) |
 | `ghcr.io/ai-dynamo/snapshot/operator:v0.0.0-gbc9d2161`, `…/agent:v0.0.0-gbc9d2161` | Dynamo operator; cuInterpose bundle the companion injects | upstream |
-| `quay.io/wseaton/vllm-openai@sha256:20fd867e…` | image volume for the CUDA 13.1 compat `libcuda` | `kserve-dynamo-snapshot/images/vllm-cuda-compat` |
-| `quay.io/wseaton/nixl-regbench@sha256:da96ebb4…` | xfer container, and the `snapshotd` build with the `nixl` feature | NIXL with [ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672), UCX and Rust. Its Dockerfile is not in this repository. |
 | `nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.6.0` | ModelExpress server | upstream |
 
 ## Dynamo Snapshot through KServe
@@ -157,7 +157,7 @@ install. TP>1 has not been rerun on this path since it moved to vLLM's checkpoin
 
 One privileged pod per node holds vLLM, CRIU and `snapshotd`; the scripts in
 [`experiments/bench`](../experiments/bench) run the phases and time them. The pod takes a whole
-node's 8 GPUs. The cluster needs image volumes (`ImageVolume`).
+node's 8 GPUs.
 
 ### One node
 
@@ -165,27 +165,25 @@ node's 8 GPUs. The cluster needs image volumes (`ImageVolume`).
 kubectl apply -k deploy/snapshotd/single-node
 kubectl -n snapshot-bench create secret docker-registry quay-wseaton-pull \
   --from-file="$HOME/.docker/config.json"
-kubectl -n snapshot-bench wait job/build-snapshotd --for=condition=Complete --timeout=15m
 kubectl apply -k deploy/snapshotd/models/qwen3-8b
 kubectl -n snapshot-bench wait job/download-qwen3-8b --for=condition=Complete --timeout=30m
 kubectl -n snapshot-bench wait pod/restore-bench --for=condition=Ready --timeout=10m
 ```
 
-`build-snapshotd` compiles [`daemon/`](../daemon) from `SNAPSHOTD_REF` of this repository (default
-`main`) onto the models volume: `/models/bin/snapshotd`, and `/models/bin/snapshotd-nixl` with
-the `nixl` feature.
+An init container copies `snapshotd` to `/models/bin` and the scripts to `/exp` from the
+`snapshotd` image, which CI builds from [`daemon/`](../daemon).
 
 Cold boot, checkpoint and restore onto the next GPU over, with cuInterpose:
 
 ```bash
 kubectl -n snapshot-bench exec restore-bench -- env MODEL=/models/Qwen3-8B TP=4 REMAP=rotate \
-  MODE=cuinterpose COMPAT=/compat/usr/local/cuda-13.1/compat \
+  MODE=cuinterpose COMPAT=/usr/local/cuda-13.1/compat \
   /exp/restore-bench.sh qwen-tp4 --max-model-len 4096 --gpu-memory-utilization 0.6
 ```
 
 It prints one `RESULT` line of JSON. `"result": "MATCH"` means the restored server gave the same
 greedy completion as before the dump. Measured: `restore_total_s` 8.0 against `cold_boot_s` 48.8.
-The path without cuInterpose needs the patched vLLM files as a second configmap; see
+The path without cuInterpose needs the patched vLLM files copied into the pod; see
 [experiments/README.md](../experiments/README.md).
 
 ### Two nodes
@@ -212,7 +210,7 @@ The harness runs from a workstation and drives both pods with `kubectl exec`:
 ```bash
 cd experiments/bench
 NS=snapshot-bench CONTEXT=$(kubectl config current-context) \
-MODEL=/models/DeepSeek-V4.1-Flash TP=8 MODE=cuinterpose COMPAT=/compat/usr/local/cuda-13.1/compat \
+MODEL=/models/DeepSeek-V4.1-Flash TP=8 MODE=cuinterpose COMPAT=/usr/local/cuda-13.1/compat \
 MX=1 NET=pod PEER=1 OVERLAP=1 IMG_DIR=/mem/deepseek RESERVE_GIB=76 CRIU_VERBOSITY=1 \
 ./lifecycle.sh deepseek --enable-expert-parallel --tokenizer-mode deepseek_v41 --language-model-only \
   --engram-config '{"cpu_offload":false}' --max-model-len 32768 --gpu-memory-utilization 0.9 \
@@ -225,7 +223,7 @@ on the second node, restore 20.5 s, cold boot 104.7 s. A smaller run of the same
 
 ```bash
 NS=snapshot-bench CONTEXT=$(kubectl config current-context) \
-MODEL=/models/Qwen3-8B TP=4 MODE=cuinterpose COMPAT=/compat/usr/local/cuda-13.1/compat \
+MODEL=/models/Qwen3-8B TP=4 MODE=cuinterpose COMPAT=/usr/local/cuda-13.1/compat \
 MX=1 NET=pod PEER=1 OVERLAP=1 IMG_DIR=/mem/qwen \
 ./lifecycle.sh qwen --max-model-len 4096 --gpu-memory-utilization 0.8
 ```
@@ -302,7 +300,7 @@ for it:
 
 | In the pod | Value | For |
 | --- | --- | --- |
-| `xfer` container | the NIXL image, running `/models/bin/snapshotd-nixl` | NIXL and UCX stay out of the workload container |
+| `xfer` container | the `snapshotd` image, running `/models/bin/snapshotd-nixl` | NIXL and UCX stay out of the workload container |
 | `rdma/ib` on `xfer` | 1 | the InfiniBand device the copy uses |
 | `IPC_LOCK` | added | registering the pool |
 | `SYS_RESOURCE` | added | raising CRIU's pipes to 64 MiB; at the 1 MiB unprivileged limit the dump runs at about 400 MB/s |
@@ -352,8 +350,8 @@ volume when there is none.
 | Setting | Where |
 | --- | --- |
 | Storage class `shared-vast` and volume sizes | `dynamo-snapshot/agent/values.yaml`, `dynamo-snapshot/qwen3-8b/namespace/model.yaml`, `snapshotd/base/storage.yaml` |
-| Pull secret name | `agent/values.yaml`, `companion/companion.yaml`, `config-layer/kustomization.yaml`, `snapshotd/base/build.yaml`, `snapshotd/pod/pod.yaml` |
-| Image references | `images:` in `agent/`, `companion/` and `config-layer/`; `kserve-dynamo-snapshot/config/llmisvcconfig`; `snapshotd/pod/pod.yaml`; `snapshotd/components/rdma-image-transfer/xfer.yaml`; `snapshotd/base/build.yaml` |
+| Pull secret name | `agent/values.yaml`, `companion/companion.yaml`, `config-layer/kustomization.yaml`, `snapshotd/pod/pod.yaml` |
+| Image references | `components/images` for the two images built here; `images:` in `agent/`, `companion/` and `config-layer/` and `snapshotd/pod/pod.yaml` for the rest |
 | CoreWeave agent image, no `runtimeClassName` | `dynamo-snapshot/agent/kustomization.yaml` |
 | PageBroker and CRIU options for driver 580 | `dynamo-snapshot/agent/values.yaml` |
 | Node label for the agent and for services | `agent/values.yaml`, `qwen3-8b/service/service.yaml` |

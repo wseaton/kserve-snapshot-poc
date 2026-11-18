@@ -8,9 +8,9 @@ spec:
       volumeMounts:
         - name: mem
           mountPath: /mem
-    # Copies /work/<tag> to or from another node: snapshotd built with the nixl feature.
+    # Copies /work/<tag> to or from another node.
     - name: xfer
-      image: quay.io/wseaton/nixl-regbench@sha256:da96ebb45ccd74f4e6259aa4a744a8c00ad22e9ec3dd1805da1378977536b241
+      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
       command: [sleep, infinity]
       env:
         - name: HOME
@@ -27,8 +27,8 @@ spec:
           memory: 256Gi
           rdma/ib: "1"
       volumeMounts:
-        - name: models
-          mountPath: /models
+        - name: snapshot-bin
+          mountPath: /models/bin
         - name: work
           mountPath: /work
         - name: mem

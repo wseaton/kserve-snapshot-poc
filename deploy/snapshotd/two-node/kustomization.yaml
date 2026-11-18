@@ -8,6 +8,7 @@ resources:
 components:
   - ../components/rdma-image-transfer
   - ../components/modelexpress-weights
+  - ../../components/images
 patches:
   - path: spread.yaml
     target:

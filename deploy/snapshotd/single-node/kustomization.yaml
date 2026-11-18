@@ -4,3 +4,5 @@ namespace: snapshot-bench
 resources:
   - ../base
   - ../pod
+components:
+  - ../../components/images
