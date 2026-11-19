@@ -13,6 +13,7 @@ spec:
       labels:
         app: snapshotd
     spec:
+      serviceAccountName: snapshotd
       hostPID: true
       nodeSelector:
         nvidia.com/gpu.present: "true"

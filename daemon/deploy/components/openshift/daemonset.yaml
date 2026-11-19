@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshotd
+spec:
+  template:
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: snapshotd
+          env:
+            - name: SNAPSHOTD_RUNTIME_SOCKET
+              value: /run/crio/crio.sock
+          volumeMounts:
+            - name: runtime
+              mountPath: /run/crio
+      volumes:
+        - name: runtime
+          hostPath:
+            path: /run/crio

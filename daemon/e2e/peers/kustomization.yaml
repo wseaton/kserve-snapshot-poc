@@ -14,11 +14,3 @@ images:
     newTag: dev
 patches:
   - path: daemonset.yaml
-  - target:
-      group: cert-manager.io
-    patch: |
-      $patch: delete
-      apiVersion: cert-manager.io/v1
-      kind: Issuer
-      metadata:
-        name: any

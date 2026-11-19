@@ -62,6 +62,8 @@ spec:
               port: ready
             periodSeconds: 2
           env:
+            - name: HOME
+              value: /dev/shm/home
             - name: VLLM_USE_RUST_FRONTEND
               value: "1"
             - name: VLLM_WORKER_MULTIPROC_METHOD
@@ -111,6 +113,8 @@ spec:
           volumeMounts:
             - name: snapshot-tools
               mountPath: /snapshot-tools
+            - name: snapshot-run
+              mountPath: /run/snapshotd
             - name: models
               mountPath: /models
             - name: dshm
@@ -120,6 +124,8 @@ spec:
               subPath: compile-cache
       volumes:
         - name: snapshot-tools
+          emptyDir: {}
+        - name: snapshot-run
           emptyDir: {}
         - name: models
           persistentVolumeClaim:

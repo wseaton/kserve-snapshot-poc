@@ -5,4 +5,5 @@ resources:
   - ../../../daemon/deploy/node
 components:
   - ../../../daemon/deploy/components/peers
+  - ../../../daemon/deploy/components/peers-cert-manager
   - ../../components/images
