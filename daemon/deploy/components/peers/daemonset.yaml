@@ -21,6 +21,10 @@ spec:
               value: /tmp
             - name: UCX_TLS
               value: tcp,cuda_copy
+          resources:
+            requests:
+              cpu: "1"
+              memory: 6Gi
           volumeMounts:
             - name: peer-token
               mountPath: /var/run/secrets/snapshotd/peers

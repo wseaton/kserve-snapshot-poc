@@ -67,6 +67,17 @@ unsafe impl Sync for HugeRegion {}
 
 impl HugeRegion {
     pub fn new(len: usize) -> Result<Self> {
+        Self::map(len, true)
+    }
+
+    /// The same region without asking for huge pages. Asking makes every
+    /// fault wait for the kernel to find or make one.
+    #[cfg(feature = "nixl")]
+    pub fn of_small_pages(len: usize) -> Result<Self> {
+        Self::map(len, false)
+    }
+
+    fn map(len: usize, huge_pages: bool) -> Result<Self> {
         ensure!(len > 0, "a region cannot be empty");
         let len = len.next_multiple_of(HUGE_PAGE);
         let span = len + HUGE_PAGE;
@@ -93,8 +104,10 @@ impl HugeRegion {
             if tail > 0 {
                 rustix::mm::munmap((aligned + len) as *mut _, tail).context("trim the mapping")?;
             }
-            rustix::mm::madvise(aligned as *mut _, len, Advice::LinuxHugepage)
-                .context("ask for huge pages")?;
+            if huge_pages {
+                rustix::mm::madvise(aligned as *mut _, len, Advice::LinuxHugepage)
+                    .context("ask for huge pages")?;
+            }
         }
         let base = NonNull::new(aligned as *mut u8).context("mapping at address zero")?;
         Ok(Self { base, len })

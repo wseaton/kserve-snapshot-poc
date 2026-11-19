@@ -2,17 +2,17 @@
 //! asks for a revision this node holds, and ask peers for one it lacks.
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
 use crate::store::{RevisionKey, RevisionStore, directory_bytes};
-use crate::transfer::{self, Pool};
+use crate::transfer::{self, Endpoint, Pool};
 use crate::tunnel::{self, Identity, Refusal, Tunnel, Work};
 
 const BUSY_RETRY: Duration = Duration::from_secs(2);
@@ -53,14 +53,77 @@ pub struct Args {
     pool: Pool,
 }
 
+type Job = Box<dyn FnOnce(Result<&Endpoint>) -> bool + Send>;
+
+/// The thread every transfer of this daemon runs on, in either direction,
+/// with the one registered pool they share. The pool is made by the first
+/// transfer and kept: making one costs seconds, or far longer on a node
+/// whose memory is fragmented.
+#[derive(Clone)]
+struct Transfers {
+    jobs: mpsc::Sender<Job>,
+}
+
+impl Transfers {
+    fn start(name: String, pool: Pool) -> Result<Self> {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("transfers".to_string())
+            .spawn(move || {
+                let mut endpoint = None;
+                for job in queue {
+                    if endpoint.is_none() {
+                        match Endpoint::new(&name, pool, false) {
+                            Ok(made) => endpoint = Some(made),
+                            Err(error) => {
+                                job(Err(error));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(ready) = &endpoint
+                        && !job(Ok(ready))
+                    {
+                        endpoint = None;
+                    }
+                }
+            })
+            .context("start the transfer thread")?;
+        Ok(Self { jobs })
+    }
+
+    /// Run `work` with the pool and wait for it. A pool that a transfer
+    /// failed on is not used again.
+    fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Endpoint) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (done, outcome) = mpsc::channel();
+        let job: Job = Box::new(move |endpoint| {
+            let result = endpoint.and_then(work);
+            let fine = result.is_ok();
+            let _ = done.send(result);
+            fine
+        });
+        self.jobs
+            .send(job)
+            .map_err(|_| anyhow!("the transfer thread stopped"))?;
+        outcome
+            .recv()
+            .context("the transfer thread dropped a transfer")?
+    }
+}
+
 pub struct Peers {
     name: String,
     own_ip: IpAddr,
     identity: Identity,
     busy_timeout: Duration,
     store: PathBuf,
-    pool: Pool,
-    sending: Arc<Semaphore>,
+    transfers: Transfers,
+    /// Held by the one transfer this daemon takes part in, sending or
+    /// receiving.
+    turn: Arc<Semaphore>,
 }
 
 impl Peers {
@@ -82,8 +145,11 @@ impl Peers {
             },
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             store: store.to_path_buf(),
-            pool: args.pool,
-            sending: Arc::new(Semaphore::new(1)),
+            transfers: Transfers::start(
+                format!("snapshotd-{own_ip}-{}", std::process::id()),
+                args.pool,
+            )?,
+            turn: Arc::new(Semaphore::new(1)),
         });
         let listener = TcpListener::bind(args.peer_listen)
             .await
@@ -101,14 +167,18 @@ impl Peers {
         if !image.is_dir() {
             return Err(Refusal::NoImage);
         }
-        let turn = Arc::clone(&self.sending)
+        let turn = Arc::clone(&self.turn)
             .try_acquire_owned()
             .map_err(|_| Refusal::Busy)?;
-        let (revision, pool) = (revision.clone(), self.pool);
+        let (revision, transfers) = (revision.clone(), self.transfers.clone());
         Ok(Box::new(move |tunnel: Tunnel| {
             let _turn = turn;
             let start = std::time::Instant::now();
-            transfer::send_over(tunnel.socket, &image, pool, Some(&tunnel.key), None)?;
+            let sent = image.clone();
+            transfers.run(move |endpoint| {
+                let Tunnel { socket, key } = tunnel;
+                transfer::send_over(socket, &sent, endpoint, Some(&key), None).map(drop)
+            })?;
             let (seconds, bytes) = (
                 start.elapsed().as_secs_f64(),
                 directory_bytes(&image) as f64,
@@ -148,30 +218,56 @@ impl Peers {
     ) -> Result<Option<SocketAddr>> {
         let deadline = Instant::now() + self.busy_timeout;
         loop {
-            let mut busy = false;
-            for peer in self.addresses().await {
-                store.clear_staging()?;
-                let staging = store.staging_dir().to_path_buf();
-                let receive = move |tunnel: Tunnel| {
-                    let key = Some(&tunnel.key);
-                    transfer::receive_over(tunnel.socket, &staging, true, false, None, key, None)
-                        .map(drop)
-                };
-                match tunnel::ask(peer, &self.identity, revision, receive).await {
-                    Ok(Ok(())) => {
-                        store.publish()?;
-                        return Ok(Some(peer));
+            let mut busy = None;
+            {
+                let _turn = self
+                    .turn
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow!("the transfer turn is closed"))?;
+                for peer in self.addresses().await {
+                    store.clear_staging()?;
+                    let staging = store.staging_dir().to_path_buf();
+                    let transfers = self.transfers.clone();
+                    let receive = move |tunnel: Tunnel| {
+                        transfers.run(move |endpoint| {
+                            let Tunnel { socket, key } = tunnel;
+                            let endpoint = Some(endpoint);
+                            let key = Some(&key);
+                            transfer::receive_over(
+                                socket, &staging, true, false, None, endpoint, key, None,
+                            )
+                            .map(drop)
+                        })
+                    };
+                    match tunnel::ask(peer, &self.identity, revision, receive).await {
+                        Ok(Ok(())) => {
+                            store.publish()?;
+                            return Ok(Some(peer));
+                        }
+                        Ok(Err(Refusal::Busy)) => busy = Some(peer),
+                        Ok(Err(Refusal::NoImage)) => {
+                            debug!(%peer, "the peer has no checkpoint of it")
+                        }
+                        Err(error) => {
+                            warn!(%peer, error = %format_args!("{error:#}"), "pull failed")
+                        }
                     }
-                    Ok(Err(Refusal::Busy)) => busy = true,
-                    Ok(Err(Refusal::NoImage)) => debug!(%peer, "the peer has no checkpoint of it"),
-                    Err(error) => warn!(%peer, error = %format_args!("{error:#}"), "pull failed"),
                 }
+                store.clear_staging()?;
             }
-            store.clear_staging()?;
-            if !busy || Instant::now() >= deadline {
+            let Some(peer) = busy else {
+                return Ok(None);
+            };
+            if Instant::now() >= deadline {
                 return Ok(None);
             }
-            sleep(BUSY_RETRY).await;
+            sleep(if self.own_ip < peer.ip() {
+                BUSY_RETRY
+            } else {
+                BUSY_RETRY * 3
+            })
+            .await;
         }
     }
 }

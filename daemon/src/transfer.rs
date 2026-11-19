@@ -171,7 +171,7 @@ fn receive(reader: &mut impl BufRead) -> Result<Message> {
 
 /// The registered region and the NIXL objects that use it. Every NIXL call
 /// happens on the thread that owns this.
-struct Endpoint {
+pub struct Endpoint {
     agent: Agent,
     backend: Backend,
     storage: SystemStorage<HugeRegion>,
@@ -181,13 +181,17 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn new(name: &str, pool: Pool) -> Result<Self> {
+    pub fn new(name: &str, pool: Pool, huge_pages: bool) -> Result<Self> {
         let len = pool
             .slots
             .checked_mul(pool.slot_bytes())
             .context("pool size overflows")?;
         ensure!(len > 0, "the pool is empty");
-        let mut region = HugeRegion::new(len)?;
+        let mut region = if huge_pages {
+            HugeRegion::new(len)?
+        } else {
+            HugeRegion::of_small_pages(len)?
+        };
         region.as_mut().fill(0);
         let huge_page_fraction = huge_page_fraction(&[(region.address(), region.len())]);
 
@@ -231,6 +235,10 @@ impl Endpoint {
             .get_local_md()
             .map_err(|e| anyhow!("local NIXL metadata: {e}"))?;
         Ok(hex::encode(metadata))
+    }
+
+    fn forget_peer(&self, name: &str) {
+        let _ = self.agent.invalidate_remote_md(name);
     }
 
     fn load_peer(&self, metadata: &str) -> Result<String> {
@@ -319,7 +327,11 @@ fn add(nanos: &AtomicU64, since: Instant) {
 pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) -> Result<()> {
     let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
     stream.set_nodelay(true)?;
-    println!("TRANSFER {}", send_over(stream, dir, pool, None, trace)?);
+    let endpoint = Endpoint::new(SENDER, pool.fitted(&list_files(dir)?), true)?;
+    println!(
+        "TRANSFER {}",
+        send_over(stream, dir, &endpoint, None, trace)?
+    );
     Ok(())
 }
 
@@ -327,13 +339,13 @@ pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) 
 pub fn send_over(
     stream: impl Control,
     dir: &Path,
-    pool: Pool,
+    endpoint: &Endpoint,
     key: Option<&TransferKey>,
     trace: Option<PathBuf>,
 ) -> Result<serde_json::Value> {
     let trace = Trace::new(trace, "sender");
     let files = list_files(dir)?;
-    let pool = pool.fitted(&files);
+    let pool = endpoint.pool;
     let total: u64 = files.iter().map(|f| f.size).sum();
     let handles: Vec<File> = files
         .iter()
@@ -349,7 +361,6 @@ pub fn send_over(
         }
     }
 
-    let endpoint = Endpoint::new(SENDER, pool)?;
     let slots = endpoint.slots();
     let mut reader = BufReader::new(stream.try_clone()?);
     let stream = Mutex::new(stream);
@@ -475,14 +486,7 @@ pub fn send_over(
             .collect();
         drop(post_tx);
 
-        let posted = drive_transfers(
-            &endpoint,
-            &peer,
-            slots,
-            &slot_addresses,
-            post_rx,
-            written_tx,
-        );
+        let posted = drive_transfers(endpoint, &peer, slots, &slot_addresses, post_rx, written_tx);
         let mut result = posted;
         for worker in workers {
             let joined = worker
@@ -504,6 +508,7 @@ pub fn send_over(
     };
     let elapsed = start.elapsed().as_secs_f64();
     let workers = pool.slots as f64;
+    endpoint.forget_peer(&peer);
     trace.write()?;
     Ok(serde_json::json!({
             "bytes": total,
@@ -768,7 +773,8 @@ pub fn receive_directory(
     let (stream, _) = listener.accept().context("accept the sender")?;
     drop(listener);
     stream.set_nodelay(true)?;
-    let Some(store) = receive_over(stream, dir, direct, hold.mmap, arena, None, trace)? else {
+    let received = receive_over(stream, dir, direct, hold.mmap, arena, None, None, trace)?;
+    let Some(store) = received else {
         return Ok(());
     };
     println!(
@@ -786,13 +792,15 @@ pub fn receive_directory(
 
 /// Write what the sender at the other end of `stream` sends under `dir`, or
 /// into `arena` when there is one; the held image is returned then. With a
-/// `key`, every chunk must have been encrypted with it.
+/// `key`, every chunk must have been encrypted with it. Without an `endpoint`
+/// one is made to the sender's measure.
 pub fn receive_over(
     stream: impl Control,
     dir: &Path,
     direct: bool,
     mapped: bool,
     arena: Option<Arena>,
+    endpoint: Option<&Endpoint>,
     key: Option<&TransferKey>,
     trace: Option<PathBuf>,
 ) -> Result<Option<Store>> {
@@ -828,9 +836,26 @@ pub fn receive_over(
             .with_context(|| format!("no file {file}"))
     };
 
-    let endpoint = Endpoint::new(RECEIVER, pool)?;
+    let made;
+    let endpoint = match endpoint {
+        Some(endpoint) => {
+            ensure!(
+                pool.slots <= endpoint.pool.slots && pool.slot_mib <= endpoint.pool.slot_mib,
+                "the sender's pool of {} x {} MiB does not fit this one of {} x {} MiB",
+                pool.slots,
+                pool.slot_mib,
+                endpoint.pool.slots,
+                endpoint.pool.slot_mib
+            );
+            endpoint
+        }
+        None => {
+            made = Endpoint::new(RECEIVER, pool, true)?;
+            &made
+        }
+    };
     let slots = endpoint.slots();
-    endpoint.load_peer(&metadata)?;
+    let peer = endpoint.load_peer(&metadata)?;
     send(
         &stream,
         &Message::Ready {
@@ -973,6 +998,7 @@ pub fn receive_over(
             sync_s: sync.elapsed().as_secs_f64(),
         },
     )?;
+    endpoint.forget_peer(&peer);
     trace.write()?;
     arena.map(|arena| arena.finish(held)).transpose()
 }
@@ -987,7 +1013,7 @@ pub fn stream_capture(
     trace: Option<PathBuf>,
 ) -> Result<()> {
     let trace = Trace::new(trace, "sender");
-    let endpoint = Endpoint::new(SENDER, pool)?;
+    let endpoint = Endpoint::new(SENDER, pool, true)?;
     let slots = endpoint.slots();
     let stream = TcpStream::connect(to).with_context(|| format!("connect {to}"))?;
     stream.set_nodelay(true)?;
