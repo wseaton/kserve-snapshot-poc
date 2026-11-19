@@ -49,6 +49,7 @@ and HTTP. The example is [daemon/deploy/workload](../daemon/deploy/workload).
 
 ```bash
 kubectl apply -k deploy/snapshotd/node       # the DaemonSet; needs cert-manager; set its store path first
+kubectl apply -k deploy/snapshotd/node-openshift   # the same for OpenShift, see "On OpenShift"
 kubectl apply -k deploy/snapshotd/workload   # an example Deployment, Qwen3-8B
 kubectl apply -k deploy/snapshotd/kserve/qwen3-8b   # or the same model as an LLMInferenceService
 daemon/e2e/run.sh                            # the whole flow on kind, no GPU, a stand-in for vLLM
@@ -57,8 +58,8 @@ daemon/e2e/peers.sh                          # checkpoints between nodes, on thr
 
 `daemon/e2e/run.sh` builds one image with `snapshotd`, a stand-in server and the distribution's
 CRIU, starts a kind cluster, and checks that the first replica of a revision is checkpointed and
-comes back as the same process, that later replicas are restores of it, and that a new revision
-boots fresh. The stand-in ([daemon/examples/stand_in.rs](../daemon/examples/stand_in.rs)) serves
+comes back as the same process, that later replicas are restores of it and carry their pod's
+security label, and that a new revision boots fresh. The stand-in ([daemon/examples/stand_in.rs](../daemon/examples/stand_in.rs)) serves
 vLLM's checkpoint RPCs and an instance ID drawn at start, which is how a restore is told from a
 boot. CI runs it on every change to the daemon.
 
@@ -180,6 +181,45 @@ other, and restored in 5 to 8 s. A request loop against the Service got only 200
 Who may pull is then a matter of RBAC: the `snapshotd-peers` ClusterRole, bound to the DaemonSet's
 ServiceAccount. Every daemon runs as that one account, so the proxy tells a daemon of this cluster
 from anything else, not one node's daemon from another's.
+
+## On OpenShift
+
+[`deploy/snapshotd/node-openshift`](../deploy/snapshotd/node-openshift) is the same daemon with
+four things swapped: it reads CRI-O's socket, it runs under the `nvidia` runtime class, which is
+what puts the driver's libraries and devices in its container, its ServiceAccount is bound to the
+`privileged` SCC, and the peers' certificate comes from the service CA instead of cert-manager.
+
+Run on OpenShift with CRI-O, SELinux enforcing and H100s: Qwen3-0.6B at TP=1 in a pod under the
+namespace's restricted SCC, three replicas on one node.
+
+| Replica | Ready after | How |
+| --- | --- | --- |
+| first | 76 s | 64 s cold boot, 6.4 s checkpoint (5.5 GiB), 3.3 s restore |
+| second and third | 12 s and 14 s | restore in 4.2 s and 3.1 s, each onto another GPU |
+
+All three answered a completion, and a restored pod stopped in 6 s.
+
+That run was the daemon alone on one node: the base manifest with the CRI-O socket and the
+runtime class, under a ServiceAccount that already had the `privileged` SCC. The overlay's own SCC
+binding and the peers with a service CA certificate have not been applied to a cluster.
+
+Two things had to change for SELinux:
+
+- CRIU hands its log to the processes it dumps, and a server in `container_t` may not append to a
+  file in the node's store, which is `container_var_lib_t`. The dump failed on that. CRIU's work
+  directory and log are now in the pod's own `/run/snapshotd/work`, and the daemon copies the log
+  into the checkpoint afterwards.
+- A restored process is a child of CRIU, which runs with the daemon's context, `spc_t`. Left
+  there the server is not confined, and its pod's shim, in `container_t`, may not signal it: a pod
+  took its whole grace period to stop. CRIU sets a restored process's label itself, but only when
+  it finds SELinux, and it looks for selinuxfs and `/etc/selinux/config`, which a pod's mount
+  namespace does not have. [`patches/criu`](../patches/criu) makes it go by its own process
+  label, the snapshot-agent image builds CRIU with libselinux, and the daemon passes the pod's
+  context to `criu restore`, so a restored server gets the label of the pod it is restored into.
+
+Not run there: a checkpoint restored into a pod whose MCS categories differ from the pod it was
+taken in (pods in one OpenShift namespace share theirs), and tensor parallel above 1, where a
+pod's processes have to read cuInterpose from the tools the daemon mounts.
 
 ## Through KServe
 

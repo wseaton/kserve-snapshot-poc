@@ -56,6 +56,12 @@ impl HostPid {
         bail!("process {self} has no child that is {pid} in its PID namespace")
     }
 
+    /// `None` on a node without SELinux.
+    pub fn selinux_context(self) -> Option<String> {
+        let attr = fs::read_to_string(format!("/proc/{self}/attr/current")).ok()?;
+        selinux_context(&attr).map(str::to_owned)
+    }
+
     pub async fn reaped(self, within: Duration) -> Result<()> {
         let deadline = Instant::now() + within;
         while Path::new(&format!("/proc/{self}")).exists() {
@@ -67,6 +73,11 @@ impl HostPid {
         }
         Ok(())
     }
+}
+
+fn selinux_context(attr: &str) -> Option<&str> {
+    let context = attr.trim_end_matches(['\0', '\n']);
+    (context.matches(':').count() >= 3 && !context.contains(' ')).then_some(context)
 }
 
 pub async fn run(command: &mut Command, what: &str) -> Result<()> {
@@ -107,7 +118,7 @@ pub async fn blocking<T: Send + 'static>(
 mod tests {
     use std::process::{Command, Stdio};
 
-    use crate::node::process::{HostPid, PodPid};
+    use crate::node::process::{HostPid, PodPid, selinux_context};
 
     fn sleeper() -> std::process::Child {
         Command::new("sleep")
@@ -128,6 +139,25 @@ mod tests {
         child.wait().unwrap();
         assert!(own.child(PodPid(pid)).is_err());
         assert!(HostPid(i32::MAX).child(PodPid(1)).is_err());
+    }
+
+    #[test]
+    fn only_an_selinux_context_is_taken_from_a_process_label() {
+        assert_eq!(
+            selinux_context("system_u:system_r:container_t:s0:c9,c39\0"),
+            Some("system_u:system_r:container_t:s0:c9,c39")
+        );
+        assert_eq!(
+            selinux_context("system_u:system_r:spc_t:s0\n"),
+            Some("system_u:system_r:spc_t:s0")
+        );
+        assert_eq!(
+            selinux_context("cri-containerd.apparmor.d (enforce)\n"),
+            None
+        );
+        assert_eq!(selinux_context("unconfined\n"), None);
+        assert_eq!(selinux_context("kernel"), None);
+        assert_eq!(selinux_context(""), None);
     }
 
     #[tokio::test]

@@ -5,6 +5,8 @@ on:
     paths:
       - daemon/**
       - images/snapshotd/**
+      - patches/criu/**
+      - upstream.tsv
       - experiments/bench/restore-bench.sh
       - experiments/bench/offload-check.sh
       - experiments/criu/noiouring.py
@@ -15,6 +17,8 @@ on:
     paths:
       - daemon/**
       - images/snapshotd/**
+      - patches/criu/**
+      - upstream.tsv
       - experiments/bench/restore-bench.sh
       - experiments/bench/offload-check.sh
       - experiments/criu/noiouring.py

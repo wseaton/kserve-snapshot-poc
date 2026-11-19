@@ -36,6 +36,7 @@ deploy/
     qwen3-8b/service/        the LLMInferenceService
   snapshotd/
     node/                    the snapshotd DaemonSet with peers, from daemon/deploy
+    node-openshift/          the same for OpenShift: CRI-O, the privileged SCC, the service CA
     workload/                an example Deployment for the daemon, from daemon/deploy
     workload-pd/             the same as a NIXL prefill Deployment and a decode Deployment
     kserve/                  the daemon under KServe; its README documents the layer
@@ -55,7 +56,8 @@ deploy/
 ## Before either path
 
 - `kubectl`, `kustomize` 5 or later, and `helm` for the agent's chart.
-- GPU nodes. Measured on 8x H200, host driver 580.126.09, containerd.
+- GPU nodes. Measured on 8x H200, host driver 580.126.09, containerd. One run on OpenShift with
+  CRI-O and H100s, see [On OpenShift](../docs/orchestration.md#on-openshift).
 - A `ReadWriteMany` storage class. The manifests name `shared-vast`.
 - For the RDMA parts, an InfiniBand device plugin that offers `rdma/ib`, and transparent huge
   pages on the nodes.

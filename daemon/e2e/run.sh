@@ -4,8 +4,8 @@
 #   daemon/e2e/run.sh
 #
 # It checks that the first replica of a revision is checkpointed and comes back as the same
-# process, that later replicas are restored from that checkpoint instead of booting, and that a
-# new revision boots and is checkpointed again.
+# process, that later replicas are restored from that checkpoint instead of booting and carry
+# their pod's security label, and that a new revision boots and is checkpointed again.
 #
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e)
@@ -34,6 +34,9 @@ settle() {
 addresses() { k get pods -l app=stand-in -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'; }
 info() { k -n snapshotd exec ds/snapshotd -c snapshotd -- stand-in info "$1:50051"; }
 restores() { k -n snapshotd logs ds/snapshotd -c snapshotd | grep -c "restored .*from=.*/image" || true; }
+# The security label of a process in a pod, empty on a node without an LSM.
+label() { k exec "$1" -- sh -c "tr -d '\\0' < /proc/$2/attr/current" 2>/dev/null || true; }
+server() { k exec "$1" -- cut -d' ' -f1 /proc/1/task/1/children; }
 
 settle 1
 first=$(info "$(addresses)")
@@ -49,6 +52,11 @@ for address in $(addresses); do
   [ "$got" = "$first" ] || fail "replica $address is not a restore of the first: $got"
 done
 [ "$(restores)" = 2 ] || fail "expected 2 restores from the node's checkpoint, saw $(restores)"
+for pod in $(k get pods -l app=stand-in -o name); do
+  own=$(label "$pod" 1) restored=$(label "$pod" "$(server "$pod")")
+  [ "$restored" = "$own" ] || fail "the restored server in $pod is labelled '$restored', its pod '$own'"
+done
+echo "restored servers carry their pod's label: '${own:-none}'"
 
 # One pod at a time through the new revision: pods of a revision that start together each boot
 # and checkpoint, and only one of those checkpoints is kept.

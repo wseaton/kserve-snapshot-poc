@@ -64,14 +64,31 @@ RUN grep -q "rev = \"${NIXL_REF}\"" /tmp/Cargo.toml \
 COPY daemon /src/daemon
 RUN cd /src/daemon && cargo build --release --locked --features nixl
 
-FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS e2e
-RUN dnf install -y --setopt=install_weak_deps=False criu util-linux openssl-libs \
+FROM rust AS criu
+RUN dnf install -y --setopt=install_weak_deps=False \
+        libbsd-devel libcap-devel libnet-devel libnl3-devel protobuf-c-devel protobuf-devel \
+        protobuf-compiler gnutls-devel nftables-devel libuuid-devel libselinux-devel python3 perl \
     && dnf clean all
+COPY upstream.tsv /src/upstream.tsv
+COPY patches/criu /src/patches/criu
+RUN set -eux; \
+    git init -q /src/criu; cd /src/criu; \
+    git fetch -q --depth 1 $(awk '$1 == "criu" { print $2, $3 }' /src/upstream.tsv); \
+    git checkout -q FETCH_HEAD; \
+    git apply /src/patches/criu/*.patch; \
+    make -j"$(nproc)" criu; \
+    ldd criu/criu | grep -q libselinux
+
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS e2e
+RUN dnf install -y --setopt=install_weak_deps=False \
+        libbsd libcap libnet libnl3 protobuf-c gnutls nftables libuuid libselinux \
+        util-linux openssl-libs \
+    && dnf clean all
+COPY --from=criu /src/criu/criu/criu /opt/tools/criu
 COPY --from=plain /src/daemon/target/release/snapshotd /src/daemon/target/release/snapshotd-shim /usr/local/bin/
 COPY --from=plain /src/daemon/target/release/examples/stand_in /usr/local/bin/stand-in
 RUN set -eux; \
     mkdir -p /opt/tools/lib /opt/tools/criu-plugins; \
-    cp "$(command -v criu)" /opt/tools/criu; \
     /opt/tools/criu --version; \
     snapshotd --help > /dev/null; \
     snapshotd-shim --help > /dev/null; \
@@ -100,13 +117,15 @@ ENV PATH="/usr/local/ucx/bin:${PATH}"
 ENV HOME=/tmp
 
 FROM runtime AS e2e-peers
-RUN dnf install -y --setopt=install_weak_deps=False criu curl openssl \
+RUN dnf install -y --setopt=install_weak_deps=False \
+        libbsd libcap libnet libnl3 protobuf-c gnutls nftables libuuid libselinux \
+        curl openssl \
     && dnf clean all
+COPY --from=criu /src/criu/criu/criu /opt/tools/criu
 COPY --from=plain /src/daemon/target/release/examples/stand_in /usr/local/bin/stand-in
 RUN set -eux; \
     ln -s /opt/snapshotd/bin/snapshotd-shim /usr/local/bin/snapshotd-shim; \
     mkdir -p /opt/tools/lib /opt/tools/criu-plugins; \
-    cp "$(command -v criu)" /opt/tools/criu; \
     /opt/tools/criu --version; \
     snapshotd node --help | grep -q topology-levels; \
     stand-in --help > /dev/null

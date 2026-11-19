@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Clone an upstream project at its pinned base commit and apply this repo's patches to it.
 #
-#   ./checkout.sh vllm|modelexpress|dynamo-snapshot [DEST]
+#   ./checkout.sh vllm|modelexpress|dynamo-snapshot|criu [DEST]
 #
 # DEST defaults to src/<project>. Patches made with git format-patch are applied with git am, so
 # each becomes a commit; plain diffs are applied with git apply and left uncommitted.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
-project=${1:?usage: $0 vllm|modelexpress|dynamo-snapshot [DEST]}
+project=${1:?usage: $0 vllm|modelexpress|dynamo-snapshot|criu [DEST]}
 dest=${2:-$root/src/$project}
 read -r _ repo base _ < <(awk -v p="$project" '$1 == p' "$root/upstream.tsv")
 [ -n "${repo:-}" ] || { echo "unknown project $project" >&2; exit 2; }

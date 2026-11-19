@@ -1,0 +1,29 @@
+Decide whether SELinux is in force from this process's label.
+
+is_selinux_enabled() needs selinuxfs mounted and /etc/selinux/config
+present. A container's mount namespace has neither, so a criu run in one
+concludes there is no LSM: it dumps no labels, and what it restores keeps
+criu's own label instead of the container's.
+
+diff --git a/criu/lsm.c b/criu/lsm.c
+index 0ea2957..9bda04c 100644
+--- a/criu/lsm.c
++++ b/criu/lsm.c
+@@ -236,13 +236,13 @@ void kerndat_lsm(void)
+ 	}
+ 
+ #ifdef CONFIG_HAS_SELINUX
+-	if (is_selinux_enabled()) {
++	{
+ 		char *ctx;
+ 
+ 		/*
+-		 * CRIU used to only check if /sys/fs/selinux is mounted, but that does not
+-		 * seem to be enough for CRIU's use case. CRIU actually needs to look if
+-		 * a valid label is returned.
++		 * is_selinux_enabled() wants selinuxfs mounted and /etc/selinux/config
++		 * present, and a container's mount namespace has neither. The label
++		 * the kernel reports for this process does not depend on them.
+ 		 */
+ 		if (getpidcon_raw(getpid(), &ctx) < 0)
+ 			goto no_lsm;

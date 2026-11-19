@@ -201,14 +201,16 @@ impl Pod {
             .await?;
         }
         self.mount(image, IMAGE).await?;
+        fs::create_dir_all(self.init.root(WORK)).context("create the work directory")?;
+        let log = self.init.root(&format!("{WORK}/dump.log"));
         step("CRIU dump", async {
             criu::run(
                 criu::command(self.init, "dump")
                     .args(["-t", &root.to_string()])
-                    .args(["-D", &format!("{IMAGE}/img"), "-W", &format!("{IMAGE}/img")])
+                    .args(["-D", &format!("{IMAGE}/img"), "-W", WORK])
                     .args(["--ghost-limit", "1G", "-o", "dump.log"]),
                 "criu dump",
-                &image.join("img/dump.log"),
+                &log,
             )
             .await?;
             server
@@ -220,6 +222,7 @@ impl Pod {
             copy_tree(&self.init.root("/dev/shm"), &image.join("shm")).await?;
             fs::copy(self.init.root(SERVER_LOG), image.join("server.log"))
                 .context("copy the server's log")?;
+            fs::copy(&log, image.join("dump.log")).context("copy CRIU's log")?;
             Ok(())
         })
         .await?;
@@ -260,6 +263,9 @@ impl Pod {
         })
         .await?;
         let mut restore = criu::command(self.init, "restore");
+        if let Some(context) = self.init.selinux_context() {
+            restore.args(["--lsm-profile", &format!("selinux:{context}")]);
+        }
         if manifest.address != self.address() {
             info!(
                 from = %manifest.address,

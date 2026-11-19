@@ -10,6 +10,7 @@ patches.
 | [`vllm/`](vllm) | `a2bcb565`, a nightly that includes the checkpoint lifecycle from [vllm-project/vllm#62570](https://github.com/vllm-project/vllm/pull/62570) |
 | [`modelexpress/`](modelexpress) | `main` at `8b2e8787`, which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854) |
 | [`dynamo-snapshot/`](dynamo-snapshot) | `bc9d216` |
+| [`criu/`](criu) | `criu-dev` at `1a935857`, the commit the snapshot-agent image builds |
 
 **vLLM**
 - `0001`: [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011) (open), carried
@@ -49,3 +50,11 @@ patches.
   marker mounts at dump, and log every CRIU error line on a failed restore.
 - `0002`: expose cuInterpose's coordinator as a library, so a node agent can run its phases
   in-process. Proposed for upstream; see [docs/design.md](../docs/design.md).
+- `0003`: build the image's CRIU with libselinux and with the patches in an `agent/criu/`
+  directory, which the image workflow fills from [`criu/`](criu).
+
+**CRIU**
+- `0001`: decide whether SELinux is in force from the process's own label instead of
+  `is_selinux_enabled()`. That call needs selinuxfs and `/etc/selinux/config`, and the daemon runs
+  CRIU in the pod's mount namespace, which has neither. Without it a restored server keeps the
+  daemon's context, `spc_t`, instead of its pod's.

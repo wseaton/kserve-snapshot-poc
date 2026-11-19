@@ -1,0 +1,24 @@
+diff --git a/agent/Dockerfile b/agent/Dockerfile
+index 000ce25..6b1c836 100644
+--- a/agent/Dockerfile
++++ b/agent/Dockerfile
+@@ -215,15 +215,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     python3-protobuf \
+     libgnutls28-dev \
+     libnftables-dev \
++    libselinux1-dev \
+     uuid-dev \
+     && rm -rf /var/lib/apt/lists/*
+ 
++COPY criu/ /tmp/criu-patches/
+ RUN git init /tmp/criu \
+     && cd /tmp/criu \
+     && git remote add origin ${CRIU_REPO} \
+     && git fetch --depth 1 origin ${CRIU_REF} \
+     && git checkout FETCH_HEAD \
++    && git apply /tmp/criu-patches/*.patch \
+     && make -j${BUILD_JOBS} \
++    && ldd criu/criu | grep -q libselinux \
+     && make DESTDIR=/criu-install install-criu install-lib install-cuda_plugin
+ 
+ COPY plugins/inet-remap/snapshot_inet_remap.c /tmp/snapshot_inet_remap.c
