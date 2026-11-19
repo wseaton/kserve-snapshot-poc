@@ -52,6 +52,7 @@ kubectl apply -k deploy/snapshotd/node       # the DaemonSet; needs cert-manager
 kubectl apply -k deploy/snapshotd/workload   # an example Deployment, Qwen3-8B
 kubectl apply -k deploy/snapshotd/kserve/qwen3-8b   # or the same model as an LLMInferenceService
 daemon/e2e/run.sh                            # the whole flow on kind, no GPU, a stand-in for vLLM
+daemon/e2e/peers.sh                          # checkpoints between nodes, on three kind workers
 ```
 
 `daemon/e2e/run.sh` builds one image with `snapshotd`, a stand-in server and the distribution's
@@ -60,6 +61,12 @@ comes back as the same process, that later replicas are restores of it, and that
 boots fresh. The stand-in ([daemon/examples/stand_in.rs](../daemon/examples/stand_in.rs)) serves
 vLLM's checkpoint RPCs and an instance ID drawn at start, which is how a restore is told from a
 boot. CI runs it on every change to the daemon.
+
+`daemon/e2e/peers.sh` does the same on three workers with the daemon built with NIXL, a
+kube-rbac-proxy in front of each and node labels for two racks. It checks that a node without a
+checkpoint pulls it and restores from it, that a node with holders in its own rack and in the
+other pulls from its own, that the proxy answers a daemon's token and nothing else, and that two
+nodes pull from each other at once, one of the servers having started prepared. CI runs it too.
 
 ## What the daemon does by itself
 

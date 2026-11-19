@@ -77,7 +77,7 @@ RUN set -eux; \
     snapshotd-shim --help > /dev/null; \
     stand-in --help > /dev/null
 
-FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS runtime
 RUN dnf install -y --setopt=install_weak_deps=False \
         rdma-core libibverbs libibverbs-utils librdmacm libibumad infiniband-diags \
         numactl-libs hwloc-libs \
@@ -98,3 +98,17 @@ RUN set -eux; \
     /opt/snapshotd/bin/snapshotd-shim --help >/dev/null
 ENV PATH="/usr/local/ucx/bin:${PATH}"
 ENV HOME=/tmp
+
+FROM runtime AS e2e-peers
+RUN dnf install -y --setopt=install_weak_deps=False criu curl openssl \
+    && dnf clean all
+COPY --from=plain /src/daemon/target/release/examples/stand_in /usr/local/bin/stand-in
+RUN set -eux; \
+    ln -s /opt/snapshotd/bin/snapshotd-shim /usr/local/bin/snapshotd-shim; \
+    mkdir -p /opt/tools/lib /opt/tools/criu-plugins; \
+    cp "$(command -v criu)" /opt/tools/criu; \
+    /opt/tools/criu --version; \
+    snapshotd node --help | grep -q topology-levels; \
+    stand-in --help > /dev/null
+
+FROM runtime

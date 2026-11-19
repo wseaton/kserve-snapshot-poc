@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshotd
+spec:
+  template:
+    spec:
+      nodeSelector: null
+      initContainers:
+        - name: tools
+          imagePullPolicy: Never
+          command: [cp, -a, /opt/tools/., /tools/]
+      containers:
+        - name: snapshotd
+          imagePullPolicy: Never
+          args:
+            - --store-dir=/store
+            - --tools-dir=/tools
+            - --min-free-gib=1
+          env:
+            - name: SNAPSHOTD_TOPOLOGY_LEVELS
+              value: e2e.snapshotd/rack,kubernetes.io/hostname
+            - name: SNAPSHOTD_SLOTS
+              value: "4"
+            - name: SNAPSHOTD_SLOT_MIB
+              value: "2"
+            - name: UCX_TLS
+              value: tcp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi

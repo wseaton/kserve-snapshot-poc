@@ -25,10 +25,11 @@ checkpoints between nodes needs the `nixl` feature and NIXL installed.
 cargo build --release --workspace
 cargo test --workspace
 e2e/run.sh        # the daemon and shim on kind, with a stand-in for vLLM
+e2e/peers.sh      # checkpoints between nodes: three kind workers, NIXL, kube-rbac-proxy
 ```
 
 [`images/snapshotd`](../images/snapshotd) builds both on Fedora with the toolchain from rustup,
-and has the kind test's image as its `e2e` target.
+and has the kind tests' images as its `e2e` and `e2e-peers` targets.
 
 ## CUDA checkpoint
 

@@ -58,8 +58,18 @@ jobs:
       - uses: docker/setup-buildx-action@v4
       - run: daemon/e2e/run.sh
 
+  e2e-peers:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - run: daemon/e2e/peers.sh
+
   image:
-    needs: [check, e2e]
+    needs: [check, e2e, e2e-peers]
     runs-on: ubuntu-latest
     permissions:
       contents: read

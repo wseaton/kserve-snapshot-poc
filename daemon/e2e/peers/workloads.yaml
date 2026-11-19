@@ -1,0 +1,121 @@
+# near-far lands on the far rack first, then on each node of the near rack.
+# left and right start on different nodes of the near rack and then swap.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: near-far
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: near-far}
+  template:
+    metadata:
+      labels:
+        app: near-far
+        snapshot.llm-d.ai/workload: near-far
+    spec:
+      terminationGracePeriodSeconds: 2
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["1"]}
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["2"]}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: near-far}
+      containers:
+        - name: main
+          image: localhost/snapshotd-e2e-peers:dev
+          imagePullPolicy: Never
+          command: [snapshotd-shim, --, stand-in, serve]
+          readinessProbe:
+            tcpSocket: {port: 8001}
+            periodSeconds: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: left
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: left}
+  template:
+    metadata:
+      labels:
+        app: left
+        snapshot.llm-d.ai/workload: left
+    spec:
+      terminationGracePeriodSeconds: 2
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["2", "3"]}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["3"]}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: left}
+      containers:
+        - name: main
+          image: localhost/snapshotd-e2e-peers:dev
+          imagePullPolicy: Never
+          command: [snapshotd-shim, --, stand-in, serve]
+          readinessProbe:
+            tcpSocket: {port: 8001}
+            periodSeconds: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: right
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: right}
+  template:
+    metadata:
+      labels:
+        app: right
+        snapshot.llm-d.ai/workload: right
+    spec:
+      terminationGracePeriodSeconds: 2
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["2", "3"]}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: e2e.snapshotd/order, operator: In, values: ["2"]}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: right}
+      containers:
+        - name: main
+          image: localhost/snapshotd-e2e-peers:dev
+          imagePullPolicy: Never
+          command: [snapshotd-shim, --, stand-in, serve, --prepared]
+          readinessProbe:
+            httpGet: {port: 8001}
+            periodSeconds: 1
