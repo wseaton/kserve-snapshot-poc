@@ -34,8 +34,8 @@ use nixl_sys::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::encrypt::{Place, Tag, TransferKey};
 use crate::image::{self, Arena, Extent, HugeRegion, Store, huge_page_fraction};
-use crate::seal::{Place, Seal, TransferKey};
 use crate::store::ensure_room;
 use crate::trace::{self, FILE_TRACKS, Trace};
 use walkdir::WalkDir;
@@ -110,7 +110,7 @@ enum Message {
         offset: u64,
         len: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        seal: Option<Seal>,
+        tag: Option<Tag>,
     },
     Ack {
         slot: usize,
@@ -323,7 +323,7 @@ pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) 
     Ok(())
 }
 
-/// Chunks are sealed with `key` when there is one. Returns how the transfer went.
+/// Chunks are encrypted with `key` when there is one. Returns how the transfer went.
 pub fn send_over(
     stream: impl Control,
     dir: &Path,
@@ -381,7 +381,7 @@ pub fn send_over(
     let jobs = Mutex::new(jobs.into_iter());
     let read_ns = AtomicU64::new(0);
     let rdma_ns = AtomicU64::new(0);
-    let sealed = AtomicU64::new(0);
+    let encrypted = AtomicU64::new(0);
     let (post_tx, post_rx) = mpsc::channel::<(usize, usize)>();
     let mut written_tx = Vec::new();
     let mut ack_tx = Vec::new();
@@ -418,7 +418,7 @@ pub fn send_over(
             .map(|(slot, (written, acked))| {
                 let (jobs, handles, stream, post_tx) = (&jobs, &handles, &stream, post_tx.clone());
                 let trace = &trace;
-                let (read_ns, rdma_ns, sealed) = (&read_ns, &rdma_ns, &sealed);
+                let (read_ns, rdma_ns, encrypted) = (&read_ns, &rdma_ns, &encrypted);
                 scope.spawn(move || -> Result<()> {
                     loop {
                         let next = jobs
@@ -434,10 +434,10 @@ pub fn send_over(
                         handles[job.file]
                             .read_exact_at(buffer, job.offset)
                             .with_context(|| format!("read file {} at {}", job.file, job.offset))?;
-                        let seal = key
+                        let tag = key
                             .map(|key| {
-                                let counter = sealed.fetch_add(1, Ordering::Relaxed);
-                                key.seal(counter, job.place(), buffer)
+                                let counter = encrypted.fetch_add(1, Ordering::Relaxed);
+                                key.encrypt(counter, job.place(), buffer)
                             })
                             .transpose()?;
                         add(read_ns, read);
@@ -462,7 +462,7 @@ pub fn send_over(
                                 file: job.file,
                                 offset: job.offset,
                                 len: job.len,
-                                seal,
+                                tag,
                             },
                         )?;
                         acked
@@ -786,7 +786,7 @@ pub fn receive_directory(
 
 /// Write what the sender at the other end of `stream` sends under `dir`, or
 /// into `arena` when there is one; the held image is returned then. With a
-/// `key`, every chunk must have been sealed with it.
+/// `key`, every chunk must have been encrypted with it.
 pub fn receive_over(
     stream: impl Control,
     dir: &Path,
@@ -846,22 +846,22 @@ pub fn receive_over(
         let mut writers = Vec::new();
         let mut queues = Vec::new();
         for slot in 0..pool.slots {
-            let (tx, rx) = mpsc::channel::<(Job, Option<Seal>)>();
+            let (tx, rx) = mpsc::channel::<(Job, Option<Tag>)>();
             queues.push(tx);
             let (destination, stream, write_ns) = (&destination, Arc::clone(&stream), &write_ns);
             let (trace, written, arena) = (&trace, &written, arena.as_ref());
             writers.push(scope.spawn(move || -> Result<()> {
                 let run = || -> Result<()> {
-                    for (job, seal) in rx {
+                    for (job, tag) in rx {
                         let write = Instant::now();
                         let write_at = trace::now();
                         // SAFETY: the sender does not reuse a slot before its
                         // acknowledgement, so nothing else touches it now.
                         let buffer = unsafe { slots.slice_mut(slot, job.len) };
-                        match (key, seal) {
-                            (Some(key), Some(seal)) => key.open(&seal, job.place(), buffer)?,
-                            (Some(_), None) => bail!("the sender did not seal a chunk"),
-                            (None, Some(_)) => bail!("a sealed chunk and no key to open it"),
+                        match (key, tag) {
+                            (Some(key), Some(tag)) => key.decrypt(&tag, job.place(), buffer)?,
+                            (Some(_), None) => bail!("the sender did not encrypt a chunk"),
+                            (None, Some(_)) => bail!("an encrypted chunk and no key for it"),
                             (None, None) => {}
                         }
                         destination(job.file)?
@@ -906,14 +906,14 @@ pub fn receive_over(
                     file,
                     offset,
                     len,
-                    seal,
+                    tag,
                 } => {
                     ensure!(
                         slot < pool.slots && len <= pool.slot_bytes(),
                         "chunk out of range"
                     );
                     queues[slot]
-                        .send((Job { file, offset, len }, seal))
+                        .send((Job { file, offset, len }, tag))
                         .map_err(|_| anyhow!("the writer for slot {slot} stopped"))?;
                 }
                 Message::Open { file, path } => {
@@ -1135,7 +1135,7 @@ pub fn stream_capture(
                                     file,
                                     offset,
                                     len: filled,
-                                    seal: None,
+                                    tag: None,
                                 },
                             )?;
                             trace.counter(

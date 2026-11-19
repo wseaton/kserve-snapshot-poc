@@ -28,7 +28,7 @@ use tokio::time::{sleep, timeout};
 use tokio_openssl::SslStream;
 use tracing::{Instrument, debug, warn};
 
-use crate::seal::TransferKey;
+use crate::encrypt::TransferKey;
 use crate::store::RevisionKey;
 
 const PROTOCOL: &str = "snapshotd-transfer/1";

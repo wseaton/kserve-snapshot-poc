@@ -18,9 +18,9 @@ pub struct Place {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct Seal {
+pub struct Tag {
     counter: u64,
-    tag: [u8; TAG_BYTES],
+    mac: [u8; TAG_BYTES],
 }
 
 impl Place {
@@ -68,7 +68,7 @@ impl TransferKey {
     }
 
     /// `counter` must not repeat under this key.
-    pub fn seal(&self, counter: u64, place: Place, data: &mut [u8]) -> Result<Seal> {
+    pub fn encrypt(&self, counter: u64, place: Place, data: &mut [u8]) -> Result<Tag> {
         ensure!(data.len() == place.len, "the chunk is not its stated size");
         let mut context = CipherCtx::new()?;
         context.encrypt_init(
@@ -79,34 +79,34 @@ impl TransferKey {
         context.cipher_update(&place.bytes(), None)?;
         run(&mut context, data)?;
         context.cipher_final(&mut [])?;
-        let mut tag = [0; TAG_BYTES];
-        context.tag(&mut tag)?;
-        Ok(Seal { counter, tag })
+        let mut mac = [0; TAG_BYTES];
+        context.tag(&mut mac)?;
+        Ok(Tag { counter, mac })
     }
 
     /// On an error `data` holds nothing that may be used.
-    pub fn open(&self, seal: &Seal, place: Place, data: &mut [u8]) -> Result<()> {
+    pub fn decrypt(&self, tag: &Tag, place: Place, data: &mut [u8]) -> Result<()> {
         ensure!(data.len() == place.len, "the chunk is not its stated size");
         let mut context = CipherCtx::new()?;
         context.decrypt_init(
             Some(Cipher::aes_256_gcm()),
             Some(&self.0),
-            Some(&Self::nonce(seal.counter)),
+            Some(&Self::nonce(tag.counter)),
         )?;
         context.cipher_update(&place.bytes(), None)?;
         run(&mut context, data)?;
-        context.set_tag(&seal.tag)?;
+        context.set_tag(&tag.mac)?;
         context
             .cipher_final(&mut [])
             .ok()
-            .with_context(|| format!("the chunk at {place:?} is not what the sender sealed"))?;
+            .with_context(|| format!("the chunk at {place:?} is not what the sender encrypted"))?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::seal::{PIECE, Place, TransferKey};
+    use crate::encrypt::{PIECE, Place, TransferKey};
 
     fn chunk(len: usize) -> (Place, Vec<u8>) {
         let place = Place {
@@ -118,29 +118,29 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_chunk_opens_to_what_it_was() {
+    fn an_encrypted_chunk_decrypts_to_what_it_was() {
         let key = TransferKey::generate().unwrap();
         for len in [0, 1, 4096, PIECE + 12345] {
             let (place, plain) = chunk(len);
             let mut data = plain.clone();
-            let seal = key.seal(7, place, &mut data).unwrap();
+            let tag = key.encrypt(7, place, &mut data).unwrap();
             assert!(len < 16 || data != plain, "{len} bytes left in the clear");
-            let seal = serde_json::from_str(&serde_json::to_string(&seal).unwrap()).unwrap();
+            let tag = serde_json::from_str(&serde_json::to_string(&tag).unwrap()).unwrap();
             let same_key = TransferKey::from_bytes(*key.as_bytes());
-            same_key.open(&seal, place, &mut data).unwrap();
+            same_key.decrypt(&tag, place, &mut data).unwrap();
             assert_eq!(data, plain, "{len} bytes");
         }
     }
 
     #[test]
-    fn a_chunk_opens_only_with_its_key_place_and_bytes() {
+    fn a_chunk_decrypts_only_with_its_key_place_and_bytes() {
         let key = TransferKey::generate().unwrap();
         let (place, plain) = chunk(4096);
-        let mut sealed = plain.clone();
-        let seal = key.seal(1, place, &mut sealed).unwrap();
+        let mut encrypted = plain.clone();
+        let tag = key.encrypt(1, place, &mut encrypted).unwrap();
 
         let other = TransferKey::generate().unwrap();
-        assert!(other.open(&seal, place, &mut sealed.clone()).is_err());
+        assert!(other.decrypt(&tag, place, &mut encrypted.clone()).is_err());
 
         for moved in [
             Place { file: 4, ..place },
@@ -149,34 +149,34 @@ mod tests {
                 ..place
             },
         ] {
-            assert!(key.open(&seal, moved, &mut sealed.clone()).is_err());
+            assert!(key.decrypt(&tag, moved, &mut encrypted.clone()).is_err());
         }
         assert!(
-            key.open(
-                &seal,
+            key.decrypt(
+                &tag,
                 Place { len: 4095, ..place },
-                &mut sealed[..4095].to_vec()
+                &mut encrypted[..4095].to_vec()
             )
             .is_err()
         );
 
-        let mut flipped = sealed.clone();
+        let mut flipped = encrypted.clone();
         flipped[2000] ^= 1;
-        assert!(key.open(&seal, place, &mut flipped).is_err());
+        assert!(key.decrypt(&tag, place, &mut flipped).is_err());
 
         let mut again = plain.clone();
-        let later = key.seal(2, place, &mut again).unwrap();
-        assert_ne!(again, sealed, "two counters gave one ciphertext");
-        assert!(key.open(&later, place, &mut sealed.clone()).is_err());
+        let later = key.encrypt(2, place, &mut again).unwrap();
+        assert_ne!(again, encrypted, "two counters gave one ciphertext");
+        assert!(key.decrypt(&later, place, &mut encrypted.clone()).is_err());
 
-        key.open(&seal, place, &mut sealed).unwrap();
-        assert_eq!(sealed, plain);
+        key.decrypt(&tag, place, &mut encrypted).unwrap();
+        assert_eq!(encrypted, plain);
     }
 
     #[test]
-    fn a_chunk_of_the_wrong_size_is_not_sealed() {
+    fn a_chunk_of_the_wrong_size_is_not_encrypted() {
         let key = TransferKey::generate().unwrap();
         let (place, mut data) = chunk(64);
-        assert!(key.seal(1, place, &mut data[..63]).is_err());
+        assert!(key.encrypt(1, place, &mut data[..63]).is_err());
     }
 }

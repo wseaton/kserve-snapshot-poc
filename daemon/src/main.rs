@@ -5,14 +5,14 @@
 mod cri;
 mod cuda;
 mod cuinterpose;
+#[cfg(any(test, feature = "nixl"))]
+mod encrypt;
 mod image;
 mod inject;
 mod node;
 #[cfg(feature = "nixl")]
 mod peer;
 mod podresources;
-#[cfg(any(test, feature = "nixl"))]
-mod seal;
 mod store;
 #[cfg(feature = "nixl")]
 mod trace;

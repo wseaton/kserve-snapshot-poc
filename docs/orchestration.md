@@ -96,7 +96,7 @@ sequenceDiagram
   P->>H: the request, on localhost
   H-->>A: 101, then a key made for this transfer
   H->>A: control messages, through the proxy
-  H-->>A: chunks over NIXL (RDMA or TCP), each sealed with the key
+  H-->>A: chunks over NIXL (RDMA or TCP), each encrypted with the key
 ```
 
 - Each daemon listens on localhost only. What other pods can reach is the
@@ -128,7 +128,9 @@ from anything else, not one node's daemon from another's.
 
 [deploy/snapshotd/kserve/config-layer](../deploy/snapshotd/kserve/config-layer) is an
 `LLMInferenceServiceConfig` named `snapshotd`. A service opts in with `baseRefs: [{name: snapshotd}]`
-and nothing else; there is no webhook or controller. The layer:
+and nothing else; there is no webhook or controller.
+[deploy/snapshotd/kserve](../deploy/snapshotd/kserve/README.md) documents every field it sets, how
+KServe merges it, and what a service may still change. In short, the layer:
 
 - labels the pods `snapshot.llm-d.ai/workload: <service name>`;
 - adds the init container that brings the shim, and wraps KServe's `vllm serve` command in it, with
