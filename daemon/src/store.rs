@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, ensure};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RevisionKey {
     namespace: String,
     workload: String,

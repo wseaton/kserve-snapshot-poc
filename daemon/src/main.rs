@@ -9,6 +9,8 @@ mod cuinterpose;
 mod encrypt;
 mod image;
 mod inject;
+#[cfg(any(test, feature = "nixl"))]
+mod lanes;
 mod node;
 #[cfg(feature = "nixl")]
 mod peer;

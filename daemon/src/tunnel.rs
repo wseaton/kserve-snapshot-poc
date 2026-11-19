@@ -273,6 +273,22 @@ pub async fn ask<T: Send + 'static>(
     }
 }
 
+/// The order in which the daemon at `own` asks `peers`. It only spreads
+/// askers over the peers, so they do not all start with the same one; a
+/// ranking by distance or load belongs here.
+pub fn ask_order(own: std::net::IpAddr, mut peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    peers.sort();
+    peers.dedup();
+    if !peers.is_empty() {
+        let mut hasher = DefaultHasher::new();
+        own.hash(&mut hasher);
+        let start = hasher.finish() as usize % peers.len();
+        peers.rotate_left(start);
+    }
+    peers
+}
+
 pub fn host(name: &str) -> Result<&str> {
     let (host, port) = name
         .rsplit_once(':')
@@ -306,7 +322,7 @@ mod tests {
     use tokio_openssl::SslStream;
 
     use crate::store::RevisionKey;
-    use crate::tunnel::{Identity, Refusal, Tunnel, Work, ask, host, serve};
+    use crate::tunnel::{Identity, Refusal, Tunnel, Work, ask, ask_order, host, serve};
 
     const NAME: &str = "snapshotd-peers.snapshotd.svc";
 
@@ -587,6 +603,32 @@ mod tests {
             assert!(status.starts_with(wanted), "{request}: {status}");
         }
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn askers_start_with_different_peers_and_each_asks_every_peer() {
+        let peers: Vec<SocketAddr> = (1..=8)
+            .map(|n| format!("10.0.0.{n}:8443").parse().unwrap())
+            .collect();
+        let mut firsts = std::collections::HashSet::new();
+        for asker in 1..=32 {
+            let own = format!("10.0.1.{asker}").parse().unwrap();
+            let mut shuffled = peers.clone();
+            shuffled.reverse();
+            shuffled.push(peers[0]);
+            let order = ask_order(own, shuffled);
+            assert_eq!(order, ask_order(own, peers.clone()));
+            firsts.insert(order[0]);
+            let mut sorted = order;
+            sorted.sort();
+            assert_eq!(sorted, peers);
+        }
+        assert!(
+            firsts.len() >= 4,
+            "32 askers started at {} peers",
+            firsts.len()
+        );
+        assert!(ask_order("10.0.1.1".parse().unwrap(), Vec::new()).is_empty());
     }
 
     #[test]

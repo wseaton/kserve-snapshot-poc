@@ -2,15 +2,16 @@
 //! asks for a revision this node holds, and ask peers for one it lacks.
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
+use crate::lanes::Lanes;
 use crate::store::{RevisionKey, RevisionStore, directory_bytes};
 use crate::transfer::{self, Endpoint, Pool};
 use crate::tunnel::{self, Identity, Refusal, Tunnel, Work};
@@ -49,69 +50,12 @@ pub struct Args {
     /// busy sending it.
     #[arg(long, env = "SNAPSHOTD_PEER_BUSY_TIMEOUT_S", default_value_t = 300)]
     peer_busy_timeout_s: u64,
+    /// Transfers this daemon takes part in at once, sending or receiving.
+    /// The pool's slots are split between them.
+    #[arg(long, env = "SNAPSHOTD_TRANSFER_LANES", default_value_t = 2)]
+    transfer_lanes: usize,
     #[command(flatten)]
     pool: Pool,
-}
-
-type Job = Box<dyn FnOnce(Result<&Endpoint>) -> bool + Send>;
-
-/// The thread every transfer of this daemon runs on, in either direction,
-/// with the one registered pool they share. The pool is made by the first
-/// transfer and kept: making one costs seconds, or far longer on a node
-/// whose memory is fragmented.
-#[derive(Clone)]
-struct Transfers {
-    jobs: mpsc::Sender<Job>,
-}
-
-impl Transfers {
-    fn start(name: String, pool: Pool) -> Result<Self> {
-        let (jobs, queue) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("transfers".to_string())
-            .spawn(move || {
-                let mut endpoint = None;
-                for job in queue {
-                    if endpoint.is_none() {
-                        match Endpoint::new(&name, pool, false) {
-                            Ok(made) => endpoint = Some(made),
-                            Err(error) => {
-                                job(Err(error));
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some(ready) = &endpoint
-                        && !job(Ok(ready))
-                    {
-                        endpoint = None;
-                    }
-                }
-            })
-            .context("start the transfer thread")?;
-        Ok(Self { jobs })
-    }
-
-    /// Run `work` with the pool and wait for it. A pool that a transfer
-    /// failed on is not used again.
-    fn run<T: Send + 'static>(
-        &self,
-        work: impl FnOnce(&Endpoint) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let (done, outcome) = mpsc::channel();
-        let job: Job = Box::new(move |endpoint| {
-            let result = endpoint.and_then(work);
-            let fine = result.is_ok();
-            let _ = done.send(result);
-            fine
-        });
-        self.jobs
-            .send(job)
-            .map_err(|_| anyhow!("the transfer thread stopped"))?;
-        outcome
-            .recv()
-            .context("the transfer thread dropped a transfer")?
-    }
 }
 
 pub struct Peers {
@@ -120,10 +64,12 @@ pub struct Peers {
     identity: Identity,
     busy_timeout: Duration,
     store: PathBuf,
-    transfers: Transfers,
-    /// Held by the one transfer this daemon takes part in, sending or
-    /// receiving.
-    turn: Arc<Semaphore>,
+    /// One lane for each transfer this daemon can take part in at once,
+    /// sending or receiving, each with its share of the registered pool.
+    transfers: Lanes<Endpoint>,
+    /// A permit for each lane. A pull takes one before it asks, so a lane
+    /// is free for what the peer sends back.
+    turns: Arc<Semaphore>,
 }
 
 impl Peers {
@@ -133,6 +79,13 @@ impl Peers {
         else {
             return Ok(None);
         };
+        let lanes = args.transfer_lanes;
+        ensure!(lanes > 0, "--transfer-lanes must be at least 1");
+        let pool = Pool {
+            slots: (args.pool.slots / lanes).max(1),
+            slot_mib: args.pool.slot_mib,
+        };
+        let agent = format!("snapshotd-{own_ip}-{}", std::process::id());
         let peers = Arc::new(Self {
             name: name.clone(),
             own_ip,
@@ -145,11 +98,10 @@ impl Peers {
             },
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             store: store.to_path_buf(),
-            transfers: Transfers::start(
-                format!("snapshotd-{own_ip}-{}", std::process::id()),
-                args.pool,
-            )?,
-            turn: Arc::new(Semaphore::new(1)),
+            transfers: Lanes::start(lanes, move |lane| {
+                Endpoint::new(&format!("{agent}-{lane}"), pool, false)
+            })?,
+            turns: Arc::new(Semaphore::new(lanes)),
         });
         let listener = TcpListener::bind(args.peer_listen)
             .await
@@ -167,7 +119,7 @@ impl Peers {
         if !image.is_dir() {
             return Err(Refusal::NoImage);
         }
-        let turn = Arc::clone(&self.turn)
+        let turn = Arc::clone(&self.turns)
             .try_acquire_owned()
             .map_err(|_| Refusal::Busy)?;
         let (revision, transfers) = (revision.clone(), self.transfers.clone());
@@ -196,13 +148,10 @@ impl Peers {
 
     async fn addresses(&self) -> Vec<SocketAddr> {
         match tokio::net::lookup_host(&self.name).await {
-            Ok(addresses) => {
-                let mut peers: Vec<SocketAddr> =
-                    addresses.filter(|a| a.ip() != self.own_ip).collect();
-                peers.sort();
-                peers.dedup();
-                peers
-            }
+            Ok(addresses) => tunnel::ask_order(
+                self.own_ip,
+                addresses.filter(|a| a.ip() != self.own_ip).collect(),
+            ),
             Err(error) => {
                 debug!(name = %self.name, %error, "the peer name does not resolve");
                 Vec::new()
@@ -221,7 +170,7 @@ impl Peers {
             let mut busy = None;
             {
                 let _turn = self
-                    .turn
+                    .turns
                     .acquire()
                     .await
                     .map_err(|_| anyhow!("the transfer turn is closed"))?;

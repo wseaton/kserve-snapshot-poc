@@ -110,10 +110,21 @@ struct Node {
     args: Args,
     #[cfg(feature = "nixl")]
     peers: Option<Arc<Peers>>,
-    /// Held while a checkpoint is pulled, so pods of one revision that start
-    /// together pull it once.
+    /// A lock for each revision, held while its checkpoint is pulled, so
+    /// pods of one revision that start together pull it once.
     #[cfg(feature = "nixl")]
-    pulling: tokio::sync::Mutex<()>,
+    pulling: std::sync::Mutex<HashMap<RevisionKey, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+#[cfg(feature = "nixl")]
+impl Node {
+    fn pull_turn(&self, revision: &RevisionKey) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut pulling = self
+            .pulling
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pull lock poisoned"))?;
+        Ok(Arc::clone(pulling.entry(revision.clone()).or_default()))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -280,7 +291,8 @@ async fn bring_up(
     pod.mount_tools().await?;
     #[cfg(feature = "nixl")]
     if let Some(peers) = &node.peers {
-        let _turn = node.pulling.lock().await;
+        let turn = node.pull_turn(&revision)?;
+        let _turn = turn.lock().await;
         if !store.image_ready() && !store.failed_before() {
             pull_from_peers(peers, &revision, &store).await?;
         }
@@ -394,7 +406,7 @@ async fn serve(args: Args) -> Result<()> {
         #[cfg(feature = "nixl")]
         peers: Peers::start(&args.peers, &args.store_dir).await?,
         #[cfg(feature = "nixl")]
-        pulling: tokio::sync::Mutex::new(()),
+        pulling: std::sync::Mutex::default(),
         args,
     });
     let args = &node.args;

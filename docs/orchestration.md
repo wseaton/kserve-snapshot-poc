@@ -112,10 +112,43 @@ sequenceDiagram
   length are authenticated with it.
 
 A node pulls a revision once: pods of it that start together wait for the one pull and restore
-from what it left. A daemon takes part in one transfer at a time, sending or receiving, on one
-registered pool that it makes at its first transfer and keeps. Two daemons that ask each other at
-the same moment do not wait on each other: the one that is refused backs off, for longer if its
-address is the higher one, and asks again.
+from what it left. Different revisions are pulled side by side.
+
+A daemon has a fixed number of transfer lanes, two unless `--transfer-lanes` says otherwise, and
+takes part in that many transfers at once, sending or receiving. Each lane has its share of the
+registered pool, made when the lane is first used and kept. A pull takes a lane before it asks, so
+the daemon can always receive what it asked for, and a daemon whose lanes are all taken answers
+busy. Two daemons that refuse each other do not wait on each other: each gives its lane up and
+asks again, the one with the higher address after a longer pause.
+
+With a prefill and a decode Deployment on different nodes, each scaled to two at the same moment,
+each node pulled 4.5 GiB from the other while sending 4.5 GiB to it. Both pulls took 5.4 s and 5.6 s
+and overlapped completely, and both new pods were Ready 15 s after they were created.
+
+### Choosing a peer
+
+Today a daemon's peers are every address behind the headless Service. It asks them one after the
+other, in an order that depends only on its own address, so that askers do not all start with the
+same peer, and takes the checkpoint from the first that has it and has a free lane. It knows
+nothing of distance, links or load. That is one function, `ask_order` in
+[daemon/src/tunnel.rs](../daemon/src/tunnel.rs), and the way to a topology-aware choice goes
+through it in steps that each stand on their own:
+
+1. **Know before asking.** A cheap request on the same authenticated endpoint that says whether a
+   peer has the revision, how many lanes it has free and where it is, sent to every peer at once.
+   Today finding out costs an upgraded connection per peer, one after the other.
+2. **Say where a daemon is.** Zone and region are already on every pod as
+   `topology.kubernetes.io/zone` and `region`, so the Downward API gives them to the daemon without
+   API access. Rack and RDMA fabric are not: they need a node label handed to the DaemonSet, or
+   the daemon reading its own devices' subnet.
+3. **Rank.** Prefer a peer on the same RDMA fabric, then the same rack, then the same zone, then
+   the least busy, and leave the zone only when nothing nearer has the checkpoint. This is also
+   where the transport gets chosen per pair of nodes; today `UCX_TLS` is one setting for all.
+4. **Learn.** Keep what each peer delivered, in bytes per second, and prefer what was fast. Stop
+   asking a peer that failed.
+5. **Let the control plane decide.** Something that knows where checkpoints are can name the
+   source for a pod, place checkpoints ahead of a scale-out, and schedule pods onto nodes that
+   have them. The daemon's own ranking is then what happens when nothing was decided.
 
 Qwen3-8B at TP=1 on H200, one replica scaled to four by KEDA over two nodes, before the daemon
 pulled once per node: the new replica on
