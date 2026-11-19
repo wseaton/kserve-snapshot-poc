@@ -1,19 +1,28 @@
 # snapshotd
 
-The node path of the Rust snapshot daemon described in [docs/design.md](../docs/design.md), as far as it is
-built: a CLI that checkpoints and restores the CUDA state of a process tree through the driver
-API, drives cuInterpose around it, holds a CRIU checkpoint in memory, and copies one to another
-node over RDMA. The control loop, the CRI lookup, the CRIU invocation and
-the cross-pod mount handling are design only; [`experiments/bench`](../experiments/bench) runs
-CRIU from a script and calls this binary for the CUDA phases.
+The node agent for restore on scale-up, as a Cargo workspace of two crates:
 
-Linux only. It loads `libcuda.so.1` at run time, so it builds without a GPU or the CUDA toolkit
-and uses whichever driver library is first on the library path where it runs.
+- `snapshotd` (this directory). `snapshotd node` is the daemon: it finds opted-in pods through CRI,
+  checkpoints the first of a revision, restores the rest, and pulls a checkpoint from another
+  node's daemon when its own node has none. How it fits into a cluster is in
+  [docs/orchestration.md](../docs/orchestration.md); manifests are in [`deploy/`](deploy). The other
+  subcommands, below, are the daemon's building blocks and are what
+  [`experiments/bench`](../experiments/bench) calls.
+- `snapshotd-shim` ([`shim/`](shim)). PID 1 of the workload container. It is built static, against
+  musl, so it runs in whatever image the workload uses.
+
+Linux only. `snapshotd` loads `libcuda.so.1` at run time, so it builds without a GPU or the CUDA
+toolkit and uses whichever driver library is first on the library path where it runs. Moving
+checkpoints between nodes needs the `nixl` feature and NIXL installed.
 
 ```bash
-cargo build --release
-cargo test
+cargo build --release --workspace
+cargo test --workspace
+e2e/run.sh        # the daemon and shim on kind, with a stand-in for vLLM
 ```
+
+[`images/snapshotd`](../images/snapshotd) builds both on Fedora with the toolchain from rustup,
+and has the kind test's image as its `e2e` target.
 
 ## CUDA checkpoint
 

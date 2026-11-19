@@ -21,15 +21,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::Parser;
 use rustix::process::{Pid, Signal, WaitOptions};
-use serde::{Deserialize, Serialize};
+use snapshotd_shim::{Reply, Request, SERVER_LOG, SOCKET};
 
 const TICK: Duration = Duration::from_millis(100);
-pub const SOCKET: &str = "/run/snapshotd/shim.sock";
-pub const SERVER_LOG: &str = "/run/snapshotd/server.log";
 
-#[derive(clap::Args)]
-pub struct Args {
+#[derive(Parser)]
+#[command(name = "snapshotd-shim")]
+struct Args {
     /// Where the node daemon connects.
     #[arg(long, default_value = SOCKET)]
     socket: PathBuf,
@@ -48,24 +48,6 @@ pub struct Args {
     /// The server's command line.
     #[arg(last = true, required = true)]
     command: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Request {
-    Start,
-    Release,
-    Adopt { pid: i32 },
-    Serving,
-    State,
-    Fail,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Reply {
-    Started { pid: i32 },
-    Done,
-    State { started: bool, serving: bool },
-    Refused { reason: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,7 +89,7 @@ fn termination_signals() -> libc::sigset_t {
 
 fn terminated_within(tick: Duration) -> bool {
     let timeout = libc::timespec {
-        tv_sec: tick.as_secs() as libc::time_t,
+        tv_sec: tick.as_secs() as _,
         tv_nsec: tick.subsec_nanos() as libc::c_long,
     };
     // SAFETY: the set and the timeout live across the call, and a null info
@@ -377,7 +359,7 @@ impl Shim {
     }
 }
 
-pub fn run(args: Args) -> Result<i32> {
+fn run(args: Args) -> Result<i32> {
     // SAFETY: blocking signals for this thread before any other exists; the
     // set lives across the call.
     if unsafe {
@@ -393,4 +375,8 @@ pub fn run(args: Args) -> Result<i32> {
     rustix::process::set_child_subreaper(rustix::process::getpid().into())
         .context("become the reaper of restored processes")?;
     Shim::new(args)?.run()
+}
+
+fn main() -> Result<()> {
+    std::process::exit(run(Args::parse())?)
 }

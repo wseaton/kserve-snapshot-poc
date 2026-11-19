@@ -20,7 +20,7 @@ spec:
           image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
           command:
             - cp
-            - /opt/snapshotd/bin/snapshotd
+            - /opt/snapshotd/bin/snapshotd-shim
             - /opt/snapshotd/exp/noiouring.py
             - /snapshot-tools/
           resources:
@@ -34,8 +34,7 @@ spec:
         - name: main
           image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
           command:
-            - /snapshot-tools/snapshotd
-            - shim
+            - /snapshot-tools/snapshotd-shim
             - --
             - sh
             - -c

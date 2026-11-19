@@ -20,7 +20,7 @@ finish() { [ "${KEEP:-0}" = 1 ] || kind delete cluster --name "$CLUSTER"; }
 
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
 trap finish EXIT
-docker build --load -t "$IMAGE" -f daemon/e2e/Dockerfile .
+docker build --load -t "$IMAGE" --target e2e -f images/snapshotd/Dockerfile .
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 k apply -k daemon/e2e
 k -n snapshotd rollout status ds/snapshotd --timeout=180s

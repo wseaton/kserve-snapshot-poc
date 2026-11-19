@@ -37,8 +37,7 @@ impl Shim {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let ready_port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_snapshotd"))
-            .arg("shim")
+        let child = Command::new(env!("CARGO_BIN_EXE_snapshotd-shim"))
             .arg("--socket")
             .arg(dir.join("shim.sock"))
             .arg("--log")

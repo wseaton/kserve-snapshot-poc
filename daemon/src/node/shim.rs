@@ -6,7 +6,7 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep};
 
 use crate::node::process::{HostPid, PodPid};
-use crate::shim::{Reply, Request, SOCKET};
+use snapshotd_shim::{Reply, Request, SOCKET};
 
 const CONNECT_WAIT: Duration = Duration::from_secs(60);
 

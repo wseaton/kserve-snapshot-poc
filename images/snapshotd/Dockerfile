@@ -1,22 +1,34 @@
 ARG FEDORA_VERSION=42
 
-FROM docker.io/library/rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS plain
-COPY daemon /src/daemon
-RUN cd /src/daemon && cargo build --release --locked
-
-FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS nixl
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS rust
 RUN dnf install -y --setopt=install_weak_deps=False \
-        gcc gcc-c++ make cmake meson ninja-build pkgconf-pkg-config git-core \
-        autoconf automake libtool rdma-core rdma-core-devel \
-        numactl-devel hwloc-devel libaio-devel liburing-devel libstdc++-devel \
-        clang clang-devel llvm-devel python3 python3-devel pybind11-devel \
-        curl ca-certificates findutils which xz openssl-devel \
+        gcc gcc-c++ make pkgconf-pkg-config git-core curl ca-certificates \
+        openssl-devel binutils findutils which xz \
     && dnf clean all
-
 ARG RUST_VERSION=1.100.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
+        | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
+            --target "$(uname -m)-unknown-linux-musl"
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+FROM rust AS plain
+COPY daemon /src/daemon
+RUN set -eux; cd /src/daemon; \
+    cargo build --release --locked --bin snapshotd --example stand_in; \
+    cargo build --release --locked -p snapshotd-shim --target "$(uname -m)-unknown-linux-musl"; \
+    cp "target/$(uname -m)-unknown-linux-musl/release/snapshotd-shim" target/release/; \
+    if readelf -d target/release/snapshotd-shim | grep NEEDED; then exit 1; fi; \
+    objdump -T target/release/snapshotd | grep -oE '(GLIBC|OPENSSL)_[0-9.]+' | sort -Vu | tee /tmp/needs; \
+    newest() { grep "^$1_" /tmp/needs | tail -1; }; \
+    test "$(printf '%s\n' "$(newest GLIBC)" GLIBC_2.39 | sort -V | tail -1)" = GLIBC_2.39; \
+    test "$(printf '%s\n' "$(newest OPENSSL)" OPENSSL_3.0.0 | sort -V | tail -1)" = OPENSSL_3.0.0
+
+FROM rust AS nixl
+RUN dnf install -y --setopt=install_weak_deps=False \
+        cmake meson ninja-build autoconf automake libtool rdma-core rdma-core-devel \
+        numactl-devel hwloc-devel libaio-devel liburing-devel libstdc++-devel \
+        clang clang-devel llvm-devel python3 python3-devel pybind11-devel \
+    && dnf clean all
 
 ARG UCX_REF=v1.23.2
 RUN git clone --depth 1 -b ${UCX_REF} https://github.com/openucx/ucx.git /src/ucx \
@@ -52,6 +64,19 @@ RUN grep -q "rev = \"${NIXL_REF}\"" /tmp/Cargo.toml \
 COPY daemon /src/daemon
 RUN cd /src/daemon && cargo build --release --locked --features nixl
 
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS e2e
+RUN dnf install -y --setopt=install_weak_deps=False criu util-linux openssl-libs \
+    && dnf clean all
+COPY --from=plain /src/daemon/target/release/snapshotd /src/daemon/target/release/snapshotd-shim /usr/local/bin/
+COPY --from=plain /src/daemon/target/release/examples/stand_in /usr/local/bin/stand-in
+RUN set -eux; \
+    mkdir -p /opt/tools/lib /opt/tools/criu-plugins; \
+    cp "$(command -v criu)" /opt/tools/criu; \
+    /opt/tools/criu --version; \
+    snapshotd --help > /dev/null; \
+    snapshotd-shim --help > /dev/null; \
+    stand-in --help > /dev/null
+
 FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
 RUN dnf install -y --setopt=install_weak_deps=False \
         rdma-core libibverbs libibverbs-utils librdmacm libibumad infiniband-diags \
@@ -61,7 +86,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 COPY --from=nixl /usr/local /usr/local
 COPY --from=nixl /etc/ld.so.conf.d/nixl.conf /etc/ld.so.conf.d/nixl.conf
 COPY --from=nixl /src/daemon/target/release/snapshotd /opt/snapshotd/bin/snapshotd-nixl
-COPY --from=plain /src/daemon/target/release/snapshotd /opt/snapshotd/bin/snapshotd
+COPY --from=plain /src/daemon/target/release/snapshotd /src/daemon/target/release/snapshotd-shim /opt/snapshotd/bin/
 COPY experiments/bench/restore-bench.sh experiments/bench/offload-check.sh experiments/criu/noiouring.py /opt/snapshotd/exp/
 RUN set -eux; \
     ldconfig; \
@@ -69,6 +94,7 @@ RUN set -eux; \
     chmod 0755 /opt/snapshotd/exp/*; \
     if find /usr/local -name '*.so*' -type f -exec ldd {} + 2>/dev/null | grep 'not found'; then exit 1; fi; \
     snapshotd transfer --help >/dev/null; \
-    /opt/snapshotd/bin/snapshotd cuda --help >/dev/null
+    /opt/snapshotd/bin/snapshotd cuda --help >/dev/null; \
+    /opt/snapshotd/bin/snapshotd-shim --help >/dev/null
 ENV PATH="/usr/local/ucx/bin:${PATH}"
 ENV HOME=/tmp

@@ -15,7 +15,7 @@ flowchart LR
   subgraph A["Node A"]
     direction TB
     subgraph WA["Workload pod (unprivileged, stock vLLM image)"]
-      SA["snapshotd shim<br/>PID 1, readiness port"]
+      SA["snapshotd-shim<br/>PID 1, readiness port"]
       VA["vLLM<br/>HTTP :8000, gRPC control :50051"]
     end
     DA["snapshotd pod<br/>DaemonSet, privileged, hostPID<br/>kube-rbac-proxy sidecar"]
@@ -41,8 +41,8 @@ flowchart LR
 ```
 
 The workload pod's template differs from a plain vLLM Deployment in four places: the opt-in label,
-an init container that copies `snapshotd` and the `io_uring` launcher into an `emptyDir`, the
-container command wrapped in `snapshotd shim --`, and a TCP readiness probe on the shim's port.
+an init container that copies `snapshotd-shim` and the `io_uring` launcher into an `emptyDir`, the
+container command wrapped in `snapshotd-shim --`, and a TCP readiness probe on the shim's port.
 The example is [daemon/deploy/workload](../daemon/deploy/workload).
 
 ## Trying it
@@ -67,7 +67,7 @@ For every pod on its node that carries the label `snapshot.llm-d.ai/workload`:
 1. It finds the pod and its container's PID through CRI and its GPUs through the kubelet's
    PodResources API.
 2. If the node holds a checkpoint for `<namespace>/<workload label>/<pod-template-hash>`, it
-   restores it into the pod and tells the pod's PID 1 (`snapshotd shim`) to report ready.
+   restores it into the pod and tells the pod's PID 1 (`snapshotd-shim`) to report ready.
 3. Otherwise it lets the server cold boot, checkpoints it, restores it from that checkpoint,
    publishes the checkpoint on the node and then reports ready.
 4. If a checkpoint or restore fails, the container exits, starts over, and cold boots with no

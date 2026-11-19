@@ -16,9 +16,9 @@ use crate::node::log::{gib, plain, seconds, step};
 use crate::node::manifest::Manifest;
 use crate::node::process::{self, HostPid, PodPid, blocking, copy_tree};
 use crate::node::shim::ShimClient;
-use crate::shim::SERVER_LOG;
 use crate::store::directory_bytes;
 use crate::vllm::Control;
+use snapshotd_shim::SERVER_LOG;
 
 const FAR_PID: &str = "4000000";
 const LIFECYCLE: Duration = Duration::from_secs(900);

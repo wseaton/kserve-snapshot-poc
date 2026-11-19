@@ -44,9 +44,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: daemon
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --benches --tests --examples -- -D warnings
-      - run: cargo test --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --benches --tests --examples -- -D warnings
+      - run: cargo test --locked --workspace
 
   e2e:
     needs: check

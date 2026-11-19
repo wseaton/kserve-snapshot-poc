@@ -1,8 +1,7 @@
 //! snapshotd: the privileged node path for snapshot scale-out. See docs/design.md.
 //!
-//! `node` is the daemon and `shim` the workload container's PID 1. The other
-//! subcommands are the daemon's building blocks, usable on their own from a
-//! privileged container.
+//! `node` is the daemon. The other subcommands are its building blocks,
+//! usable on their own from a privileged container.
 mod cri;
 mod cuda;
 mod cuinterpose;
@@ -14,7 +13,6 @@ mod peer;
 mod podresources;
 #[cfg(any(test, feature = "nixl"))]
 mod seal;
-mod shim;
 mod store;
 #[cfg(feature = "nixl")]
 mod trace;
@@ -45,14 +43,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run as PID 1 of a workload container, under the node daemon.
-    Shim(shim::Args),
-    #[command(flatten)]
-    Privileged(Privileged),
-}
-
-#[derive(Subcommand)]
-enum Privileged {
     /// CUDA process checkpoint through the host driver.
     #[command(subcommand)]
     Cuda(CudaCommand),
@@ -201,24 +191,18 @@ fn raise_open_file_limit() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Shim(args) => std::process::exit(shim::run(args)?),
-        Command::Privileged(command) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_env("SNAPSHOTD_LOG")
-                        .unwrap_or_else(|_| EnvFilter::new("info")),
-                )
-                .with_target(false)
-                .with_ansi(std::io::stdout().is_terminal())
-                .init();
-            raise_open_file_limit()?;
-            command.run()
-        }
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("SNAPSHOTD_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
+    raise_open_file_limit()?;
+    Cli::parse().command.run()
 }
 
-impl Privileged {
+impl Command {
     fn run(self) -> Result<()> {
         match self {
             Self::Inject(args) => inject::run(&args),

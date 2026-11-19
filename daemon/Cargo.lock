@@ -1489,6 +1489,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "snapshotd-shim",
  "tokio",
  "tokio-openssl",
  "tonic",
@@ -1499,6 +1500,18 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "snapshotd-shim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
