@@ -37,6 +37,7 @@ deploy/
   snapshotd/
     node/                    the snapshotd DaemonSet with peers, from daemon/deploy
     workload/                an example Deployment for the daemon, from daemon/deploy
+    kserve/                  the daemon under KServe; its README documents the layer
     kserve/config-layer/     the LLMInferenceServiceConfig a service opts into for the daemon
     kserve/qwen3-8b/         an example LLMInferenceService that does
     base/                    namespace and volumes
