@@ -10,6 +10,9 @@
 # daemons, and that two nodes can pull from each other at once, one of them a server that starts
 # prepared.
 #
+# Four kind nodes on one Linux host run out of inotify instances at the default limit, and CRIU
+# needs one: raise fs.inotify.max_user_instances first, as CI does.
+#
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e-peers)
 #   KEEP     1: leave the cluster and its pods behind (default 0)
