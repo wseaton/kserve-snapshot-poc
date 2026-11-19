@@ -85,6 +85,10 @@ struct Node {
     args: Args,
     #[cfg(feature = "nixl")]
     peers: Option<Arc<Peers>>,
+    /// Held while a checkpoint is pulled, so pods of one revision that start
+    /// together pull it once.
+    #[cfg(feature = "nixl")]
+    pulling: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -241,11 +245,11 @@ async fn bring_up(
     );
     pod.mount_tools().await?;
     #[cfg(feature = "nixl")]
-    if let Some(peers) = &node.peers
-        && !store.image_ready()
-        && !store.failed_before()
-    {
-        pull_from_peers(peers, &revision, &store).await?;
+    if let Some(peers) = &node.peers {
+        let _turn = node.pulling.lock().await;
+        if !store.image_ready() && !store.failed_before() {
+            pull_from_peers(peers, &revision, &store).await?;
+        }
     }
     let plan = Plan::choose(
         store.failed_before(),
@@ -341,6 +345,8 @@ async fn serve(args: Args) -> Result<()> {
     let node = Arc::new(Node {
         #[cfg(feature = "nixl")]
         peers: Peers::start(&args.peers, &args.store_dir).await?,
+        #[cfg(feature = "nixl")]
+        pulling: tokio::sync::Mutex::new(()),
         args,
     });
     let args = &node.args;
