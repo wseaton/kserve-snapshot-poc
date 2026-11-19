@@ -1,0 +1,308 @@
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: snapshotd-pd
+spec:
+  labels:
+    snapshot.llm-d.ai/workload: "{{ .ObjectMeta.Name }}"
+  template:
+    initContainers:
+      - name: snapshot-tools
+        image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+        imagePullPolicy: IfNotPresent
+        command:
+          - cp
+          - /opt/snapshotd/bin/snapshotd-shim
+          - /opt/snapshotd/exp/noiouring.py
+          - /snapshot-tools/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+              - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        volumeMounts:
+          - name: snapshot-tools
+            mountPath: /snapshot-tools
+    containers:
+      - name: main
+        image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+        command:
+          - /snapshot-tools/snapshotd-shim
+          - --ready-port=8090
+          - --port=8001
+          - --
+          - /bin/bash
+          - -c
+          - |-
+            export LD_LIBRARY_PATH="/usr/local/cuda-13.1/compat:${LD_LIBRARY_PATH}"
+            export LD_PRELOAD=/run/snapshotd/tools/cuinterpose/libcuinterpose.so
+            KV_TRANSFER_ARGS="${KSERVE_KV_TRANSFER_ARGS:-}"
+            if [ -z "${KV_TRANSFER_ARGS}" ]; then
+              KV_TRANSFER_ARGS="--kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\"}'"
+            fi
+            eval "exec python3 /snapshot-tools/noiouring.py vllm serve /mnt/models \
+              --served-model-name "{{ .Spec.Model.Name }}" "publishers/{{ .ObjectMeta.Namespace }}/models/{{ .Spec.Model.Name }}" \
+              --port 8001 \
+              --grpc-port 50051 \
+              --root-path /{{ .ObjectMeta.Namespace }}/{{ .ObjectMeta.Name }} \
+              --disable-access-log-for-endpoints /health,/metrics,/ping \
+              --shutdown-timeout {{ shutdownTimeout .Spec.Template 15 }} \
+              {{- if and .Spec.Parallelism .Spec.Parallelism.Tensor }} --tensor-parallel-size {{ .Spec.Parallelism.Tensor }}{{- end }} \
+              {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt --ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
+              ${KV_TRANSFER_ARGS} \
+              ${VLLM_ADDITIONAL_ARGS} \
+              $@ \
+              --enable-sleep-mode \
+              --checkpoint-release-weights \
+              --checkpoint-prepare-on-startup"
+          - "--"
+        ports:
+          - name: control
+            containerPort: 50051
+            protocol: TCP
+          - name: ready
+            containerPort: 8090
+            protocol: TCP
+        startupProbe:
+          httpGet:
+            port: 8090
+            scheme: HTTP
+          periodSeconds: 1
+          failureThreshold: 3600
+        readinessProbe:
+          httpGet:
+            port: 8090
+            scheme: HTTP
+        livenessProbe:
+          httpGet:
+            port: 8090
+            scheme: HTTP
+        env:
+          - name: HOME
+            value: /dev/shm/home
+          - name: VLLM_USE_RUST_FRONTEND
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_HOST_IP
+            value: 127.0.0.1
+          - name: CUDA_DEVICE_ORDER
+            value: PCI_BUS_ID
+          - name: NCCL_NVLS_ENABLE
+            value: "0"
+          - name: NCCL_IB_DISABLE
+            value: "1"
+          - name: NCCL_SOCKET_IFNAME
+            value: lo
+          - name: GLOO_SOCKET_IFNAME
+            value: lo
+          - name: VLLM_ALLREDUCE_USE_SYMM_MEM
+            value: "0"
+          - name: VLLM_USE_NCCL_SYMM_MEM
+            value: "0"
+          - name: KSERVE_INFER_ROCE
+            value: "false"
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: XDG_CACHE_HOME
+            value: /dev/shm/cache/xdg
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: /dev/shm/cache/torchinductor
+          - name: TRITON_CACHE_DIR
+            value: /dev/shm/cache/triton
+          - name: CUDA_CACHE_PATH
+            value: /dev/shm/cache/cuda
+          - name: DG_JIT_CACHE_DIR
+            value: /dev/shm/cache/deepgemm
+          - name: FLASHINFER_WORKSPACE_BASE
+            value: /dev/shm/cache/flashinfer
+          - name: VLLM_CACHE_ROOT
+            value: /dev/shm/cache/vllm
+          - name: TILELANG_CACHE_DIR
+            value: /dev/shm/cache/tilelang
+          - name: PYTORCH_ALLOC_CONF
+            value: pinned_max_round_threshold_mb:1,pinned_max_cached_size_mb:1
+          - name: UCX_TLS
+            value: tcp,cuda_copy
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+        volumeMounts:
+          - name: snapshot-tools
+            mountPath: /snapshot-tools
+            readOnly: true
+          - name: snapshot-run
+            mountPath: /run/snapshotd
+    volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: snapshot-tools
+        emptyDir: {}
+      - name: snapshot-run
+        emptyDir: {}
+  prefill:
+    labels:
+      snapshot.llm-d.ai/workload: "{{ .ObjectMeta.Name }}-prefill"
+    template:
+      initContainers:
+        - name: snapshot-tools
+          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          imagePullPolicy: IfNotPresent
+          command:
+            - cp
+            - /opt/snapshotd/bin/snapshotd-shim
+            - /opt/snapshotd/exp/noiouring.py
+            - /snapshot-tools/
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: snapshot-tools
+              mountPath: /snapshot-tools
+      containers:
+        - name: main
+          image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+          command:
+            - /snapshot-tools/snapshotd-shim
+            - --ready-port=8090
+            - --port=8000
+            - --
+            - /bin/bash
+            - -c
+            - |-
+              export LD_LIBRARY_PATH="/usr/local/cuda-13.1/compat:${LD_LIBRARY_PATH}"
+              export LD_PRELOAD=/run/snapshotd/tools/cuinterpose/libcuinterpose.so
+              KV_TRANSFER_ARGS="${KSERVE_KV_TRANSFER_ARGS:-}"
+              if [ -z "${KV_TRANSFER_ARGS}" ]; then
+                KV_TRANSFER_ARGS="--kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\"}'"
+              fi
+              eval "exec python3 /snapshot-tools/noiouring.py vllm serve /mnt/models \
+                --served-model-name "{{ .Spec.Model.Name }}" \
+                --port 8000 \
+                --grpc-port 50051 \
+                --root-path /{{ .ObjectMeta.Namespace }}/{{ .ObjectMeta.Name }} \
+                --disable-access-log-for-endpoints /health,/metrics,/ping \
+                --shutdown-timeout {{ shutdownTimeout .Spec.Template 15 }} \
+                {{- if and .Spec.Prefill .Spec.Prefill.Parallelism .Spec.Prefill.Parallelism.Tensor }} --tensor-parallel-size {{ .Spec.Prefill.Parallelism.Tensor }}{{- end }} \
+                {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt --ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
+                ${KV_TRANSFER_ARGS} \
+                ${VLLM_ADDITIONAL_ARGS} \
+                $@ \
+                --enable-sleep-mode \
+                --checkpoint-release-weights \
+                --checkpoint-prepare-on-startup"
+            - "--"
+          ports:
+            - name: control
+              containerPort: 50051
+              protocol: TCP
+            - name: ready
+              containerPort: 8090
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              port: 8090
+              scheme: HTTP
+            periodSeconds: 1
+            failureThreshold: 3600
+          readinessProbe:
+            httpGet:
+              port: 8090
+              scheme: HTTP
+          livenessProbe:
+            httpGet:
+              port: 8090
+              scheme: HTTP
+          env:
+            - name: HOME
+              value: /dev/shm/home
+            - name: VLLM_USE_RUST_FRONTEND
+              value: "1"
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: spawn
+            - name: VLLM_HOST_IP
+              value: 127.0.0.1
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: lo
+            - name: GLOO_SOCKET_IFNAME
+              value: lo
+            - name: VLLM_ALLREDUCE_USE_SYMM_MEM
+              value: "0"
+            - name: VLLM_USE_NCCL_SYMM_MEM
+              value: "0"
+            - name: KSERVE_INFER_ROCE
+              value: "false"
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: XDG_CACHE_HOME
+              value: /dev/shm/cache/xdg
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /dev/shm/cache/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /dev/shm/cache/triton
+            - name: CUDA_CACHE_PATH
+              value: /dev/shm/cache/cuda
+            - name: DG_JIT_CACHE_DIR
+              value: /dev/shm/cache/deepgemm
+            - name: FLASHINFER_WORKSPACE_BASE
+              value: /dev/shm/cache/flashinfer
+            - name: VLLM_CACHE_ROOT
+              value: /dev/shm/cache/vllm
+            - name: TILELANG_CACHE_DIR
+              value: /dev/shm/cache/tilelang
+            - name: PYTORCH_ALLOC_CONF
+              value: pinned_max_round_threshold_mb:1,pinned_max_cached_size_mb:1
+            - name: UCX_TLS
+              value: tcp,cuda_copy
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+          volumeMounts:
+            - name: snapshot-tools
+              mountPath: /snapshot-tools
+              readOnly: true
+            - name: snapshot-run
+              mountPath: /run/snapshotd
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: snapshot-tools
+          emptyDir: {}
+        - name: snapshot-run
+          emptyDir: {}

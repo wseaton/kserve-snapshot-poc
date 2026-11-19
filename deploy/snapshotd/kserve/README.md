@@ -21,6 +21,13 @@ spec:
 
 [`qwen3-8b/`](qwen3-8b) is that service in full, with the layer.
 
+A second layer, `snapshotd-pd`, is for a service with separate prefill and decode pods. It applies
+the same changes to both of KServe's templates and differs in three ways: vLLM runs with
+`--checkpoint-prepare-on-startup` and the NIXL connector in each pod's role, the shim's port is
+8090 because the decode pod's routing sidecar and vLLM already have 8000 and 8001, and the prefill
+pods are labelled `<service name>-prefill`. [`qwen3-8b-pd/`](qwen3-8b-pd) is an example, and
+[Prefill and decode](../../../docs/orchestration.md#prefill-and-decode) has what was measured.
+
 ## Before a service can use it
 
 - KServe with `LLMInferenceService` at `serving.kserve.io/v1alpha2`.
@@ -146,9 +153,8 @@ pods.
 - Single-node services only. KServe runs those as a Deployment, whose pods carry
   `pod-template-hash`. Multi-node services are `LeaderWorkerSet` pods without it, and
   checkpointing several pods as one has not been tried.
-- Prefill and decode services have not been run under KServe. Its templates for them are separate
-  base configs, and the decode pod carries a routing sidecar on the port the shim uses. Written by
-  hand they work: see [Prefill and decode](../../../docs/orchestration.md#prefill-and-decode).
+- A layer that sets `spec.prefill` makes any service that uses it a prefill and decode service,
+  which is why there are two layers and a service picks one.
 - The endpoint picker scrapes the server's metrics port. What it does with a connection it holds
   to a pod that is being checkpointed has not been looked at.
 - A service that never scales still pays for one checkpoint on its first replica.

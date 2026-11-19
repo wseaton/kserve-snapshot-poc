@@ -112,7 +112,10 @@ sequenceDiagram
   length are authenticated with it.
 
 A node pulls a revision once: pods of it that start together wait for the one pull and restore
-from what it left.
+from what it left. A daemon takes part in one transfer at a time, sending or receiving, on one
+registered pool that it makes at its first transfer and keeps. Two daemons that ask each other at
+the same moment do not wait on each other: the one that is refused backs off, for longer if its
+address is the higher one, and asks again.
 
 Qwen3-8B at TP=1 on H200, one replica scaled to four by KEDA over two nodes, before the daemon
 pulled once per node: the new replica on
@@ -180,9 +183,23 @@ second pair restored from checkpoints pulled from the first node:
 | A code buried in a 400 to 3000 token prompt, asked for through prefill then decode | 260 of 260 right, one at a time and 8 at a time |
 | KV transfers counted by the two decode pods | 277 and 276, 12 GB each |
 
-The requests were sent the way a router does: to prefill with `do_remote_decode`, then to decode
-with the `kv_transfer_params` it returned. It has not run behind llm-d's routing sidecar or
-KServe's prefill and decode templates, and not over RDMA: the connector ran on `UCX_TLS=tcp,cuda_copy`.
+The requests in that table were sent the way a router does: to prefill with `do_remote_decode`,
+then to decode with the `kv_transfer_params` it returned.
+
+Under KServe, with its prefill and decode templates, llm-d's routing sidecar in the decode pod and
+the endpoint picker, through the gateway
+([deploy/snapshotd/kserve/qwen3-8b-pd](../deploy/snapshotd/kserve/qwen3-8b-pd)):
+
+| | |
+| --- | --- |
+| First prefill and decode pod, Ready after | 88 s and 77 s |
+| Scaled to two of each, the new pods on the node the other role was on | 20 s and 21 s, each node pulling from the other |
+| Retrieval prompt through the gateway | 280 of 280 right, with one and with two pods of each role |
+
+None of this has run over RDMA: the connector was on `UCX_TLS=tcp,cuda_copy`, which moves KV at
+about 2.7 Gbit/s here. A 2000 token prompt took 0.72 s through prefill and decode against 0.08 s
+on one server, all of it the transfer, so these runs say nothing about what disaggregation costs
+or saves.
 
 ## A limit on tensor parallel below a whole node
 

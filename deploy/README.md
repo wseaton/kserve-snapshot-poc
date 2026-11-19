@@ -41,6 +41,7 @@ deploy/
     kserve/                  the daemon under KServe; its README documents the layer
     kserve/config-layer/     the LLMInferenceServiceConfig a service opts into for the daemon
     kserve/qwen3-8b/         an example LLMInferenceService that does
+    kserve/qwen3-8b-pd/      the same with separate prefill and decode pods
     base/                    namespace and volumes
     pod/                     the bench pod; init containers copy snapshotd, the scripts, CRIU and cuInterpose into it
     components/
