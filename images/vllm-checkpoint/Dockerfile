@@ -2,7 +2,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:nightly-a2bcb5657a881a002e79d0adab3c6b5e39436121
 
 FROM docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS frontend
 ARG VLLM_REPO=wseaton/vllm
-ARG FRONTEND_REF=b3c279b57a69c494a651ac400c1e8dbd8454e8c3
+ARG FRONTEND_REF=fc1214e528e728012175027e0c48d69e6a77a063
 RUN set -eux; \
     git init -q /src/vllm; \
     cd /src/vllm; \
@@ -14,8 +14,8 @@ RUN set -eux; \
 FROM ${BASE_IMAGE}
 
 ARG VLLM_REPO=wseaton/vllm
-ARG VLLM_REF=7fd5e5ba729af2b67ce140aea9221c6797de57e6
-ARG VLLM_FILES="vllm/config/model.py vllm/engine/arg_utils.py vllm/model_executor/model_loader/__init__.py vllm/model_executor/model_loader/base_loader.py vllm/model_executor/model_loader/modelexpress_loader.py vllm/model_executor/model_loader/reload/inplace.py vllm/v1/engine/core.py vllm/v1/worker/gpu/model_runner.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_worker.py"
+ARG VLLM_REF=fc1214e528e728012175027e0c48d69e6a77a063
+ARG VLLM_FILES="vllm/config/model.py vllm/distributed/device_communicators/cuda_communicator.py vllm/distributed/device_communicators/pynccl.py vllm/distributed/kv_transfer/kv_connector/v1/base.py vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py vllm/engine/arg_utils.py vllm/model_executor/model_loader/__init__.py vllm/model_executor/model_loader/base_loader.py vllm/model_executor/model_loader/modelexpress_loader.py vllm/model_executor/model_loader/reload/inplace.py vllm/v1/engine/core.py vllm/v1/engine/llm_engine.py vllm/v1/worker/gpu/model_runner.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_worker.py"
 ARG MX_REPO=wseaton/modelexpress
 ARG MX_REF=16ecf7a627d2a117f0c4f97c7a549923d6719529
 
@@ -28,7 +28,7 @@ RUN set -eux; \
     uv pip install --system --no-cache -c /tmp/base-constraints.txt \
         "modelexpress @ https://github.com/${MX_REPO}/archive/${MX_REF}.tar.gz#subdirectory=modelexpress_client/python"; \
     rm /tmp/base-constraints.txt; \
-    python3 -c "import modelexpress, nixl, vllm; from vllm.config import ModelConfig; assert 'checkpoint_release_weights' in ModelConfig.__dataclass_fields__; from modelexpress import envs; assert envs.MX_POD_INFO_DIR == ''; print(vllm.__version__)"
+    python3 -c "import modelexpress, nixl, vllm; from vllm.config import ModelConfig; assert 'checkpoint_release_weights' in ModelConfig.__dataclass_fields__; from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import NixlConnector; assert 'supports_checkpoint' in vars(NixlConnector); from modelexpress import envs; assert envs.MX_POD_INFO_DIR == ''; print(vllm.__version__)"
 
 ARG CUDA_COMPAT_VERSION=13.1
 ARG CUDA_KEYRING_URL=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb

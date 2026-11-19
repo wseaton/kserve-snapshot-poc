@@ -26,10 +26,17 @@ patches.
 - `0004`: the connector hooks of [vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371)
   (open), its first commit backported: KV connectors get `checkpoint_prepare` and
   `checkpoint_restore`, and the engine refuses to prepare with a connector that does not declare
-  `supports_checkpoint`. Its NIXL prefill/decode commit is not carried.
+  `supports_checkpoint`.
 - `0005`: stacked on those hooks. With the CPU KV offload connector (`--kv-offloading-size`),
   `/checkpoint/prepare` frees the offload region and `/checkpoint/restore` refills it, so the
   checkpoint does not grow by the region size. No flag: stock vLLM keeps the region.
+- `0006`: the checkpoint lifecycle on the Rust frontend's gRPC `Control` service
+  (`CheckpointPrepare`, `CheckpointRestore`, `GetCheckpointState`). Upstream serves it only on
+  the HTTP routes of the development server.
+- `0007`: the second commit of #64371 as of 2026-11-18, backported to this base: NIXL prefill and
+  decode instances are checkpointed with `--checkpoint-prepare-on-startup` and restored
+  independently, each restore taking a new KV engine id and the restored pod's own side-channel
+  address. It applied to the NIXL connector unchanged; the conflicts were with `0002` and `0005`.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by

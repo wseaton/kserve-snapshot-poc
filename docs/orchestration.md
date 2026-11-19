@@ -147,9 +147,42 @@ on another node, which shared one 6.7 s pull of 4.3 GiB and then restored at the
 A completion through the KServe gateway and the endpoint picker came back from the restored pods.
 
 Not covered by that run: TLS between the gateway and vLLM, multi-node services (`LeaderWorkerSet`
-pods carry no `pod-template-hash`; `--revision-label` names another label), prefill and decode
-pairs, and what the endpoint picker does with connections it holds to a pod that is being
-checkpointed.
+pods carry no `pod-template-hash`; `--revision-label` names another label), KServe's prefill and
+decode templates, and what the endpoint picker does with connections it holds to a pod that is
+being checkpointed.
+
+## Prefill and decode
+
+Disaggregated serving works with the NIXL connector, with
+[vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371), which is open and is
+carried here as [patches/vllm/0007](../patches/vllm). The examples are
+[deploy/snapshotd/workload-pd](../deploy/snapshotd/workload-pd): the same Deployment twice, as a
+`kv_producer` and as a `kv_consumer`, each a workload of its own to the daemon.
+
+Two things differ from a server without a connector:
+
+- vLLM can checkpoint a NIXL connector only if it has not started its NIXL agent, so the server
+  runs with `--checkpoint-prepare-on-startup`: it comes up already prepared and serves nothing
+  until it is restored. The daemon takes a server in that state as booted, checkpoints it without
+  asking it to prepare, and every replica, the first included, serves only after a restore.
+- A restored replica is a new peer. On restore vLLM gives it a new KV engine id and moves the
+  connector's side channel to the pod's own address on the same interface, so
+  `VLLM_NIXL_SIDE_CHANNEL_HOST` has to be the pod's address, not a name.
+
+Qwen3-8B at TP=1 on H200, one prefill and one decode pod, then two of each over two nodes, the
+second pair restored from checkpoints pulled from the first node:
+
+| | |
+| --- | --- |
+| First replica of each role, Ready after | 91 s and 92 s (60 s boot to prepared, 5 to 7 s checkpoint, 5.7 s restore) |
+| Second replica of each role, on another node | 32 s and 36 s, the two pulls one after the other |
+| Prefill on any of the four pods, decode on any other | answered in all four pairings |
+| A code buried in a 400 to 3000 token prompt, asked for through prefill then decode | 260 of 260 right, one at a time and 8 at a time |
+| KV transfers counted by the two decode pods | 277 and 276, 12 GB each |
+
+The requests were sent the way a router does: to prefill with `do_remote_decode`, then to decode
+with the `kv_transfer_params` it returned. It has not run behind llm-d's routing sidecar or
+KServe's prefill and decode templates, and not over RDMA: the connector ran on `UCX_TLS=tcp,cuda_copy`.
 
 ## A limit on tensor parallel below a whole node
 
@@ -190,7 +223,7 @@ been run with.
 | --- | --- | --- |
 | Shaping the pod | A KServe config layer for `LLMInferenceService`, or a Deployment written by hand: the opt-in label, an init container that brings the shim, the wrapped command, vLLM's flags and environment, probes on the shim's port | The same for workloads that are neither, which means an admission webhook. Something also has to keep the shim, the daemon and the CRIU and cuInterpose tools at matching versions, because a checkpoint taken with one set is restored with whatever the node runs then |
 | Who may opt in | Anyone who can set a pod label | The label makes a privileged daemon enter the pod and run CRIU there, and a restore puts a saved process image into the pod. Opting in has to be an authorized act: admission policy on the label, or a decision made by the controller instead of by a label |
-| Eligibility | None; every labelled pod is tried | Refuse what cannot be checkpointed or would be wrong to restore: multi-node workers, prefill/decode pairs, engines without the checkpoint lifecycle, runtime-loaded LoRA adapters, routing that depends on per-replica cache state. Today such a pod fails its checkpoint and cold boots, after paying for the attempt |
+| Eligibility | None; every labelled pod is tried | Refuse what cannot be checkpointed or would be wrong to restore: multi-node workers, engines without the checkpoint lifecycle, runtime-loaded LoRA adapters, routing that depends on per-replica cache state. Today such a pod fails its checkpoint and cold boots, after paying for the attempt |
 | Revision identity | Namespace, the label's value and `pod-template-hash` | The hash covers the pod template only. It does not cover model files that change under the same path, an image referenced by tag, or a Deployment deleted and created again with the same template. A real key adds those, and a way to invalidate |
 | Node compatibility | Not checked. A checkpoint is restored on whatever node holds or pulls it | A checkpoint is good for one GPU model, driver, kernel and CPU feature set. Record them with the checkpoint, refuse a mismatch before trying, and invalidate after a driver or kernel upgrade |
 | Scheduling | The scheduler knows nothing. A pod restores if it happens to land on a node with the checkpoint, or one that can pull it, and for TP above 1 on part of a node, on the same device minors | Prefer nodes that hold the checkpoint, and never choose incompatible ones. Without this the benefit depends on luck or on every node pulling |

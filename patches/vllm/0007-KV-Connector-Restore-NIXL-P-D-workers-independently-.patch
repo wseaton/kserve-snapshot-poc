@@ -1,0 +1,988 @@
+From fc1214e528e728012175027e0c48d69e6a77a063 Mon Sep 17 00:00:00 2001
+From: Schwinn Saereesitthipitak <schwinns@nvidia.com>
+Date: Tue, 10 Nov 2026 20:24:02 +0000
+Subject: [PATCH] [KV Connector] Restore NIXL P/D workers independently from
+ process checkpoints
+
+Lets prefill and decode workers be checkpointed and restored independently,
+and several replicas be restored from one checkpoint.
+
+- Each restore appends a random suffix to the KV engine id, so peers
+  handshake again instead of reusing metadata cached by engine id. The
+  engine passes the new id to the workers.
+  MultiConnector children always share the engine's id, and a restore
+  copies the new one into each child's config. A child that sets its own
+  engine_id now gets a clear error instead of a TypeError.
+- Once UCX is initialized in a process, a checkpoint of it cannot be
+  restored, even after the agent is destroyed: UCX keeps process-wide
+  network state, such as routes by interface index. So NIXL supports
+  process checkpoints only with --checkpoint-prepare-on-startup, and its
+  workers then create their agent at checkpoint restore and register the
+  KV cache when it wakes. Every agent gets the backends and UCX backend
+  params of the first. A worker that already had an agent, as in a
+  prepare and restore in one process, drops the old agent's peers, gets a
+  new one and republishes its handshake metadata under the new engine id.
+  NixlBaseConnector.engine_id now reads the config, so it follows restores.
+  Preparing again after a restore logs a warning, since that checkpoint
+  cannot be restored.
+- The NIXL scheduler stops its handshake listener on prepare and records
+  which interface carries the side-channel host. Restore keeps that address
+  if the pod still has it, and otherwise takes a routable address of the
+  same interface. Names such as DNS names are kept. A listener that cannot
+  bind fails startup or restore instead of hanging.
+
+--checkpoint-prepare-on-startup is refused for an in-process engine core,
+which never prepares, so NIXL workers there would never create an agent.
+
+Out of scope: NIXL push mode and the P2P offload tier.
+
+Signed-off-by: Schwinn Saereesitthipitak <schwinns@nvidia.com>
+---
+ docs/features/nixl_connector_usage.md         |   1 +
+ docs/serving/online_serving/README.md         |   2 +-
+ tests/v1/engine/test_engine_core.py           |  30 ++-
+ tests/v1/engine/test_llm_engine.py            |   8 +
+ tests/v1/kv_connector/unit/test_config.py     |  36 ++++
+ .../kv_connector/unit/test_multi_connector.py |  33 ++++
+ .../kv_connector/unit/test_nixl_connector.py  | 180 ++++++++++++++++++
+ .../unit/test_nixl_desc_geometry.py           |   1 +
+ tests/v1/worker/test_gpu_worker.py            |  23 ++-
+ vllm/config/model.py                          |   2 +-
+ .../kv_transfer/kv_connector/v1/base.py       |   3 +-
+ .../kv_connector/v1/multi_connector.py        |  15 +-
+ .../kv_connector/v1/nixl/base_scheduler.py    |  56 +++++-
+ .../kv_connector/v1/nixl/base_worker.py       |  96 ++++++++--
+ .../kv_connector/v1/nixl/connector.py         |  26 ++-
+ vllm/v1/engine/core.py                        |  10 +-
+ vllm/v1/engine/llm_engine.py                  |   9 +
+ vllm/v1/worker/gpu_worker.py                  |   5 +-
+ 18 files changed, 502 insertions(+), 34 deletions(-)
+
+diff --git a/docs/features/nixl_connector_usage.md b/docs/features/nixl_connector_usage.md
+index 00f5860af..0fca4c6d9 100644
+--- a/docs/features/nixl_connector_usage.md
++++ b/docs/features/nixl_connector_usage.md
+@@ -134,6 +134,7 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
+     - Default: "localhost"
+     - Set when prefiller and decoder are on different machines
+     - Connection info is passed via KVTransferParams from prefiller to decoder for handshake
++    - After a [process checkpoint](../serving/online_serving/README.md#process-checkpoint-apis) restore, an interface address the restored pod lacks becomes its address on the same interface. Process checkpoints need `--checkpoint-prepare-on-startup`, and a checkpoint taken after a restore cannot be restored.
+ 
+ - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
+     - Default: 30
+diff --git a/docs/serving/online_serving/README.md b/docs/serving/online_serving/README.md
+index 814f8de1f..139fc0daa 100644
+--- a/docs/serving/online_serving/README.md
++++ b/docs/serving/online_serving/README.md
+@@ -173,7 +173,7 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
+ 
+ ## Process Checkpoint APIs
+ 
+-For external checkpoint/restore orchestrators, available with `--enable-sleep-mode`. Preparing drains the engine and releases its KV cache and other external state, any number of times. Until `/checkpoint/restore`, new requests get a retryable error and `/health` still returns 200, as while asleep. `--checkpoint-prepare-on-startup` prepares each engine once it starts. With a KV connector, the engine prepares only if the connector supports it. `OffloadingConnector` supports it with the CPU spec (`--kv-offloading-size`): preparing also frees the CPU offloading region, which restoring allocates again.
++For external checkpoint/restore orchestrators, available with `--enable-sleep-mode`. Preparing drains the engine and releases its KV cache and other external state, any number of times. Until `/checkpoint/restore`, new requests get a retryable error and `/health` still returns 200, as while asleep. `--checkpoint-prepare-on-startup` prepares each engine once it starts. With a KV connector, the engine prepares only if the connector supports it. `OffloadingConnector` supports it with the CPU spec (`--kv-offloading-size`): preparing also frees the CPU offloading region, which restoring allocates again. `NixlConnector` in pull mode needs `--checkpoint-prepare-on-startup`. Each restore appends a random suffix to the KV engine id, so restored replicas get distinct `remote_engine_id` values.
+ 
+ - `/checkpoint/prepare` - Start preparing, draining with `?mode=wait` (default), `abort` or `keep`; 200 once started or already preparing, 400 if the engine cannot prepare now
+ - `/checkpoint/status` - Return the state: 200 once prepared, 503 until then, 500 after a failure
+diff --git a/tests/v1/engine/test_engine_core.py b/tests/v1/engine/test_engine_core.py
+index 3952382f8..8ff5028f6 100644
+--- a/tests/v1/engine/test_engine_core.py
++++ b/tests/v1/engine/test_engine_core.py
+@@ -870,9 +870,8 @@ def _executor_calls(core: EngineCoreProc) -> list[str]:
+ 
+ 
+ def test_checkpoint_prepare_then_restore_run_in_order():
+-    """Preparing drains, then discards the KV cache and releases external
+-    state. Restoring brings external state back before the KV cache wakes and
+-    scheduling resumes. Repeating either is a no-op."""
++    """Preparing drains and releases the KV cache and external state. Restoring
++    takes a new KV engine id, then brings them back. Repeating is a no-op."""
+     core = _pausable_engine_core_proc()
+     core.vllm_config = MagicMock()
+     core.vllm_config.model_config.checkpoint_release_weights = False
+@@ -882,7 +881,8 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+     kv_connector = MagicMock()
+     kv_connector.supports_checkpoint.return_value = True
+     core.scheduler.get_kv_connector.return_value = kv_connector
+-    # Record the scheduler-side connector calls among the executor calls.
++    core.vllm_config.kv_transfer_config.engine_id = "source"
++    # Record the connector calls among the executor calls.
+     core.model_executor.attach_mock(kv_connector, "kv_connector")
+     core.model_executor.get_kv_connector_handshake_metadata.return_value = []
+ 
+@@ -909,6 +909,11 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+         "wake_up",
+         "get_kv_connector_handshake_metadata",
+     ]
++    engine_id = core.vllm_config.kv_transfer_config.engine_id
++    assert engine_id.startswith("source_") and len(engine_id) == len("source_") + 16
++    core.model_executor.collective_rpc.assert_any_call(
++        "checkpoint_restore", None, (engine_id,), None
++    )
+     core.scheduler.set_pause_state.assert_called_with(PauseState.UNPAUSED)
+     assert not core.reject_new_requests
+ 
+@@ -966,6 +971,23 @@ def test_checkpoint_release_weights_discards_then_reloads():
+     ]
+ 
+ 
++def test_checkpoint_restore_without_kv_transfer_passes_no_engine_id():
++    """Workers whose `checkpoint_restore` takes no arguments keep working."""
++    core = _pausable_engine_core_proc()
++    core.vllm_config = MagicMock(kv_transfer_config=None)
++    core.model_executor.is_sleeping = False
++    core._reset_caches = MagicMock()
++    core.reject_new_requests = False
++    core.scheduler.get_kv_connector.return_value = None
++
++    assert core.checkpoint_prepare("wait") is None
++    core.checkpoint_restore()
++
++    core.model_executor.collective_rpc.assert_any_call(
++        "checkpoint_restore", None, (), None
++    )
++
++
+ def test_checkpoint_prepare_refuses_unsupported_kv_connector():
+     """A KV connector whose process checkpoint cannot be restored makes the
+     engine refuse to prepare, with nothing paused."""
+diff --git a/tests/v1/engine/test_llm_engine.py b/tests/v1/engine/test_llm_engine.py
+index 491db06a0..6a6dd4d4e 100644
+--- a/tests/v1/engine/test_llm_engine.py
++++ b/tests/v1/engine/test_llm_engine.py
+@@ -85,6 +85,14 @@ def test_dp_step_runs_dummy_batch_when_no_forward(model_executed: bool):
+     )
+ 
+ 
++def test_checkpoint_prepare_on_startup_requires_engine_core_process():
++    """An in-process engine core never prepares, so the flag is refused."""
++    vllm_config = MagicMock()
++    vllm_config.model_config.checkpoint_prepare_on_startup = True
++    with pytest.raises(ValueError, match="VLLM_ENABLE_V1_MULTIPROCESSING"):
++        LLMEngine(vllm_config, MagicMock(), log_stats=False)
++
++
+ def test_duplicate_profile_start_rejected_before_engine_core_dispatch():
+     engine = object.__new__(LLMEngine)
+     engine.engine_core = MagicMock()
+diff --git a/tests/v1/kv_connector/unit/test_config.py b/tests/v1/kv_connector/unit/test_config.py
+index b2c0c32ab..1d305e7a8 100644
+--- a/tests/v1/kv_connector/unit/test_config.py
++++ b/tests/v1/kv_connector/unit/test_config.py
+@@ -112,6 +112,7 @@ def _build_config(
+     kv_connector_extra_config: dict | None = None,
+     enable_sleep_mode: bool = False,
+     enable_cumem_allocator: bool = False,
++    checkpoint_prepare_on_startup: bool = False,
+ ) -> VllmConfig:
+     """Build a VllmConfig that exercises _verify_kv_transfer_compat without
+     requiring a real model (avoids HF downloads in CI)."""
+@@ -131,6 +132,7 @@ def _build_config(
+     cfg.model_config = SimpleNamespace(
+         enable_sleep_mode=enable_sleep_mode,
+         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
++        checkpoint_prepare_on_startup=checkpoint_prepare_on_startup,
+     )
+     cfg._verify_kv_transfer_compat()
+     return cfg
+@@ -203,6 +205,40 @@ def test_offloading_connector_opts_in_to_process_checkpoints(extra_config, suppo
+     assert connector_cls.supports_checkpoint(config) == supported
+ 
+ 
++_NIXL = {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
++_OFFLOAD = {
++    "kv_connector": "OffloadingConnector",
++    "kv_role": "kv_both",
++    "kv_connector_extra_config": {"spec_name": "TieringOffloadingSpec"},
++}
++
++
++@pytest.mark.parametrize(
++    "kv_connector,extra_config,prepare_on_startup,supported",
++    [
++        ("NixlConnector", None, True, True),
++        # UCX state from an agent created before capture breaks the restore.
++        ("NixlConnector", None, False, False),
++        ("MooncakeConnector", None, True, False),
++        ("MultiConnector", {"connectors": [_NIXL]}, True, True),
++        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, False),
++    ],
++)
++def test_kv_connectors_opt_in_to_process_checkpoints(
++    kv_connector, extra_config, prepare_on_startup, supported
++):
++    """The engine prepares only with connectors whose checkpoint restores; a
++    MultiConnector needs every child to."""
++    config = _build_config(
++        kv_connector=kv_connector,
++        kv_connector_extra_config=extra_config,
++        enable_sleep_mode=True,
++        checkpoint_prepare_on_startup=prepare_on_startup,
++    )
++    connector_cls = KVConnectorFactory.get_connector_class(config.kv_transfer_config)
++    assert connector_cls.supports_checkpoint(config) == supported
++
++
+ def test_mooncake_store_supports_sleep_with_explicit_rdma(monkeypatch, tmp_path):
+     """Disabling auto-discovery keeps explicit RDMA despite NVLink overrides."""
+     monkeypatch.setitem(sys.modules, "mooncake", None)
+diff --git a/tests/v1/kv_connector/unit/test_multi_connector.py b/tests/v1/kv_connector/unit/test_multi_connector.py
+index 02e68a324..04fbb40e9 100644
+--- a/tests/v1/kv_connector/unit/test_multi_connector.py
++++ b/tests/v1/kv_connector/unit/test_multi_connector.py
+@@ -1147,6 +1147,39 @@ def test_multi_connector_children_use_configured_lookahead_hashes(
+             )
+ 
+ 
++@pytest.mark.cpu_test
++def test_checkpoint_restore_refreshes_each_connector_engine_id(mc):
++    """Each connector restores under the engine's new id, in its own copy of
++    the KV transfer config."""
++    seen = []
++    for ktc, connector in zip(mc._ktc_kv_transfer_config, mc._connectors):
++        connector.checkpoint_restore.side_effect = lambda ktc=ktc: seen.append(
++            ktc.engine_id
++        )
++    mc._vllm_config.kv_transfer_config.engine_id = "restored"
++    mc.checkpoint_restore()
++
++    assert seen == ["restored"] * 2
++
++
++def test_connectors_cannot_set_engine_id():
++    """Connectors share the engine's id."""
++    vllm_config = create_vllm_config(
++        kv_connector="MultiConnector",
++        kv_connector_extra_config={
++            "connectors": [
++                {
++                    "kv_connector": "NixlConnector",
++                    "kv_role": "kv_both",
++                    "engine_id": "a",
++                }
++            ]
++        },
++    )
++    with pytest.raises(ValueError, match="cannot set engine_id"):
++        MultiConnector._get_connector_classes_and_configs(vllm_config)
++
++
+ def test_multi_connector_worker_metadata(mc):
+     class MockConnectorWorkerMetadata(KVConnectorWorkerMetadata):
+         def __init__(self, data: set[str]):
+diff --git a/tests/v1/kv_connector/unit/test_nixl_connector.py b/tests/v1/kv_connector/unit/test_nixl_connector.py
+index 5010706f1..c3e4c01c7 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_connector.py
++++ b/tests/v1/kv_connector/unit/test_nixl_connector.py
+@@ -5,6 +5,7 @@ import contextlib
+ import inspect
+ import os
+ import queue
++import socket
+ import tempfile
+ import textwrap
+ import threading
+@@ -3198,6 +3199,147 @@ def test_sleep_unregisters_and_restores_kv_caches(dist_init):
+     connector.shutdown()
+ 
+ 
++@pytest.mark.cpu_test
++@pytest.mark.parametrize("prepare_on_startup", [True, False])
++@patch(
++    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
++    FakeNixlWrapper,
++)
++def test_checkpoint_restore_creates_the_agent_under_a_new_engine_id(
++    dist_init, prepare_on_startup
++):
++    """A restored worker gets a new agent without the old agent's peers and
++    advertises the restored engine id."""
++    block_size = maybe_update_block_size(16)
++    vllm_config = create_vllm_config(block_size=block_size)
++    vllm_config.model_config.checkpoint_prepare_on_startup = prepare_on_startup
++    vllm_config.cache_config.kv_cache_layout = "BLHNC"
++    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
++    spec = AttentionSpec(
++        block_size=block_size, num_kv_heads=4, head_size=16, dtype=torch.float16
++    )
++    kv_cache_config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[],
++        kv_cache_groups=[new_kv_cache_group(["layer0"], spec)],
++    )
++    raw = torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)
++    (cache,) = dense_kv_cache_views(
++        raw, spec, 2, num_layers=1, layout=KVCacheLayout.BLHNC
++    )
++    with set_current_vllm_config(vllm_config):
++        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
++        connector.register_kv_caches({"layer0": cache})
++    worker = connector.connector_worker
++    assert bool(worker._registered_descs) != prepare_on_startup
++    source_agent = getattr(worker, "nixl_wrapper", None)
++
++    connector.unregister_kv_caches()
++    if source_agent is not None:
++        # A handshake that finished after the KV cache was released.
++        worker._remote_agents["late-peer"] = {(0, 0): "late-agent"}
++    vllm_config.kv_transfer_config.engine_id = "restored"
++    connector.checkpoint_restore()
++    connector.restore_kv_caches()
++    assert worker.nixl_wrapper is not source_agent
++    assert not worker._remote_agents
++    assert set(worker.dst_num_blocks) == {"restored"}
++    assert worker._registered_descs
++    payload = worker.xfer_handshake_metadata
++    agent = msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)
++    assert agent.engine_id == "restored"
++    connector.shutdown()
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize(
++    "source,source_eth0,restored_eth0,expected",
++    [
++        (
++            "10.0.0.5",
++            [(socket.AF_INET, "10.0.0.5")],
++            [(socket.AF_INET, "10.0.9.7")],
++            "10.0.9.7",
++        ),
++        (
++            "fd00::5",
++            [(socket.AF_INET6, "fd00::5")],
++            [(socket.AF_INET6, "fe80::1%eth0"), (socket.AF_INET6, "fd00::7")],
++            "fd00::7",
++        ),
++        (
++            "prefill.ns.svc",
++            [(socket.AF_INET, "10.0.0.5")],
++            [(socket.AF_INET, "10.0.9.7")],
++            "prefill.ns.svc",
++        ),
++        (
++            "10.0.0.5",
++            [(socket.AF_INET, "10.0.0.5")],
++            [(socket.AF_INET, "10.0.9.7"), (socket.AF_INET, "10.0.0.5")],
++            "10.0.0.5",
++        ),
++    ],
++    ids=["ipv4", "ipv6", "name", "in-place"],
++)
++def test_checkpoint_restore_moves_the_side_channel_to_the_new_pod(
++    source, source_eth0, restored_eth0, expected
++):
++    """A restored listener moves to the new pod's routable address on the same
++    interface. A name, or an address the pod still has, is kept."""
++
++    def interfaces(eth0):
++        return {
++            "lo": [SimpleNamespace(family=socket.AF_INET, address="127.0.0.1")],
++            "eth0": [SimpleNamespace(family=f, address=a) for f, a in eth0],
++        }
++
++    vllm_config = create_vllm_config()
++    scheduler = NixlConnectorScheduler(
++        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(16)
++    )
++    scheduler.side_channel_host = source
++    with patch("psutil.net_if_addrs", return_value=interfaces(source_eth0)):
++        scheduler.checkpoint_prepare()
++    vllm_config.kv_transfer_config.engine_id = "restored"
++    with patch("psutil.net_if_addrs", return_value=interfaces(restored_eth0)):
++        scheduler.checkpoint_restore()
++    request = create_request(request_id=0, num_tokens=40, do_remote_decode=True)
++    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
++    params = scheduler.request_finished(request, ([0, 1, 2],))[1]
++    assert params is not None
++    assert params["remote_host"] == expected
++    assert params["remote_engine_id"] == "restored"
++    assert not scheduler._stop_event.is_set()
++
++
++@pytest.mark.cpu_test
++@pytest.mark.timeout(60)
++@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
++def test_handshake_listener_bind_failure_raises():
++    """A listener that cannot bind its side-channel address must fail the
++    caller, such as a checkpoint restore, instead of hanging it."""
++    import zmq
++
++    vllm_config = create_vllm_config()
++    scheduler = NixlConnectorScheduler(
++        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(16)
++    )
++    payload = NixlHandshakePayload(compatibility_hash="h", agent_metadata_bytes=b"a")
++    ctx = zmq.Context()
++    taken = ctx.socket(zmq.ROUTER)
++    try:
++        scheduler.side_channel_host = "127.0.0.1"
++        scheduler.side_channel_port = taken.bind_to_random_port("tcp://127.0.0.1")
++        with pytest.raises(RuntimeError, match="failed to bind"):
++            scheduler.set_xfer_handshake_metadata({(0, 0): payload})
++        # A later call tries to bind again.
++        assert scheduler._nixl_handshake_listener_t is None
++    finally:
++        taken.close(linger=0)
++        ctx.term()
++
++
+ def test_registration_generation_bumps_on_changed_payload(
+     default_vllm_config, dist_init
+ ):
+@@ -5240,3 +5382,41 @@ def test_ucx_backend_params(dist_init, extra_config, agent_backends, created_bac
+     wrapper = connector.connector_worker.nixl_wrapper
+     assert wrapper.config.backends == agent_backends
+     assert wrapper.created_backends == created_backends
++
++
++@pytest.mark.cpu_test
++def test_restored_agent_creates_the_startup_backends(dist_init):
++    """The agent a checkpoint restore creates gets the backends and UCX
++    params of the agent created at startup."""
++
++    def agent_config(backends=None, num_threads=0, capture_telemetry=False):
++        return SimpleNamespace(backends=["UCX"] if backends is None else backends)
++
++    vllm_config = create_vllm_config(
++        kv_connector_extra_config={
++            "ucx_backend_params": {"ucx_error_handling_mode": "none"}
++        }
++    )
++    vllm_config.model_config.enable_sleep_mode = True
++    with (
++        patch(
++            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
++            _BackendRecordingNixlWrapper,
++        ),
++        patch(
++            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.nixl_agent_config",
++            agent_config,
++        ),
++        set_current_vllm_config(vllm_config),
++    ):
++        connector = NixlConnector(
++            vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
++        )
++    worker = connector.connector_worker
++    ucx_params = {
++        "num_threads": "4",
++        "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
++        "ucx_error_handling_mode": "none",
++    }
++    assert worker.nixl_wrapper.created_backends == [("UCX", ucx_params)]
++    assert worker._create_nixl_wrapper().created_backends == [("UCX", ucx_params)]
+diff --git a/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py b/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
+index 91d68f852..21fbaaed2 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
++++ b/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
+@@ -416,6 +416,7 @@ def _register_overlaid_mla_worker(
+     worker.nixl_memory_type = "VRAM"
+     worker.nixl_backends = None
+     worker.nixl_wrapper = _RecordingNixl()
++    worker._has_agent = True
+     worker._registered_descs = []
+     worker.dst_num_blocks = {}
+     worker.dst_region_num_blocks = {}
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 1c90edda7..bb34f4348 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -4,7 +4,7 @@
+ import json
+ from contextlib import nullcontext
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+@@ -75,6 +75,27 @@ def test_sleep_preservation_allows_empty_draft_but_rejects_target_typo(
+         worker._save_sleep_parameters(target)
+ 
+ 
++def test_checkpoint_restore_sets_kv_engine_id_before_the_connector(monkeypatch):
++    """The KV connector restores under the engine id the engine sent."""
++    worker = object.__new__(gpu_worker.Worker)
++    kv_transfer_config = SimpleNamespace(engine_id="source")
++    worker.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
++    seen = []
++    connector = MagicMock()
++    connector.checkpoint_restore.side_effect = lambda: seen.append(
++        kv_transfer_config.engine_id
++    )
++    monkeypatch.setattr(
++        gpu_worker, "checkpoint_restore_distributed_state", lambda: None
++    )
++    monkeypatch.setattr(gpu_worker, "has_kv_transfer_group", lambda: True)
++    monkeypatch.setattr(gpu_worker, "get_kv_transfer_group", lambda: connector)
++
++    worker.checkpoint_restore("restored")
++
++    assert seen == ["restored"]
++
++
+ def test_load_model_preserves_compiled_graphs_at_runtime(monkeypatch):
+     """Profiling must use serving's thread count to keep Dynamo guards valid."""
+     from torch._dynamo.testing import CompileCounter
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 05aa1d144..eacb4ee8e 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -398,7 +398,7 @@ class ModelConfig:
+     checkpoint_prepare_on_startup: bool = False
+     """Prepare each engine for a process checkpoint once it starts, as
+     `/checkpoint/prepare` does. It serves only after `/checkpoint/restore`.
+-    Requires sleep mode."""
++    Requires sleep mode and an engine core in its own process."""
+     checkpoint_release_weights: bool = False
+     """Also discard the weights when preparing for a process checkpoint, so the
+     checkpoint does not contain them, and reload them through the model loader
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 981caf850..c3d035321 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -253,7 +253,8 @@ class KVConnectorBase_V1(ABC):
+         return
+ 
+     def checkpoint_restore(self) -> None:
+-        """Bring back what `checkpoint_prepare` released."""
++        """Bring back what `checkpoint_prepare` released, under the new
++        `kv_transfer_config.engine_id`."""
+         return
+ 
+     # ==============================
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index cfbb52499..03285cc93 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -180,10 +180,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         )
+ 
+         self._connectors: list[KVConnectorBase_V1] = []
+-        self._ktc_kv_transfer_config = []
++        self._ktc_kv_transfer_config: list[KVTransferConfig] = []
+         for connector_cls, temp_config in self._get_connector_classes_and_configs(
+             vllm_config
+         ):
++            assert temp_config.kv_transfer_config is not None
+             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
+             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+ 
+@@ -267,10 +268,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         assert ktcs is not None
+         ret: list[tuple[type[KVConnectorBaseType], VllmConfig]] = []
+         for ktc in ktcs:
++            # Children share the engine's id, so a restore updates them together.
++            if "engine_id" in ktc:
++                raise ValueError("MultiConnector connectors cannot set engine_id")
+             temp_config = copy.copy(vllm_config)
+-            engine_id = ktc.get("engine_id", vllm_config.kv_transfer_config.engine_id)
+             temp_config.kv_transfer_config = KVTransferConfig(
+-                **ktc, engine_id=engine_id
++                **ktc, engine_id=vllm_config.kv_transfer_config.engine_id
+             )
+             ret.append(
+                 (
+@@ -299,7 +302,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+             c.checkpoint_prepare()
+ 
+     def checkpoint_restore(self) -> None:
+-        for c in self._connectors:
++        assert self._vllm_config.kv_transfer_config is not None
++        engine_id = self._vllm_config.kv_transfer_config.engine_id
++        # Each connector has its own copy of the shared engine id.
++        for ktc, c in zip(self._ktc_kv_transfer_config, self._connectors):
++            ktc.engine_id = engine_id
+             c.checkpoint_restore()
+ 
+     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+index 1a78fbb45..06d708bf7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+@@ -2,11 +2,13 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Base scheduler-side logic for the NIXL connector."""
+ 
++import ipaddress
+ import threading
+ import time
+ from typing import TYPE_CHECKING, Any
+ 
+ import msgspec
++import psutil
+ import zmq
+ 
+ from vllm import envs
+@@ -74,6 +76,8 @@ class NixlBaseConnectorScheduler:
+         self.engine_id: EngineId = engine_id
+         self.kv_cache_config = kv_cache_config
+         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
++        # (interface, family) of the side-channel host, set by checkpoint prepare.
++        self._side_channel_interface: tuple[str, int] | None = None
+         self.side_channel_port = (
+             envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+             + vllm_config.parallel_config.data_parallel_index
+@@ -199,6 +203,47 @@ class NixlBaseConnectorScheduler:
+             self._nixl_handshake_listener_t.join()
+             self._nixl_handshake_listener_t = None
+ 
++    def checkpoint_prepare(self) -> None:
++        # Stop the handshake listener, which is bound to this pod's address.
++        self.shutdown()
++        self._side_channel_interface = next(
++            (
++                (name, addr.family)
++                for name, addrs in psutil.net_if_addrs().items()
++                for addr in addrs
++                if addr.address.split("%")[0] == self.side_channel_host
++            ),
++            None,
++        )
++
++    def checkpoint_restore(self) -> None:
++        # The next handshake metadata restarts the listener.
++        kv_transfer_config = self.vllm_config.kv_transfer_config
++        assert kv_transfer_config is not None and kv_transfer_config.engine_id
++        self.engine_id = kv_transfer_config.engine_id
++        # An interface address moves to this pod's address on the same
++        # interface. A hostname is kept.
++        if self._side_channel_interface is not None:
++            name, family = self._side_channel_interface
++            addresses = [
++                addr.address.split("%")[0]
++                for addr in psutil.net_if_addrs().get(name, [])
++                if addr.family == family
++            ]
++            if self.side_channel_host not in addresses:
++                routable = [
++                    address
++                    for address in addresses
++                    if not (ip := ipaddress.ip_address(address)).is_link_local
++                    and not ip.is_loopback
++                ]
++                if not routable:
++                    raise RuntimeError(
++                        f"Side-channel interface {name} has no address after restore"
++                    )
++                self.side_channel_host = routable[0]
++        self._stop_event.clear()
++
+     def on_new_request(self, request: "Request") -> None:
+         """Track a request that may need heartbeats."""
+         params = request.kv_transfer_params
+@@ -322,7 +367,7 @@ class NixlBaseConnectorScheduler:
+             )
+ 
+         # Only start the listener when we have metadata to serve.
+-        if self._nixl_handshake_listener_t is None:
++        if self._nixl_handshake_listener_t is None and self._handshake_data:
+             ready_event = threading.Event()
+             self._nixl_handshake_listener_t = threading.Thread(
+                 target=self._nixl_handshake_listener,
+@@ -337,7 +382,14 @@ class NixlBaseConnectorScheduler:
+                 name="nixl_handshake_listener",
+             )
+             self._nixl_handshake_listener_t.start()
+-            ready_event.wait()  # Wait for listener ZMQ socket to be ready.
++            # The thread exits if it cannot bind, so do not wait forever.
++            while not ready_event.wait(timeout=1):
++                if not self._nixl_handshake_listener_t.is_alive():
++                    self._nixl_handshake_listener_t = None
++                    raise RuntimeError(
++                        "NIXL handshake listener failed to bind "
++                        f"{self.side_channel_host}:{self.side_channel_port}"
++                    )
+ 
+     @staticmethod
+     def _nixl_handshake_listener(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index db667e710..a3fd10af0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -806,18 +806,21 @@ class NixlBaseConnectorWorker:
+         explicit_backends = (config is not None and not sleep_mode) and (
+             bool(ucx_backend_params) and "UCX" in self.nixl_backends
+         )
++        # Backends to create on each agent, with their params.
++        self._nixl_backend_params: list[tuple[str, dict[str, str]]] = []
+         if sleep_mode or explicit_backends:
+             config = nixl_agent_config(backends=[], capture_telemetry=True)
+-        self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+         if sleep_mode:
+             # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
+-            self.nixl_wrapper.create_backend(
+-                "UCX",
+-                {
+-                    "num_threads": str(num_threads),
+-                    "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
+-                    **ucx_backend_params,
+-                },
++            self._nixl_backend_params.append(
++                (
++                    "UCX",
++                    {
++                        "num_threads": str(num_threads),
++                        "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
++                        **ucx_backend_params,
++                    },
++                )
+             )
+         elif explicit_backends:
+             for backend in self.nixl_backends:
+@@ -826,7 +829,14 @@ class NixlBaseConnectorWorker:
+                     if not non_ucx_backends:
+                         nixl_params["num_threads"] = str(num_threads)
+                     nixl_params.update(ucx_backend_params)
+-                self.nixl_wrapper.create_backend(backend, nixl_params)
++                self._nixl_backend_params.append((backend, nixl_params))
++        self._nixl_wrapper_cls = nixl_wrapper_cls
++        self._nixl_agent_config = config
++        # UCX caches routes for the life of the process, so an engine that
++        # prepares at startup creates its agent at checkpoint restore.
++        self._has_agent = not vllm_config.model_config.checkpoint_prepare_on_startup
++        if self._has_agent:
++            self.nixl_wrapper = self._create_nixl_wrapper()
+         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
+         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
+         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
+@@ -983,6 +993,8 @@ class NixlBaseConnectorWorker:
+         self._dst_pairs: dict[EngineId, _RegionPairs] = {}
+         self.dst_region_mem_types: dict[EngineId, list[str]] = {}
+         self._registered_descs: list[Any] = []
++        # Memory type -> (address, length, device, "") ranges to register.
++        self._registration_ranges: dict[str, list[tuple[int, int, int, str]]] = {}
+         self._kv_unregistered = False
+ 
+         # In progress transfers.
+@@ -1922,10 +1934,8 @@ class NixlBaseConnectorWorker:
+                 "Mixed-device KV registration is only supported for MLA "
+                 "models without Mamba layers."
+             )
+-        for mem_type in sorted(set(region_mem_types)):
+-            if mem_type == "DRAM" and self._skip_dram_xfer:
+-                continue
+-            ranges_for_mem_type = [
++        self._registration_ranges = {
++            mem_type: [
+                 (start, end - start, device_id, "")
+                 for (_, cache_mem_type), (
+                     start,
+@@ -1934,9 +1944,9 @@ class NixlBaseConnectorWorker:
+                 ) in registration_ranges.items()
+                 if cache_mem_type == mem_type
+             ]
+-            descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
+-            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+-            self._registered_descs.append(descs)
++            for mem_type in sorted(set(region_mem_types))
++            if not (mem_type == "DRAM" and self._skip_dram_xfer)
++        }
+ 
+         self.device_kv_caches = kv_caches
+         self.dst_num_blocks[self.engine_id] = self.num_blocks
+@@ -1958,6 +1968,16 @@ class NixlBaseConnectorWorker:
+                 set(self.block_len_per_layer),
+             )
+ 
++        if self._has_agent:
++            self._register_with_nixl()
++
++    def _register_with_nixl(self) -> None:
++        """Register the KV regions with the agent and build the handshake payload."""
++        for mem_type, ranges in self._registration_ranges.items():
++            descs = self.nixl_wrapper.get_reg_descs(ranges, mem_type)
++            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
++            self._registered_descs.append(descs)
++
+         # Register local/src descr for NIXL xfer.
+         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
+             self.register_local_xfer_handler(self.block_size)
+@@ -2029,6 +2049,10 @@ class NixlBaseConnectorWorker:
+         self._kv_unregistered = True
+ 
+     def restore_kv_caches(self) -> None:
++        if self.xfer_handshake_metadata is None:
++            # First registration of an agent created at checkpoint restore.
++            self._register_with_nixl()
++            return
+         if not self._kv_unregistered:
+             return
+         for descs in self._registered_descs:
+@@ -2043,6 +2067,8 @@ class NixlBaseConnectorWorker:
+             payload.agent_metadata_bytes, type=NixlAgentMetadata
+         )
+         agent_metadata.agent_metadata = self.nixl_wrapper.get_agent_metadata()
++        # A checkpoint restore gives the engine a new id.
++        agent_metadata.engine_id = self.engine_id
+         payload.agent_metadata_bytes = msgspec.msgpack.encode(agent_metadata)
+         self._kv_unregistered = False
+ 
+@@ -4145,6 +4171,44 @@ class NixlBaseConnectorWorker:
+             self.device_kv_caches = {}
+             self.host_xfer_buffers = {}
+ 
++    def _create_nixl_wrapper(self) -> Any:
++        # Each restored copy of the process needs a new agent name.
++        wrapper = self._nixl_wrapper_cls(str(uuid.uuid4()), self._nixl_agent_config)
++        for backend, params in self._nixl_backend_params:
++            wrapper.create_backend(backend, params)
++        return wrapper
++
++    def checkpoint_prepare(self) -> None:
++        # Preparing is refused unless the agent is created at restore.
++        if self._has_agent:
++            logger.warning_once(
++                "This process created its NIXL agent at a checkpoint restore, so "
++                "a checkpoint of it cannot be restored. Preparing and restoring "
++                "in place still works."
++            )
++
++    def checkpoint_restore(self) -> None:
++        """Create a new agent under the restored engine id."""
++        if self._has_agent:
++            # Let pending handshakes finish, then drop the old agent's peers.
++            self._handshake_initiation_executor.submit(lambda: None).result()
++            self._release_local_xfer_handles()
++            for peer in list(self._remote_agents):
++                self._cleanup_remote_engine(peer, log_eviction=False)
++        self.nixl_wrapper = self._create_nixl_wrapper()
++        self._has_agent = True
++        engine_id = self.kv_transfer_config.engine_id
++        assert engine_id is not None
++        local_state: tuple[dict[EngineId, Any], ...] = (
++            self.kv_caches_base_addr,
++            self.dst_num_blocks,
++        )
++        for state in local_state:
++            state[engine_id] = state.pop(self.engine_id)
++        if self.transfer_topo is not None:
++            self.transfer_topo.engine_id = engine_id
++        self.engine_id = engine_id
++
+     def shutdown(self) -> None:
+         """Shutdown the connector worker."""
+         if not hasattr(self, "_handshake_initiation_executor"):
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+index 279cd6aa6..1ee46666b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+@@ -137,12 +137,18 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
+             )
+ 
+         self.kv_cache_config = kv_cache_config
+-        self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+         self.kv_transfer_config = vllm_config.kv_transfer_config
+         # Subclasses must set self.connector_scheduler and self.connector_worker
+         self.connector_scheduler: NixlBaseConnectorScheduler | None = None
+         self.connector_worker: NixlBaseConnectorWorker | None = None
+ 
++    @property
++    def engine_id(self) -> EngineId:
++        # Read from the config, which a checkpoint restore updates.
++        engine_id = self.kv_transfer_config.engine_id
++        assert engine_id is not None
++        return engine_id
++
+     ############################################################
+     # Class Methods
+     ############################################################
+@@ -333,6 +339,18 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
+         if self.connector_scheduler is not None:
+             self.connector_scheduler.shutdown()
+ 
++    def checkpoint_prepare(self) -> None:
++        if self.connector_worker is not None:
++            self.connector_worker.checkpoint_prepare()
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.checkpoint_prepare()
++
++    def checkpoint_restore(self) -> None:
++        if self.connector_worker is not None:
++            self.connector_worker.checkpoint_restore()
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.checkpoint_restore()
++
+     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+         """Get the KVConnector handshake metadata for this connector.
+         This metadata is used for out-of-band connector handshake
+@@ -379,6 +397,12 @@ class NixlPullConnector(NixlBaseConnector):
+         # Sleep mode is only validated with the UCX backend.
+         return kv_transfer_config.get_from_extra_config("backends", ["UCX"]) == ["UCX"]
+ 
++    @classmethod
++    def supports_checkpoint(cls, vllm_config: VllmConfig) -> bool:
++        # UCX state from before the capture breaks the restore, so the agent
++        # must be created at restore.
++        return vllm_config.model_config.checkpoint_prepare_on_startup
++
+     def unregister_kv_caches(self) -> None:
+         assert self.connector_worker is not None
+         self.connector_worker.unregister_kv_caches()
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index a4d7d2aad..6bbed5666 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -45,7 +45,7 @@ from vllm.outputs import RequestError
+ from vllm.tasks import POOLING_TASKS, SupportedTask
+ from vllm.tracing import instrument, maybe_init_worker_tracer
+ from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+-from vllm.utils import numa_utils
++from vllm.utils import numa_utils, random_uuid
+ from vllm.utils.gc_utils import (
+     freeze_gc_heap,
+     maybe_attach_gc_debug_callback,
+@@ -2476,7 +2476,13 @@ class EngineCoreProc(EngineCore):
+         logger.info("Restoring from a process checkpoint")
+         self._checkpoint_state = CheckpointState.RESTORING
+         try:
+-            self.collective_rpc("checkpoint_restore")
++            args: tuple[str, ...] = ()
++            if (kv_transfer_config := self.vllm_config.kv_transfer_config) is not None:
++                # Peers cache what they learn by KV engine id, so take a new one.
++                engine_id = f"{kv_transfer_config.engine_id}_{random_uuid()}"
++                kv_transfer_config.engine_id = engine_id
++                args = (engine_id,)
++            self.collective_rpc("checkpoint_restore", args=args)
+             if self.vllm_config.model_config.checkpoint_release_weights:
+                 self.wake_up(["weights"])
+                 self.collective_rpc("reload_weights")
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 4875b13fd..eda744818 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -65,6 +65,15 @@ class LLMEngine:
+         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+         multiprocess_mode: bool = False,
+     ) -> None:
++        if (
++            not multiprocess_mode
++            and vllm_config.model_config.checkpoint_prepare_on_startup
++        ):
++            # Only an engine core in its own process prepares at startup.
++            raise ValueError(
++                "checkpoint_prepare_on_startup requires "
++                "VLLM_ENABLE_V1_MULTIPROCESSING=1"
++            )
+         configure_logging_if_needed(vllm_config.logging_config)
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f076016fa..be58a3e38 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -446,7 +446,10 @@ class Worker(WorkerBase):
+             get_kv_transfer_group().checkpoint_prepare()
+         checkpoint_prepare_distributed_state()
+ 
+-    def checkpoint_restore(self) -> None:
++    def checkpoint_restore(self, kv_engine_id: str | None = None) -> None:
++        if kv_engine_id is not None:
++            assert self.vllm_config.kv_transfer_config is not None
++            self.vllm_config.kv_transfer_config.engine_id = kv_engine_id
+         checkpoint_restore_distributed_state()
+         if has_kv_transfer_group():
+             get_kv_transfer_group().checkpoint_restore()
+-- 
+2.54.0 (Apple Git-157)
+
