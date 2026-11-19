@@ -12,8 +12,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
-use http_body_util::Empty;
+use anyhow::{Context, Result, anyhow, ensure};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{AUTHORIZATION, CONNECTION, HOST, HeaderMap, HeaderValue, UPGRADE};
 use hyper::service::service_fn;
@@ -22,6 +22,7 @@ use hyper_util::rt::TokioIo;
 use openssl::ssl::{SslConnector, SslMethod, SslVersion};
 use openssl::x509::X509;
 use openssl::x509::store::X509StoreBuilder;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
@@ -30,6 +31,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::encrypt::TransferKey;
 use crate::store::RevisionKey;
+use crate::topology::Place;
 
 const PROTOCOL: &str = "snapshotd-transfer/1";
 const ROUTE: &str = "/v1/checkpoints/";
@@ -47,6 +49,23 @@ pub struct Tunnel {
 }
 
 pub type Work = Box<dyn FnOnce(Tunnel) -> Result<()> + Send>;
+
+/// What a daemon says about a revision without handing it over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    pub held: bool,
+    /// Transfers the daemon could start now.
+    pub free_lanes: usize,
+    pub place: Place,
+}
+
+/// The daemon that answers its peers.
+pub trait Holder: Send + Sync + 'static {
+    fn status(&self, revision: &RevisionKey) -> Status;
+    /// Decide whether to hand `revision` over, and what to do with the
+    /// connection if so.
+    fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal>;
+}
 
 pub struct Identity {
     pub token_file: PathBuf,
@@ -128,12 +147,9 @@ fn asks_to_upgrade(headers: &HeaderMap) -> bool {
     })
 }
 
-fn answer<A>(mut request: Request<Incoming>, admit: &A) -> Response<Empty<Bytes>>
-where
-    A: Fn(&RevisionKey) -> Result<Work, Refusal>,
-{
+fn answer(mut request: Request<Incoming>, holder: &impl Holder) -> Response<Full<Bytes>> {
     let status = |status| {
-        let mut response = Response::new(Empty::new());
+        let mut response = Response::new(Full::default());
         *response.status_mut() = status;
         response
     };
@@ -146,9 +162,12 @@ where
         return status(StatusCode::NOT_FOUND);
     };
     if !asks_to_upgrade(request.headers()) {
-        return status(StatusCode::UPGRADE_REQUIRED);
+        return match serde_json::to_vec(&holder.status(&revision)) {
+            Ok(body) => Response::new(Full::from(body)),
+            Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+        };
     }
-    let work = match admit(&revision) {
+    let work = match holder.admit(&revision) {
         Ok(work) => work,
         Err(Refusal::NoImage) => return status(StatusCode::NOT_FOUND),
         Err(Refusal::Busy) => return status(StatusCode::SERVICE_UNAVAILABLE),
@@ -180,11 +199,7 @@ where
     response
 }
 
-pub async fn serve<A>(listener: TcpListener, admit: A)
-where
-    A: Fn(&RevisionKey) -> Result<Work, Refusal> + Send + Sync + 'static,
-{
-    let admit = Arc::new(admit);
+pub async fn serve(listener: TcpListener, holder: Arc<impl Holder>) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) if stream.set_nodelay(true).is_ok() => stream,
@@ -195,11 +210,11 @@ where
                 continue;
             }
         };
-        let admit = Arc::clone(&admit);
+        let holder = Arc::clone(&holder);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let admit = Arc::clone(&admit);
-                async move { Ok::<_, Infallible>(answer(request, admit.as_ref())) }
+                let holder = Arc::clone(&holder);
+                async move { Ok::<_, Infallible>(answer(request, holder.as_ref())) }
             });
             let served = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -211,13 +226,10 @@ where
     }
 }
 
-pub async fn ask<T: Send + 'static>(
-    peer: SocketAddr,
-    identity: &Identity,
-    revision: &RevisionKey,
-    work: impl FnOnce(Tunnel) -> Result<T> + Send + 'static,
-) -> Result<Result<T, Refusal>> {
-    let token = identity.token()?;
+type Sender = hyper::client::conn::http1::SendRequest<Empty<Bytes>>;
+
+/// An HTTP connection to the proxy at `peer`, its certificate checked.
+async fn open(peer: SocketAddr, identity: &Identity) -> Result<Sender> {
     let ssl = identity
         .connector()?
         .configure()?
@@ -228,18 +240,67 @@ pub async fn ask<T: Send + 'static>(
         .context("connect")?;
     tcp.set_nodelay(true)?;
     let mut tls = SslStream::new(ssl, tcp)?;
+    Pin::new(&mut tls)
+        .connect()
+        .await
+        .context("the peer's certificate or TLS")?;
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .context("start HTTP")?;
+    tokio::spawn(connection.with_upgrades());
+    Ok(sender)
+}
+
+fn request(identity: &Identity, revision: &RevisionKey) -> Result<hyper::http::request::Builder> {
+    Ok(Request::get(format!("{ROUTE}{revision}"))
+        .header(HOST, &identity.server_name)
+        .header(AUTHORIZATION, format!("Bearer {}", identity.token()?)))
+}
+
+fn refused(status: StatusCode) -> anyhow::Error {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            anyhow!("the peer's proxy turned this daemon's token down ({status})")
+        }
+        status => anyhow!("the peer answered {status}"),
+    }
+}
+
+/// Ask the daemon behind the proxy at `peer` what it has of `revision`.
+pub async fn inquire(
+    peer: SocketAddr,
+    identity: &Identity,
+    revision: &RevisionKey,
+) -> Result<Status> {
     let exchange = async {
-        Pin::new(&mut tls)
-            .connect()
+        let mut sender = open(peer, identity).await?;
+        let request = request(identity, revision)?.body(Empty::<Bytes>::new())?;
+        let response = sender.send_request(request).await.context("ask")?;
+        if response.status() != StatusCode::OK {
+            return Err(refused(response.status()));
+        }
+        let body = response
+            .into_body()
+            .collect()
             .await
-            .context("the peer's certificate or TLS")?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-            .await
-            .context("start HTTP")?;
-        tokio::spawn(connection.with_upgrades());
-        let request = Request::get(format!("{ROUTE}{revision}"))
-            .header(HOST, &identity.server_name)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .context("read the peer's answer")?
+            .to_bytes();
+        serde_json::from_slice(&body).context("parse the peer's answer")
+    };
+    timeout(identity.answer_timeout, exchange)
+        .await
+        .context("the peer took too long to answer")?
+}
+
+pub async fn ask<T: Send + 'static>(
+    peer: SocketAddr,
+    identity: &Identity,
+    revision: &RevisionKey,
+    work: impl FnOnce(Tunnel) -> Result<T> + Send + 'static,
+) -> Result<Result<T, Refusal>> {
+    let exchange = async {
+        let mut sender = open(peer, identity).await?;
+        let request = request(identity, revision)?
             .header(CONNECTION, "upgrade")
             .header(UPGRADE, PROTOCOL)
             .body(Empty::<Bytes>::new())?;
@@ -248,10 +309,7 @@ pub async fn ask<T: Send + 'static>(
             StatusCode::SWITCHING_PROTOCOLS => {}
             StatusCode::NOT_FOUND => return Ok(Err(Refusal::NoImage)),
             StatusCode::SERVICE_UNAVAILABLE => return Ok(Err(Refusal::Busy)),
-            status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
-                bail!("the peer's proxy turned this daemon's token down ({status})")
-            }
-            status => bail!("the peer answered {status}"),
+            status => return Err(refused(status)),
         }
         let upgraded = hyper::upgrade::on(response)
             .await
@@ -322,7 +380,10 @@ mod tests {
     use tokio_openssl::SslStream;
 
     use crate::store::RevisionKey;
-    use crate::tunnel::{Identity, Refusal, Tunnel, Work, ask, ask_order, host, serve};
+    use crate::topology::Place;
+    use crate::tunnel::{
+        Holder, Identity, Refusal, Status, Tunnel, Work, ask, ask_order, host, inquire, serve,
+    };
 
     const NAME: &str = "snapshotd-peers.snapshotd.svc";
 
@@ -409,22 +470,49 @@ mod tests {
         admitted: Arc<AtomicUsize>,
     }
 
+    /// Holds `serving/qwen/held`, is busy with `serving/qwen/busy`, and does
+    /// `work` with whoever it admits.
+    struct Fixture {
+        work: fn(Tunnel) -> Result<()>,
+        admitted: Arc<AtomicUsize>,
+    }
+
+    fn place() -> Place {
+        let levels = ["rack".to_string()];
+        Place::of(&levels, &[("rack".to_string(), "237".to_string())].into())
+    }
+
+    impl Holder for Fixture {
+        fn status(&self, revision: &RevisionKey) -> Status {
+            let name = revision.to_string();
+            Status {
+                held: name != "serving/qwen/other",
+                free_lanes: usize::from(name == "serving/qwen/held"),
+                place: place(),
+            }
+        }
+
+        fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
+            match revision.to_string().as_str() {
+                "serving/qwen/held" => {
+                    self.admitted.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(self.work))
+                }
+                "serving/qwen/busy" => Err(Refusal::Busy),
+                _ => Err(Refusal::NoImage),
+            }
+        }
+    }
+
     async fn holder(work: fn(Tunnel) -> Result<()>) -> Daemon {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let admitted = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&admitted);
-        tokio::spawn(serve(
-            listener,
-            move |revision: &RevisionKey| match revision.to_string().as_str() {
-                "serving/qwen/held" => {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok(Box::new(work) as Work)
-                }
-                "serving/qwen/busy" => Err(Refusal::Busy),
-                _ => Err(Refusal::NoImage),
-            },
-        ));
+        let fixture = Fixture {
+            work,
+            admitted: Arc::clone(&admitted),
+        };
+        tokio::spawn(serve(listener, Arc::new(fixture)));
         Daemon { address, admitted }
     }
 
@@ -576,12 +664,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn only_an_upgrade_of_a_checkpoint_path_is_answered() {
+    async fn only_a_get_of_a_checkpoint_path_is_answered() {
         let daemon = holder(|_| Ok(())).await;
         for (request, wanted) in [
             (
                 "GET /v1/checkpoints/serving/qwen/held HTTP/1.1",
-                "HTTP/1.1 426",
+                "HTTP/1.1 200",
             ),
             (
                 "POST /v1/checkpoints/serving/qwen/held HTTP/1.1",
@@ -602,6 +690,31 @@ mod tests {
             let status = line(&mut stream);
             assert!(status.starts_with(wanted), "{request}: {status}");
         }
+        assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_says_what_it_holds_and_where_it_is_without_starting_work() {
+        let (ca, other) = (authority("peers"), authority("someone else"));
+        let daemon = holder(|_| panic!("work ran for a question")).await;
+        let front = tls_front(&ca, NAME, daemon.address).await;
+        let identity = files("inquire", &ca);
+        for (name, held, free_lanes) in [
+            ("serving/qwen/held", true, 1),
+            ("serving/qwen/busy", true, 0),
+            ("serving/qwen/other", false, 0),
+        ] {
+            let status = inquire(front, &identity, &revision(name)).await.unwrap();
+            let wanted = Status {
+                held,
+                free_lanes,
+                place: place(),
+            };
+            assert_eq!(status, wanted, "{name}");
+        }
+        let untrusted = tls_front(&other, NAME, daemon.address).await;
+        let held = revision("serving/qwen/held");
+        assert!(inquire(untrusted, &identity, &held).await.is_err());
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
     }
 

@@ -17,6 +17,10 @@ spec:
                   fieldPath: status.podIP
             - name: SNAPSHOTD_PEER_CA_FILE
               value: /etc/snapshotd/peers/ca.crt
+            - name: SNAPSHOTD_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: HOME
               value: /tmp
             - name: UCX_TLS

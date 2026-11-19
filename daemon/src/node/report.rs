@@ -48,7 +48,7 @@ pub fn plain(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::node::log::{plain, short_id};
+    use crate::node::report::{plain, short_id};
 
     #[test]
     fn colour_sequences_are_removed() {

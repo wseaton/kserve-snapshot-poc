@@ -10,10 +10,10 @@
 //! ```
 mod criu;
 mod layout;
-mod log;
 mod manifest;
 mod pod;
 mod process;
+mod report;
 mod shim;
 
 use std::collections::HashMap;
@@ -29,10 +29,10 @@ use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::cri::{Runtime, Sandbox};
-use crate::node::log::{seconds, short_id};
 use crate::node::manifest::Manifest;
 use crate::node::pod::Pod;
 use crate::node::process::{HostPid, PodPid};
+use crate::node::report::{seconds, short_id};
 use crate::node::shim::ShimClient;
 #[cfg(feature = "nixl")]
 use crate::peer::{self, Peers};
@@ -220,7 +220,7 @@ fn revision_of(sandbox: &Sandbox, label: &str, revision_label: &str) -> Result<R
 
 #[cfg(feature = "nixl")]
 async fn pull_from_peers(
-    peers: &Peers,
+    peers: &Arc<Peers>,
     revision: &RevisionKey,
     store: &RevisionStore,
 ) -> Result<()> {
@@ -230,7 +230,7 @@ async fn pull_from_peers(
         Some(peer) => info!(
             %peer,
             seconds = %seconds(asked),
-            gib = %log::gib(directory_bytes(&store.image_dir())),
+            gib = %report::gib(directory_bytes(&store.image_dir())),
             "pulled the checkpoint from a peer"
         ),
         None => info!(seconds = %seconds(asked), "no other node has it"),

@@ -1,20 +1,28 @@
 //! Checkpoints between the daemons of different nodes: answer a peer that
 //! asks for a revision this node holds, and ask peers for one it lacks.
+//!
+//! ```text
+//! pull:  resolve the peers ─► ask each what it holds, at once ─► nearest holder first
+//!        ─► take a lane ─► upgrade and receive ─► publish
+//! ```
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use k8s_openapi::api::core::v1::Node;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
 use crate::lanes::Lanes;
 use crate::store::{RevisionKey, RevisionStore, directory_bytes};
+use crate::topology::{Candidate, Place, nearest_first};
 use crate::transfer::{self, Endpoint, Pool};
-use crate::tunnel::{self, Identity, Refusal, Tunnel, Work};
+use crate::tunnel::{self, Holder, Identity, Refusal, Status, Tunnel, Work};
 
 const BUSY_RETRY: Duration = Duration::from_secs(2);
 
@@ -54,8 +62,36 @@ pub struct Args {
     /// The pool's slots are split between them.
     #[arg(long, env = "SNAPSHOTD_TRANSFER_LANES", default_value_t = 2)]
     transfer_lanes: usize,
+    /// Node labels that say where a node is, widest domain first, as in a
+    /// Kueue Topology. A checkpoint is pulled from the holder that shares
+    /// the most levels with this node. Needs --node-name.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_TOPOLOGY_LEVELS",
+        value_delimiter = ',',
+        requires = "node_name"
+    )]
+    topology_levels: Vec<String>,
+    /// The node this daemon runs on.
+    #[arg(long, env = "SNAPSHOTD_NODE_NAME")]
+    node_name: Option<String>,
     #[command(flatten)]
     pool: Pool,
+}
+
+/// This node's value for each of `levels`, read from its labels.
+async fn place_of(node: &str, levels: &[String]) -> Result<Place> {
+    let client = kube::Client::try_default()
+        .await
+        .context("reach the Kubernetes API")?;
+    let labels = kube::Api::<Node>::all(client)
+        .get(node)
+        .await
+        .with_context(|| format!("read node {node}"))?
+        .metadata
+        .labels
+        .unwrap_or_default();
+    Ok(Place::of(levels, &labels))
 }
 
 pub struct Peers {
@@ -63,6 +99,7 @@ pub struct Peers {
     own_ip: IpAddr,
     identity: Identity,
     busy_timeout: Duration,
+    place: Place,
     store: PathBuf,
     /// One lane for each transfer this daemon can take part in at once,
     /// sending or receiving, each with its share of the registered pool.
@@ -86,6 +123,12 @@ impl Peers {
             slot_mib: args.pool.slot_mib,
         };
         let agent = format!("snapshotd-{own_ip}-{}", std::process::id());
+        let place = match &args.node_name {
+            Some(node) if !args.topology_levels.is_empty() => {
+                place_of(node, &args.topology_levels).await?
+            }
+            _ => Place::default(),
+        };
         let peers = Arc::new(Self {
             name: name.clone(),
             own_ip,
@@ -97,6 +140,7 @@ impl Peers {
                 answer_timeout: Duration::from_secs(args.peer_answer_timeout_s),
             },
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
+            place,
             store: store.to_path_buf(),
             transfers: Lanes::start(lanes, move |lane| {
                 Endpoint::new(&format!("{agent}-{lane}"), pool, false)
@@ -106,12 +150,24 @@ impl Peers {
         let listener = TcpListener::bind(args.peer_listen)
             .await
             .with_context(|| format!("listen on {}", args.peer_listen))?;
-        info!(address = %args.peer_listen, name = %name, "answering peers");
-        let holder = Arc::clone(&peers);
-        tokio::spawn(tunnel::serve(listener, move |revision: &RevisionKey| {
-            holder.admit(revision)
-        }));
+        info!(
+            address = %args.peer_listen,
+            name = %name,
+            place = %peers.place,
+            "answering peers"
+        );
+        tokio::spawn(tunnel::serve(listener, Arc::clone(&peers)));
         Ok(Some(peers))
+    }
+}
+
+impl Holder for Peers {
+    fn status(&self, revision: &RevisionKey) -> Status {
+        Status {
+            held: revision.image_dir(&self.store).is_dir(),
+            free_lanes: self.turns.available_permits(),
+            place: self.place.clone(),
+        }
     }
 
     fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
@@ -145,7 +201,9 @@ impl Peers {
             Ok(())
         }))
     }
+}
 
+impl Peers {
     async fn addresses(&self) -> Vec<SocketAddr> {
         match tokio::net::lookup_host(&self.name).await {
             Ok(addresses) => tunnel::ask_order(
@@ -159,14 +217,47 @@ impl Peers {
         }
     }
 
+    /// The peers that hold `revision`, the nearest first.
+    async fn holders(self: &Arc<Self>, revision: &RevisionKey) -> Vec<Candidate> {
+        let addresses = self.addresses().await;
+        let mut asked = JoinSet::new();
+        for peer in addresses.iter().copied() {
+            let (peers, revision) = (Arc::clone(self), revision.clone());
+            asked.spawn(async move {
+                (
+                    peer,
+                    tunnel::inquire(peer, &peers.identity, &revision).await,
+                )
+            });
+        }
+        let mut holding = Vec::new();
+        while let Some(answer) = asked.join_next().await {
+            match answer {
+                Ok((address, Ok(status))) if status.held => holding.push(Candidate {
+                    address,
+                    place: status.place,
+                    free_lanes: status.free_lanes,
+                }),
+                Ok((peer, Ok(_))) => debug!(%peer, "the peer has no checkpoint of it"),
+                Ok((peer, Err(error))) => {
+                    debug!(%peer, error = %format_args!("{error:#}"), "the peer did not answer")
+                }
+                Err(error) => debug!(%error, "asking a peer was cut short"),
+            }
+        }
+        holding.sort_by_key(|candidate| addresses.iter().position(|a| *a == candidate.address));
+        nearest_first(&self.place, holding)
+    }
+
     /// Returns the peer the checkpoint came from, if any had it.
     pub async fn pull(
-        &self,
+        self: &Arc<Self>,
         revision: &RevisionKey,
         store: &RevisionStore,
     ) -> Result<Option<SocketAddr>> {
         let deadline = Instant::now() + self.busy_timeout;
         loop {
+            let holders = self.holders(revision).await;
             let mut busy = None;
             {
                 let _turn = self
@@ -174,7 +265,8 @@ impl Peers {
                     .acquire()
                     .await
                     .map_err(|_| anyhow!("the transfer turn is closed"))?;
-                for peer in self.addresses().await {
+                for holder in holders {
+                    let peer = holder.address;
                     store.clear_staging()?;
                     let staging = store.staging_dir().to_path_buf();
                     let transfers = self.transfers.clone();
@@ -189,6 +281,13 @@ impl Peers {
                             .map(drop)
                         })
                     };
+                    info!(
+                        %peer,
+                        place = %holder.place,
+                        shared_levels = self.place.shared_levels(&holder.place),
+                        of = self.place.levels(),
+                        "asking a peer that has it"
+                    );
                     match tunnel::ask(peer, &self.identity, revision, receive).await {
                         Ok(Ok(())) => {
                             store.publish()?;
@@ -196,7 +295,7 @@ impl Peers {
                         }
                         Ok(Err(Refusal::Busy)) => busy = Some(peer),
                         Ok(Err(Refusal::NoImage)) => {
-                            debug!(%peer, "the peer has no checkpoint of it")
+                            debug!(%peer, "the peer no longer has it")
                         }
                         Err(error) => {
                             warn!(%peer, error = %format_args!("{error:#}"), "pull failed")

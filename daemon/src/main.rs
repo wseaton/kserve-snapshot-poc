@@ -16,6 +16,8 @@ mod node;
 mod peer;
 mod podresources;
 mod store;
+#[cfg(any(test, feature = "nixl"))]
+mod topology;
 #[cfg(feature = "nixl")]
 mod trace;
 #[cfg(feature = "nixl")]

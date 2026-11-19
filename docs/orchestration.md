@@ -74,8 +74,9 @@ For every pod on its node that carries the label `snapshot.llm-d.ai/workload`:
 4. If a checkpoint or restore fails, the container exits, starts over, and cold boots with no
    second attempt.
 
-The daemon does not talk to the Kubernetes API. There is no custom resource, webhook, controller
-or scheduling gate.
+The daemon does not watch or write anything in the Kubernetes API. Its one read is its own node's
+labels, when it is told to choose peers by topology. There is no custom resource, webhook,
+controller or scheduling gate.
 
 ## Checkpoints between nodes
 
@@ -127,26 +128,39 @@ and overlapped completely, and both new pods were Ready 15 s after they were cre
 
 ### Choosing a peer
 
-Today a daemon's peers are every address behind the headless Service. It asks them one after the
-other, in an order that depends only on its own address, so that askers do not all start with the
-same peer, and takes the checkpoint from the first that has it and has a free lane. It knows
-nothing of distance, links or load. That is one function, `ask_order` in
-[daemon/src/tunnel.rs](../daemon/src/tunnel.rs), and the way to a topology-aware choice goes
-through it in steps that each stand on their own:
+A daemon's peers are every address behind the headless Service. Before it pulls, it asks all of
+them at once what they hold: a plain `GET` on the checkpoint's path answers whether the peer has
+it, how many lanes it has free, and where it is. It then tries the holders nearest first.
 
-1. **Know before asking.** A cheap request on the same authenticated endpoint that says whether a
-   peer has the revision, how many lanes it has free and where it is, sent to every peer at once.
-   Today finding out costs an upgraded connection per peer, one after the other.
-2. **Say where a daemon is.** Zone and region are already on every pod as
-   `topology.kubernetes.io/zone` and `region`, so the Downward API gives them to the daemon without
-   API access. Rack and RDMA fabric are not: they need a node label handed to the DaemonSet, or
-   the daemon reading its own devices' subnet.
-3. **Rank.** Prefer a peer on the same RDMA fabric, then the same rack, then the same zone, then
-   the least busy, and leave the zone only when nothing nearer has the checkpoint. This is also
-   where the transport gets chosen per pair of nodes; today `UCX_TLS` is one setting for all.
-4. **Learn.** Keep what each peer delivered, in bytes per second, and prefer what was fast. Stop
+Where a node is, is said the way Kueue's `Topology` says it: an ordered list of node labels,
+widest domain first. Two nodes are as near as the number of levels, from the widest, at which
+their labels agree.
+
+```text
+--topology-levels   ib.coreweave.cloud/superpod, ib.coreweave.cloud/leafgroup, kubernetes.io/hostname
+gf49e9c             0                            11                            gf49e9c
+gf41fb2             0                            11                            gf41fb2     2 levels shared with gf49e9c
+gf4334a             0                            391                           gf4334a     1 level shared
+```
+
+The list can be copied from a Kueue `Topology` object's `spec.levels`. The daemon reads its own
+node's labels once, when it starts, which is the one thing it asks the Kubernetes API and needs
+`get` on `nodes` for. Among holders equally near, one with a free lane is tried first; after that
+the order only spreads askers over the peers. Without `--topology-levels` that spreading is all
+there is.
+
+On three H200 nodes, with those levels and a checkpoint held on `gf41fb2` and on `gf4334a`, a pod
+on `gf49e9c` pulled it from `gf41fb2`. Asking both peers took 15 ms.
+
+What this does not do yet:
+
+1. **Choose the transport by distance.** `UCX_TLS` is one setting for every pair of nodes. Two
+   nodes on one InfiniBand fabric should use it, and the levels already say when they are.
+2. **Learn.** Keep what each peer delivered, in bytes per second, and prefer what was fast. Stop
    asking a peer that failed.
-5. **Let the control plane decide.** Something that knows where checkpoints are can name the
+3. **Weigh load against distance.** A far peer that is idle may beat a near one that is busy;
+   today nearness always wins and the puller waits.
+4. **Let the control plane decide.** Something that knows where checkpoints are can name the
    source for a pod, place checkpoints ahead of a scale-out, and schedule pods onto nodes that
    have them. The daemon's own ranking is then what happens when nothing was decided.
 
