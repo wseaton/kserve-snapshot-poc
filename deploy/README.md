@@ -1,20 +1,23 @@
 # Deploying
 
-Two ways to restore a vLLM replica from a checkpoint, both as kustomize:
+Three ways to restore a vLLM replica from a checkpoint, all as kustomize:
 
-| | [`dynamo-snapshot/`](dynamo-snapshot) | [`snapshotd/`](snapshotd) |
-| --- | --- | --- |
-| Node agent | Dynamo Snapshot's, at `bc9d216` | `snapshotd`, called from a script in a privileged pod |
-| Driven by | KServe: scaling an `LLMInferenceService` captures and restores | [`experiments/bench`](../experiments/bench) scripts; no KServe integration yet |
-| Checkpoint goes to | a shared `ReadWriteMany` volume | the node's disk, or over InfiniBand into the target node's RAM while CRIU dumps |
-| Weights after restore | ModelExpress from a serving replica, else the model volume | the same |
-| Largest configuration run | Qwen3-8B, TP=1 | DeepSeek-V4.1-Flash, TP=8 with expert parallel, across two nodes |
+| | [`dynamo-snapshot/`](dynamo-snapshot) | [`snapshotd/`](snapshotd) bench | [`snapshotd/node`](snapshotd/node) daemon |
+| --- | --- | --- | --- |
+| Node agent | Dynamo Snapshot's, at `bc9d216` | `snapshotd`, called from a script in a privileged pod | `snapshotd node`, a DaemonSet; the workload pod is unprivileged |
+| Driven by | KServe, with a companion webhook and controller | [`experiments/bench`](../experiments/bench) scripts | scaling a Deployment or an `LLMInferenceService`; nothing else is installed |
+| Checkpoint goes to | a shared `ReadWriteMany` volume | the node's disk, or over InfiniBand into the target node's RAM while CRIU dumps | the node's disk, pulled by other nodes' daemons when they need it |
+| Weights after restore | ModelExpress from a serving replica, else the model volume | the same | the model volume |
+| Largest configuration run | Qwen3-8B, TP=1 | DeepSeek-V4.1-Flash, TP=8 with expert parallel, across two nodes | Qwen3-8B, TP=1 across two nodes and TP=4 on one |
+
+The daemon path is described in [docs/orchestration.md](../docs/orchestration.md), with how to try
+it; the rest of this page is the other two.
 
 The manifests hold the configuration of the measured runs in
 [docs/benchmarks.md](../docs/benchmarks.md) and [docs/cross-node.md](../docs/cross-node.md). Those
 runs created the same objects with scripts: `kserve-dynamo-snapshot/hack/smoke-waldorf.sh`, against
 KServe in a vCluster with the agent on the host, and a hand-edited pod spec. This tree has been
-built, dry-run against that cluster's API servers, and its build Job has run. Neither path has
+built, dry-run against that cluster's API servers, and its build Job has run. Neither of those two paths has
 been applied end to end from it.
 
 ## Layout
@@ -32,6 +35,10 @@ deploy/
     qwen3-8b/namespace/      namespace, model volume and download, config layer, ModelExpress server
     qwen3-8b/service/        the LLMInferenceService
   snapshotd/
+    node/                    the snapshotd DaemonSet with peers, from daemon/deploy
+    workload/                an example Deployment for the daemon, from daemon/deploy
+    kserve/config-layer/     the LLMInferenceServiceConfig a service opts into for the daemon
+    kserve/qwen3-8b/         an example LLMInferenceService that does
     base/                    namespace and volumes
     pod/                     the bench pod; init containers copy snapshotd, the scripts, CRIU and cuInterpose into it
     components/

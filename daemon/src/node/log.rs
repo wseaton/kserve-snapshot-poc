@@ -4,8 +4,11 @@ use anyhow::Result;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+/// The part of a pod's name that tells it from its siblings. A pod synced
+/// from a vCluster is named `<name>-x-<namespace>-x-<vcluster>` on the host.
 pub fn short_id(pod: &str) -> &str {
-    pod.rsplit('-').next().unwrap_or(pod)
+    let name = pod.split("-x-").next().unwrap_or(pod);
+    name.rsplit('-').next().unwrap_or(name)
 }
 
 pub fn seconds(since: Instant) -> String {
@@ -45,7 +48,7 @@ pub fn plain(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::node::log::plain;
+    use crate::node::log::{plain, short_id};
 
     #[test]
     fn colour_sequences_are_removed() {
@@ -53,5 +56,15 @@ mod tests {
         assert_eq!(plain(line), "(RustFrontend pid=421) INFO ready");
         assert_eq!(plain("no colours"), "no colours");
         assert_eq!(plain("cut off \u{1b}[3"), "cut off ");
+    }
+
+    #[test]
+    fn a_pod_is_tagged_with_the_end_of_its_own_name() {
+        assert_eq!(short_id("snapshot-serve-85f787b8cb-cjv9n"), "cjv9n");
+        assert_eq!(
+            short_id("qwen3-8b-kserve-6f79c6cd9c-zw7mr-x-kds-smoke-x-kds"),
+            "zw7mr"
+        );
+        assert_eq!(short_id("pod"), "pod");
     }
 }

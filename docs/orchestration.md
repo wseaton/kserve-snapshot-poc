@@ -5,8 +5,8 @@ restore-on-scale-up work for a plain Deployment with nothing else installed. Tha
 it shows how little the engine needs from the control plane. It also means every decision a
 control plane normally makes is either missing or hard-coded. This page lists them.
 
-It has run with a hand-written Deployment, scaled by hand and by KEDA, on H200 nodes and on kind.
-It has not run under an `LLMInferenceService`.
+It has run with a hand-written Deployment, scaled by hand and by KEDA, with a KServe
+`LLMInferenceService` through a config layer, on H200 nodes, and on kind with a stand-in server.
 
 ## Where things run
 
@@ -42,14 +42,15 @@ flowchart LR
 
 The workload pod's template differs from a plain vLLM Deployment in four places: the opt-in label,
 an init container that copies `snapshotd-shim` and the `io_uring` launcher into an `emptyDir`, the
-container command wrapped in `snapshotd-shim --`, and a TCP readiness probe on the shim's port.
-The example is [daemon/deploy/workload](../daemon/deploy/workload).
+container command wrapped in `snapshotd-shim --`, and probes on the shim's port, which answers TCP
+and HTTP. The example is [daemon/deploy/workload](../daemon/deploy/workload).
 
 ## Trying it
 
 ```bash
 kubectl apply -k deploy/snapshotd/node       # the DaemonSet; needs cert-manager; set its store path first
 kubectl apply -k deploy/snapshotd/workload   # an example Deployment, Qwen3-8B
+kubectl apply -k deploy/snapshotd/kserve/qwen3-8b   # or the same model as an LLMInferenceService
 daemon/e2e/run.sh                            # the whole flow on kind, no GPU, a stand-in for vLLM
 ```
 
@@ -110,7 +111,11 @@ sequenceDiagram
   both sides encrypt and decrypt each chunk in its registered buffer. A chunk's file, offset and
   length are authenticated with it.
 
-Qwen3-8B at TP=1 on H200, one replica scaled to four by KEDA over two nodes: the new replica on
+A node pulls a revision once: pods of it that start together wait for the one pull and restore
+from what it left.
+
+Qwen3-8B at TP=1 on H200, one replica scaled to four by KEDA over two nodes, before the daemon
+pulled once per node: the new replica on
 the node that held the checkpoint was Ready 9 s after its pod was created, and the two on the other
 node after 20 s and 22 s. Each of those pulled the 4.5 GiB checkpoint in 5.8 s, one after the
 other, and restored in 5 to 8 s. A request loop against the Service got only 200s throughout.
@@ -118,6 +123,31 @@ other, and restored in 5 to 8 s. A request loop against the Service got only 200
 Who may pull is then a matter of RBAC: the `snapshotd-peers` ClusterRole, bound to the DaemonSet's
 ServiceAccount. Every daemon runs as that one account, so the proxy tells a daemon of this cluster
 from anything else, not one node's daemon from another's.
+
+## Through KServe
+
+[deploy/snapshotd/kserve/config-layer](../deploy/snapshotd/kserve/config-layer) is an
+`LLMInferenceServiceConfig` named `snapshotd`. A service opts in with `baseRefs: [{name: snapshotd}]`
+and nothing else; there is no webhook or controller. The layer:
+
+- labels the pods `snapshot.llm-d.ai/workload: <service name>`;
+- adds the init container that brings the shim, and wraps KServe's `vllm serve` command in it, with
+  the Rust frontend, the gRPC control port, sleep mode and released weights;
+- points KServe's startup, readiness and liveness probes at the shim's port, so the kubelet never
+  connects to the server and the pod is Ready when the daemon says so;
+- runs the server as a non-root user, with an `emptyDir` at `/run/snapshotd` for the shim's socket,
+  and keeps caches and `HOME` in `/dev/shm`, which travels with the checkpoint.
+
+Run in a vCluster with KServe, the daemon on the host cluster: Qwen3-8B at TP=1, first replica
+Ready 85 s after the service was created (60 s cold boot, 7.8 s checkpoint, 4.3 s restore). Scaled
+to four through `spec.replicas`: 8 s on the node holding the checkpoint, and 30 s for each of two
+on another node, which shared one 6.7 s pull of 4.3 GiB and then restored at the same time in 12 s.
+A completion through the KServe gateway and the endpoint picker came back from the restored pods.
+
+Not covered by that run: TLS between the gateway and vLLM, multi-node services (`LeaderWorkerSet`
+pods carry no `pod-template-hash`; `--revision-label` names another label), prefill and decode
+pairs, and what the endpoint picker does with connections it holds to a pod that is being
+checkpointed.
 
 ## A limit on tensor parallel below a whole node
 
@@ -156,7 +186,7 @@ been run with.
 
 | Concern | Today | What a real solution has to decide or build |
 | --- | --- | --- |
-| Shaping the pod | The Deployment is written by hand: the opt-in label, an init container that brings the shim, the wrapped command, vLLM's flags and environment, a TCP readiness probe on the shim's port | Something has to apply this to pods it does not own: a KServe config layer or an admission webhook. It also has to keep the shim, the daemon and the CRIU and cuInterpose tools at matching versions, because a checkpoint taken with one set is restored with whatever the node runs then |
+| Shaping the pod | A KServe config layer for `LLMInferenceService`, or a Deployment written by hand: the opt-in label, an init container that brings the shim, the wrapped command, vLLM's flags and environment, probes on the shim's port | The same for workloads that are neither, which means an admission webhook. Something also has to keep the shim, the daemon and the CRIU and cuInterpose tools at matching versions, because a checkpoint taken with one set is restored with whatever the node runs then |
 | Who may opt in | Anyone who can set a pod label | The label makes a privileged daemon enter the pod and run CRIU there, and a restore puts a saved process image into the pod. Opting in has to be an authorized act: admission policy on the label, or a decision made by the controller instead of by a label |
 | Eligibility | None; every labelled pod is tried | Refuse what cannot be checkpointed or would be wrong to restore: multi-node workers, prefill/decode pairs, engines without the checkpoint lifecycle, runtime-loaded LoRA adapters, routing that depends on per-replica cache state. Today such a pod fails its checkpoint and cold boots, after paying for the attempt |
 | Revision identity | Namespace, the label's value and `pod-template-hash` | The hash covers the pod template only. It does not cover model files that change under the same path, an image referenced by tag, or a Deployment deleted and created again with the same template. A real key adds those, and a way to invalidate |
@@ -164,7 +194,7 @@ been run with.
 | Scheduling | The scheduler knows nothing. A pod restores if it happens to land on a node with the checkpoint, or one that can pull it, and for TP above 1 on part of a node, on the same device minors | Prefer nodes that hold the checkpoint, and never choose incompatible ones. Without this the benefit depends on luck or on every node pulling |
 | When and where to capture | The first pod of a revision on each node is checkpointed in place before it is ready, always | Whether to capture at all for a workload that never scales, where (in place, or a donor pod so the first replica is not delayed), and how many captures may run at once on a node |
 | One capture per revision | Each node decides alone. Several pods of a new revision starting at once on one node all cold boot and capture, and the first to finish publishes | A claim per revision, cluster-wide, so one pod captures and the rest wait or cold boot by policy |
-| Readiness and traffic | The shim opens a TCP port once the server serves; the pod's readiness probe points at it | Readiness owned by the platform: a readiness gate the engine sets, and KServe's own probes moved off the server's port. A stock HTTP readiness probe on the server passes during cold boot, before the checkpoint stops it |
+| Readiness and traffic | The shim opens a port once the server serves, and every probe of the pod points at it | Readiness owned by the platform: a readiness gate the engine sets. A probe left on the server's own port passes during cold boot, before the checkpoint stops the server |
 | Connections during the dump | The daemon closes its own, and CRIU dumps without locking the network, so a connection someone else holds is carried into the image and is dead after the restore | Keep everything else off the server until the pod is ready (kubelet probes, an endpoint picker scraping metrics, a mesh sidecar), or accept that such a client sees a reset |
 | Rollouts | A new template is a new revision and is captured again on every node it lands on | Surge capacity while old and new revisions overlap, what a rollback reuses, and whether a rollout of a one-replica service should capture at all, since it only makes that replica slower |
 | Checkpoint storage | One directory per revision on the node's disk. Nothing is ever deleted, and the space is not charged to any pod | Retention and eviction per node, deletion when the workload goes away (the daemon cannot see that without the API), quotas per tenant, and accounting. With weights kept in the checkpoint an image is the size of the model per revision per node |
