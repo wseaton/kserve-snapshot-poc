@@ -29,6 +29,10 @@ enum Command {
     Serve {
         #[arg(long, default_value = "0.0.0.0:50051")]
         listen: SocketAddr,
+        /// Start prepared for a checkpoint, as vLLM does with
+        /// --checkpoint-prepare-on-startup, and serve only after a restore.
+        #[arg(long)]
+        prepared: bool,
     },
     /// Print a server's instance ID and checkpoint state.
     Info { address: SocketAddr },
@@ -125,7 +129,7 @@ control_service! {
     get_weight_version(GetWeightVersionRequest) -> GetWeightVersionResponse;
 }
 
-async fn serve(listen: SocketAddr) -> Result<()> {
+async fn serve(listen: SocketAddr, prepared: bool) -> Result<()> {
     let mut id = [0; 8];
     openssl::rand::rand_bytes(&mut id).context("draw an instance ID")?;
     let instance = hex::encode(id);
@@ -133,7 +137,11 @@ async fn serve(listen: SocketAddr) -> Result<()> {
     tonic::transport::Server::builder()
         .add_service(ControlServer::new(StandIn {
             instance,
-            state: Mutex::new(pb::CheckpointState::Running),
+            state: Mutex::new(if prepared {
+                pb::CheckpointState::Prepared
+            } else {
+                pb::CheckpointState::Running
+            }),
         }))
         .serve(listen)
         .await
@@ -164,7 +172,7 @@ fn main() -> Result<()> {
         .build()
         .context("start the runtime")?;
     match Cli::parse().command {
-        Command::Serve { listen } => runtime.block_on(serve(listen)),
+        Command::Serve { listen, prepared } => runtime.block_on(serve(listen, prepared)),
         Command::Info { address } => runtime.block_on(info(address)),
     }
 }

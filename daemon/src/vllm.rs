@@ -56,7 +56,12 @@ impl Control {
         })
     }
 
-    pub async fn connect_when_running(address: SocketAddr, limit: Duration) -> Result<Self> {
+    /// Wait for a starting server to answer: serving, or prepared for a
+    /// checkpoint if it prepares itself at startup.
+    pub async fn connect_when_up(
+        address: SocketAddr,
+        limit: Duration,
+    ) -> Result<(Self, Lifecycle)> {
         let deadline = Instant::now() + limit;
         loop {
             let attempt = async {
@@ -64,7 +69,9 @@ impl Control {
                 control.state().await.map(|state| (control, state))
             };
             match attempt.await {
-                Ok((control, Lifecycle::Running)) => return Ok(control),
+                Ok((control, state @ (Lifecycle::Running | Lifecycle::Prepared))) => {
+                    return Ok((control, state));
+                }
                 Ok(_) | Err(_) if Instant::now() < deadline => sleep(POLL * 5).await,
                 Ok((_, state)) => bail!("vLLM at {address} is still {state:?}"),
                 Err(error) => return Err(error.context("vLLM did not start serving")),

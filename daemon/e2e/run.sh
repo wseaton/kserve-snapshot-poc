@@ -63,4 +63,20 @@ for address in $(addresses); do
   got=$(info "$address")
   [ "$got" = "$second" ] || fail "replica $address of the new revision is not a restore: $got"
 done
+
+# A server that prepares itself at startup never serves before its checkpoint: it is captured as
+# it comes up, and every replica serves only after a restore.
+settle 1
+k patch deploy/stand-in --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/command/-","value":"--prepared"}]'
+settle 1
+third=$(info "$(addresses)")
+echo "prepared at startup: $third"
+[[ $third == *" Running" ]] || fail "a server that started prepared was not put into service: $third"
+[ "$third" != "$second" ] || fail "the prepared revision came up as the old process"
+settle 2
+for address in $(addresses); do
+  got=$(info "$address")
+  [ "$got" = "$third" ] || fail "replica $address of the prepared revision is not a restore: $got"
+done
 echo PASS

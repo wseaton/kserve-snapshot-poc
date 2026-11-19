@@ -40,7 +40,7 @@ use crate::podresources;
 #[cfg(feature = "nixl")]
 use crate::store::directory_bytes;
 use crate::store::{RevisionKey, RevisionStore};
-use crate::vllm::Control;
+use crate::vllm::{Control, Lifecycle};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -231,12 +231,12 @@ async fn cold_boot(
     pod: &Pod,
     shim: &mut ShimClient,
     within: Duration,
-) -> Result<(PodPid, Control)> {
+) -> Result<(PodPid, Control, Lifecycle)> {
     let asked = Instant::now();
     let server = shim.start().await?;
-    let control = Control::connect_when_running(pod.control(), within).await?;
-    info!(seconds = %seconds(asked), "the server is running");
-    Ok((server, control))
+    let (control, state) = Control::connect_when_up(pod.control(), within).await?;
+    info!(seconds = %seconds(asked), ?state, "the server is up");
+    Ok((server, control, state))
 }
 
 async fn adopt_or_give_up(
@@ -300,12 +300,15 @@ async fn bring_up(
         }
         Plan::ColdBoot(because) => {
             warn!(because, "cold booting, with no checkpoint taken");
-            cold_boot(pod, shim, boot).await?;
+            let (_, control, state) = cold_boot(pod, shim, boot).await?;
+            if state == Lifecycle::Prepared {
+                pod.resume(control).await?;
+            }
             Ok(Served::ColdBooted)
         }
         Plan::Capture => {
             info!("cold booting; this pod gives the revision its checkpoint");
-            let (server, control) = cold_boot(pod, shim, boot).await?;
+            let (server, control, _) = cold_boot(pod, shim, boot).await?;
             store.clear_staging()?;
             let staging = store.staging_dir();
             let cycled = async {
@@ -349,8 +352,11 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     let pod = Pod::new(init, control, &args.pod, &allotted)?;
     let served = if progress.started {
         info!("the server was started before this daemon; waiting for it to run");
-        Control::connect_when_running(pod.control(), Duration::from_secs(args.boot_timeout_s))
-            .await?;
+        let boot = Duration::from_secs(args.boot_timeout_s);
+        let (control, state) = Control::connect_when_up(pod.control(), boot).await?;
+        if state == Lifecycle::Prepared {
+            pod.resume(control).await?;
+        }
         Served::StartedEarlier
     } else {
         bring_up(node, sandbox, &pod, &mut shim).await?

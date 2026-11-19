@@ -237,6 +237,15 @@ impl Pod {
         Ok(())
     }
 
+    /// Put a server that prepared itself at startup into service.
+    pub async fn resume(&self, mut control: Control) -> Result<()> {
+        step(
+            "vLLM restore",
+            control.restore(self.options.lifecycle_timeout()),
+        )
+        .await
+    }
+
     pub async fn restore(&self, image: &Path) -> Result<PodPid> {
         let started = Instant::now();
         let manifest = Manifest::load(image)?;
