@@ -11,6 +11,9 @@ The node agent for restore on scale-up, as a Cargo workspace of two crates:
 - `snapshotd-shim` ([`shim/`](shim)). PID 1 of the workload container. It is built static, against
   musl, so it runs in whatever image the workload uses.
 
+Every option of `snapshotd node` can also be set through the environment, as `SNAPSHOTD_` and the
+option's name: `--boot-timeout-s` is `SNAPSHOTD_BOOT_TIMEOUT_S`. `snapshotd node --help` lists them.
+
 Linux only. `snapshotd` loads `libcuda.so.1` at run time, so it builds without a GPU or the CUDA
 toolkit and uses whichever driver library is first on the library path where it runs. Moving
 checkpoints between nodes needs the `nixl` feature and NIXL installed.

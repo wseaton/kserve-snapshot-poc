@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
 
-const REAP_WAIT: Duration = Duration::from_secs(30);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostPid(pub i32);
 
@@ -58,12 +56,12 @@ impl HostPid {
         bail!("process {self} has no child that is {pid} in its PID namespace")
     }
 
-    pub async fn reaped(self) -> Result<()> {
-        let deadline = Instant::now() + REAP_WAIT;
+    pub async fn reaped(self, within: Duration) -> Result<()> {
+        let deadline = Instant::now() + within;
         while Path::new(&format!("/proc/{self}")).exists() {
             ensure!(
                 Instant::now() < deadline,
-                "process {self} is still there {REAP_WAIT:?} after its dump"
+                "process {self} is still there {within:?} after its dump"
             );
             sleep(Duration::from_millis(20)).await;
         }
@@ -142,7 +140,9 @@ mod tests {
             child.wait().unwrap();
         });
         let started = std::time::Instant::now();
-        pid.reaped().await.unwrap();
+        pid.reaped(std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
         reaper.join().unwrap();
     }

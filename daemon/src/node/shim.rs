@@ -8,8 +8,6 @@ use tokio::time::{Instant, sleep};
 use crate::node::process::{HostPid, PodPid};
 use snapshotd_shim::{Reply, Request, SOCKET};
 
-const CONNECT_WAIT: Duration = Duration::from_secs(60);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub started: bool,
@@ -21,9 +19,9 @@ pub struct ShimClient {
 }
 
 impl ShimClient {
-    pub async fn connect(init: HostPid) -> Result<Self> {
+    pub async fn connect(init: HostPid, within: Duration) -> Result<Self> {
         let socket = init.root(SOCKET);
-        let deadline = Instant::now() + CONNECT_WAIT;
+        let deadline = Instant::now() + within;
         loop {
             match UnixStream::connect(&socket).await {
                 Ok(stream) => {

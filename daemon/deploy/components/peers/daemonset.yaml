@@ -8,17 +8,15 @@ spec:
       serviceAccountName: snapshotd
       containers:
         - name: snapshotd
-          args:
-            - --store-dir=/store
-            - --tools-dir=/tools
-            - --peers=snapshotd-peers:8443
-            - --own-ip=$(POD_IP)
-            - --peer-ca-file=/etc/snapshotd/peers/ca.crt
           env:
-            - name: POD_IP
+            - name: SNAPSHOTD_PEERS
+              value: snapshotd-peers:8443
+            - name: SNAPSHOTD_OWN_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: SNAPSHOTD_PEER_CA_FILE
+              value: /etc/snapshotd/peers/ca.crt
             - name: HOME
               value: /tmp
             - name: UCX_TLS

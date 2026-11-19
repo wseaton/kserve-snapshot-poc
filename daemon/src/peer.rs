@@ -16,26 +16,39 @@ use crate::transfer::{self, Pool};
 use crate::tunnel::{self, Identity, Refusal, Tunnel, Work};
 
 const BUSY_RETRY: Duration = Duration::from_secs(2);
-const BUSY_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Name and port that resolve to the kube-rbac-proxy of every node's
     /// daemon. Without it, checkpoints stay on the node that took them.
-    #[arg(long, requires_all = ["own_ip", "peer_ca_file"])]
+    #[arg(long, env = "SNAPSHOTD_PEERS", requires_all = ["own_ip", "peer_ca_file"])]
     peers: Option<String>,
     /// Where this daemon answers its own kube-rbac-proxy.
-    #[arg(long, default_value = "127.0.0.1:7700")]
+    #[arg(long, env = "SNAPSHOTD_PEER_LISTEN", default_value = "127.0.0.1:7700")]
     peer_listen: SocketAddr,
     /// This daemon's address, left out of the peers.
-    #[arg(long)]
+    #[arg(long, env = "SNAPSHOTD_OWN_IP")]
     own_ip: Option<IpAddr>,
     /// The ServiceAccount token this daemon shows its peers.
-    #[arg(long, default_value = "/var/run/secrets/snapshotd/peers/token")]
+    #[arg(
+        long,
+        env = "SNAPSHOTD_PEER_TOKEN_FILE",
+        default_value = "/var/run/secrets/snapshotd/peers/token"
+    )]
     peer_token_file: PathBuf,
     /// The authority that signs the certificate of the peers' proxies.
-    #[arg(long)]
+    #[arg(long, env = "SNAPSHOTD_PEER_CA_FILE")]
     peer_ca_file: Option<PathBuf>,
+    /// Seconds a peer may take to accept a connection.
+    #[arg(long, env = "SNAPSHOTD_PEER_CONNECT_TIMEOUT_S", default_value_t = 3)]
+    peer_connect_timeout_s: u64,
+    /// Seconds a peer may take to answer a request.
+    #[arg(long, env = "SNAPSHOTD_PEER_ANSWER_TIMEOUT_S", default_value_t = 10)]
+    peer_answer_timeout_s: u64,
+    /// Seconds to keep asking while the peers that hold a checkpoint are
+    /// busy sending it.
+    #[arg(long, env = "SNAPSHOTD_PEER_BUSY_TIMEOUT_S", default_value_t = 300)]
+    peer_busy_timeout_s: u64,
     #[command(flatten)]
     pool: Pool,
 }
@@ -44,6 +57,7 @@ pub struct Peers {
     name: String,
     own_ip: IpAddr,
     identity: Identity,
+    busy_timeout: Duration,
     store: PathBuf,
     pool: Pool,
     sending: Arc<Semaphore>,
@@ -63,7 +77,10 @@ impl Peers {
                 token_file: args.peer_token_file.clone(),
                 ca_file: ca_file.clone(),
                 server_name: tunnel::host(name)?.to_string(),
+                connect_timeout: Duration::from_secs(args.peer_connect_timeout_s),
+                answer_timeout: Duration::from_secs(args.peer_answer_timeout_s),
             },
+            busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             store: store.to_path_buf(),
             pool: args.pool,
             sending: Arc::new(Semaphore::new(1)),
@@ -129,7 +146,7 @@ impl Peers {
         revision: &RevisionKey,
         store: &RevisionStore,
     ) -> Result<Option<SocketAddr>> {
-        let deadline = Instant::now() + BUSY_WAIT;
+        let deadline = Instant::now() + self.busy_timeout;
         loop {
             let mut busy = false;
             for peer in self.addresses().await {

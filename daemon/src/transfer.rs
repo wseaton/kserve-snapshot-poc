@@ -49,10 +49,10 @@ const HUGE_PAGE: u64 = 2 << 20;
 #[derive(Clone, Copy, Debug, clap::Args, Serialize, Deserialize)]
 pub struct Pool {
     /// Chunks in flight at once.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, env = "SNAPSHOTD_SLOTS", default_value_t = 16)]
     pub slots: usize,
     /// Size of one chunk.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "SNAPSHOTD_SLOT_MIB", default_value_t = 256)]
     pub slot_mib: usize,
 }
 

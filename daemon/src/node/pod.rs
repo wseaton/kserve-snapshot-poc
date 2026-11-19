@@ -20,15 +20,42 @@ use crate::store::directory_bytes;
 use crate::vllm::Control;
 use snapshotd_shim::SERVER_LOG;
 
-const FAR_PID: &str = "4000000";
-const LIFECYCLE: Duration = Duration::from_secs(900);
-const CUDA_LOCK: Duration = Duration::from_secs(60);
-const SERVER_TAIL: usize = 12;
+#[derive(Clone, clap::Args)]
+pub struct Options {
+    /// Directory holding criu, its lib/ and its criu-plugins/.
+    #[arg(long, env = "SNAPSHOTD_TOOLS_DIR")]
+    pub tools_dir: PathBuf,
+    /// Seconds vLLM may take to prepare for a checkpoint, or to come back
+    /// from one.
+    #[arg(long, env = "SNAPSHOTD_LIFECYCLE_TIMEOUT_S", default_value_t = 900)]
+    lifecycle_timeout_s: u64,
+    /// Seconds a process may take to reach a point where the driver can
+    /// checkpoint it.
+    #[arg(long, env = "SNAPSHOTD_CUDA_LOCK_TIMEOUT_S", default_value_t = 60)]
+    cuda_lock_timeout_s: u64,
+    /// Seconds a dumped server may take to be reaped.
+    #[arg(long, env = "SNAPSHOTD_REAP_TIMEOUT_S", default_value_t = 30)]
+    reap_timeout_s: u64,
+    /// Where a pod's PID counter is moved before a restore; above every PID
+    /// a checkpoint holds.
+    #[arg(long, env = "SNAPSHOTD_RESTORE_FIRST_PID", default_value_t = 4_000_000)]
+    restore_first_pid: u32,
+    /// Lines of the server's log repeated in the daemon's when a checkpoint
+    /// or restore fails.
+    #[arg(long, env = "SNAPSHOTD_SERVER_LOG_LINES", default_value_t = 12)]
+    server_log_lines: usize,
+}
+
+impl Options {
+    fn lifecycle_timeout(&self) -> Duration {
+        Duration::from_secs(self.lifecycle_timeout_s)
+    }
+}
 
 pub struct Pod {
     init: HostPid,
     control: SocketAddr,
-    tools: PathBuf,
+    options: Options,
     /// The pod's GPUs, in the driver's order.
     gpus: Vec<Gpu>,
     /// Every GPU the container can open.
@@ -39,7 +66,7 @@ impl Pod {
     pub fn new(
         init: HostPid,
         control: SocketAddr,
-        tools: &Path,
+        options: &Options,
         allotted: &[GpuUuid],
     ) -> Result<Self> {
         let (gpus, visible) = if allotted.is_empty() {
@@ -56,7 +83,7 @@ impl Pod {
         Ok(Self {
             init,
             control,
-            tools: tools.to_path_buf(),
+            options: options.clone(),
             gpus,
             visible,
         })
@@ -97,20 +124,20 @@ impl Pod {
     }
 
     pub async fn mount_tools(&self) -> Result<()> {
-        self.mount(&self.tools, TOOLS).await
+        self.mount(&self.options.tools_dir, TOOLS).await
     }
 
     pub fn log_server_tail(&self) {
         let log = fs::read_to_string(self.init.root(SERVER_LOG)).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
-        for line in &lines[lines.len().saturating_sub(SERVER_TAIL)..] {
+        for line in &lines[lines.len().saturating_sub(self.options.server_log_lines)..] {
             warn!("server: {}", plain(line));
         }
     }
 
     fn cuinterpose(&self) -> cuinterpose::Config {
         cuinterpose::Config {
-            bundle_dir: self.tools.join(CUINTERPOSE),
+            bundle_dir: self.options.tools_dir.join(CUINTERPOSE),
             socket_dir: self.init.root("/tmp"),
             loaded_from: Some(PathBuf::from(format!("{TOOLS}/{CUINTERPOSE}"))),
         }
@@ -140,7 +167,11 @@ impl Pod {
         let started = Instant::now();
         fs::create_dir_all(image.join("img"))
             .with_context(|| format!("create {}", image.display()))?;
-        step("vLLM prepare", control.prepare(LIFECYCLE)).await?;
+        step(
+            "vLLM prepare",
+            control.prepare(self.options.lifecycle_timeout()),
+        )
+        .await?;
         drop(control);
         let server = self.init.child(root)?;
         let processes = self.cuda_processes(server).await?;
@@ -162,9 +193,10 @@ impl Pod {
                 }),
             )
             .await?;
+            let lock = Duration::from_secs(self.options.cuda_lock_timeout_s);
             step(
                 "CUDA checkpoint",
-                blocking(move || cuda::checkpoint_job(&Driver::load()?, &processes, CUDA_LOCK)),
+                blocking(move || cuda::checkpoint_job(&Driver::load()?, &processes, lock)),
             )
             .await?;
         }
@@ -179,7 +211,9 @@ impl Pod {
                 &image.join("img/dump.log"),
             )
             .await?;
-            server.reaped().await
+            server
+                .reaped(Duration::from_secs(self.options.reap_timeout_s))
+                .await
         })
         .await?;
         step("copy shared memory out", async {
@@ -234,7 +268,10 @@ impl Pod {
         process::run(
             Command::new("nsenter")
                 .args(["-t", &self.init.to_string(), "-p", "--", "sh", "-c"])
-                .arg(format!("echo {FAR_PID} > /proc/sys/kernel/ns_last_pid")),
+                .arg(format!(
+                    "echo {} > /proc/sys/kernel/ns_last_pid",
+                    self.options.restore_first_pid
+                )),
             "move the pod's PID counter",
         )
         .await?;
@@ -284,7 +321,7 @@ impl Pod {
         step("vLLM restore", async {
             Control::connect(self.control)
                 .await?
-                .restore(LIFECYCLE)
+                .restore(self.options.lifecycle_timeout())
                 .await
         })
         .await?;

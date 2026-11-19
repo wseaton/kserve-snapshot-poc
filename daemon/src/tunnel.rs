@@ -33,8 +33,6 @@ use crate::store::RevisionKey;
 
 const PROTOCOL: &str = "snapshotd-transfer/1";
 const ROUTE: &str = "/v1/checkpoints/";
-const CONNECT: Duration = Duration::from_secs(3);
-const ANSWER: Duration = Duration::from_secs(10);
 const LAST_WORDS: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +52,8 @@ pub struct Identity {
     pub token_file: PathBuf,
     pub ca_file: PathBuf,
     pub server_name: String,
+    pub connect_timeout: Duration,
+    pub answer_timeout: Duration,
 }
 
 impl Identity {
@@ -222,7 +222,7 @@ pub async fn ask<T: Send + 'static>(
         .connector()?
         .configure()?
         .into_ssl(&identity.server_name)?;
-    let tcp = timeout(CONNECT, TcpStream::connect(peer))
+    let tcp = timeout(identity.connect_timeout, TcpStream::connect(peer))
         .await
         .context("connecting took too long")?
         .context("connect")?;
@@ -264,7 +264,7 @@ pub async fn ask<T: Send + 'static>(
             .context("read the transfer key")?;
         Ok(Ok((upgraded, TransferKey::from_bytes(key))))
     };
-    let admitted = timeout(ANSWER, exchange)
+    let admitted = timeout(identity.answer_timeout, exchange)
         .await
         .context("the peer took too long to answer")??;
     match admitted {
@@ -423,6 +423,8 @@ mod tests {
             token_file,
             ca_file,
             server_name: NAME.to_string(),
+            connect_timeout: Duration::from_secs(3),
+            answer_timeout: Duration::from_secs(10),
         }
     }
 

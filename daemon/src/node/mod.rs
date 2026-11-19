@@ -42,40 +42,65 @@ use crate::store::directory_bytes;
 use crate::store::{RevisionKey, RevisionStore};
 use crate::vllm::Control;
 
-const REVISION_LABEL: &str = "pod-template-hash";
-const CONTAINER_WAIT: Duration = Duration::from_secs(600);
-const BOOT: Duration = Duration::from_secs(3600);
-const RETRY: Duration = Duration::from_secs(10);
-
 #[derive(clap::Args)]
 pub struct Args {
     /// The container runtime's CRI socket.
-    #[arg(long, default_value = "/run/containerd/containerd.sock")]
+    #[arg(
+        long,
+        env = "SNAPSHOTD_RUNTIME_SOCKET",
+        default_value = "/run/containerd/containerd.sock"
+    )]
     runtime_socket: PathBuf,
     /// The kubelet's PodResources socket.
-    #[arg(long, default_value = "/var/lib/kubelet/pod-resources/kubelet.sock")]
+    #[arg(
+        long,
+        env = "SNAPSHOTD_POD_RESOURCES_SOCKET",
+        default_value = "/var/lib/kubelet/pod-resources/kubelet.sock"
+    )]
     pod_resources_socket: PathBuf,
     /// Directory on the node's data disk where checkpoints are kept.
-    #[arg(long)]
+    #[arg(long, env = "SNAPSHOTD_STORE_DIR")]
     store_dir: PathBuf,
-    /// Directory holding criu, its lib/ and its criu-plugins/.
-    #[arg(long)]
-    tools_dir: PathBuf,
     /// Pod label that opts a pod in; its value names the workload.
-    #[arg(long, default_value = "snapshot.llm-d.ai/workload")]
+    #[arg(
+        long,
+        env = "SNAPSHOTD_LABEL",
+        default_value = "snapshot.llm-d.ai/workload"
+    )]
     label: String,
     /// Name of the container that runs the server.
-    #[arg(long, default_value = "main")]
+    #[arg(long, env = "SNAPSHOTD_CONTAINER", default_value = "main")]
     container: String,
     /// vLLM's gRPC control port.
-    #[arg(long, default_value_t = 50051)]
+    #[arg(long, env = "SNAPSHOTD_CONTROL_PORT", default_value_t = 50051)]
     control_port: u16,
     /// Free space the store must have before a checkpoint is taken.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "SNAPSHOTD_MIN_FREE_GIB", default_value_t = 256)]
     min_free_gib: u64,
+    /// Pod label that names a pod's revision.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_REVISION_LABEL",
+        default_value = "pod-template-hash"
+    )]
+    revision_label: String,
     /// Seconds between looks at the runtime's pods.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, env = "SNAPSHOTD_POLL_S", default_value_t = 2)]
     poll_s: u64,
+    /// Seconds a pod's server container may take to start.
+    #[arg(long, env = "SNAPSHOTD_CONTAINER_TIMEOUT_S", default_value_t = 600)]
+    container_timeout_s: u64,
+    /// Seconds a pod's shim may take to listen.
+    #[arg(long, env = "SNAPSHOTD_SHIM_TIMEOUT_S", default_value_t = 60)]
+    shim_timeout_s: u64,
+    /// Seconds a server may take to cold boot.
+    #[arg(long, env = "SNAPSHOTD_BOOT_TIMEOUT_S", default_value_t = 3600)]
+    boot_timeout_s: u64,
+    /// Seconds before a pod that could not be handled is tried again.
+    #[arg(long, env = "SNAPSHOTD_RETRY_S", default_value_t = 10)]
+    retry_s: u64,
+    #[command(flatten)]
+    pod: pod::Options,
     #[cfg(feature = "nixl")]
     #[command(flatten)]
     peers: peer::Args,
@@ -154,8 +179,13 @@ impl fmt::Display for Served {
     }
 }
 
-async fn container_init(runtime: &mut Runtime, sandbox: &Sandbox, name: &str) -> Result<HostPid> {
-    let deadline = Instant::now() + CONTAINER_WAIT;
+async fn container_init(
+    runtime: &mut Runtime,
+    sandbox: &Sandbox,
+    name: &str,
+    within: Duration,
+) -> Result<HostPid> {
+    let deadline = Instant::now() + within;
     loop {
         if let Some(pid) = runtime.pid(sandbox, name).await? {
             return Ok(HostPid(pid));
@@ -165,15 +195,15 @@ async fn container_init(runtime: &mut Runtime, sandbox: &Sandbox, name: &str) ->
     }
 }
 
-fn revision_of(sandbox: &Sandbox, label: &str) -> Result<RevisionKey> {
+fn revision_of(sandbox: &Sandbox, label: &str, revision_label: &str) -> Result<RevisionKey> {
     let workload = sandbox
         .labels
         .get(label)
         .context("the opt-in label is gone")?;
     let hash = sandbox
         .labels
-        .get(REVISION_LABEL)
-        .with_context(|| format!("no {REVISION_LABEL} label; is the pod from a Deployment?"))?;
+        .get(revision_label)
+        .with_context(|| format!("no {revision_label} label; is the pod from a Deployment?"))?;
     RevisionKey::new(&sandbox.namespace, workload, hash)
 }
 
@@ -197,10 +227,14 @@ async fn pull_from_peers(
     Ok(())
 }
 
-async fn cold_boot(pod: &Pod, shim: &mut ShimClient) -> Result<(PodPid, Control)> {
+async fn cold_boot(
+    pod: &Pod,
+    shim: &mut ShimClient,
+    within: Duration,
+) -> Result<(PodPid, Control)> {
     let asked = Instant::now();
     let server = shim.start().await?;
-    let control = Control::connect_when_running(pod.control(), BOOT).await?;
+    let control = Control::connect_when_running(pod.control(), within).await?;
     info!(seconds = %seconds(asked), "the server is running");
     Ok((server, control))
 }
@@ -232,7 +266,7 @@ async fn bring_up(
     shim: &mut ShimClient,
 ) -> Result<Served> {
     let args = &node.args;
-    let revision = revision_of(sandbox, &args.label)?;
+    let revision = revision_of(sandbox, &args.label, &args.revision_label)?;
     let store = RevisionStore::open(&args.store_dir, &revision, &sandbox.uid)?;
     info!(
         pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
@@ -251,6 +285,7 @@ async fn bring_up(
             pull_from_peers(peers, &revision, &store).await?;
         }
     }
+    let boot = Duration::from_secs(args.boot_timeout_s);
     let plan = Plan::choose(
         store.failed_before(),
         Image::of(&store, pod)?,
@@ -265,12 +300,12 @@ async fn bring_up(
         }
         Plan::ColdBoot(because) => {
             warn!(because, "cold booting, with no checkpoint taken");
-            cold_boot(pod, shim).await?;
+            cold_boot(pod, shim, boot).await?;
             Ok(Served::ColdBooted)
         }
         Plan::Capture => {
             info!("cold booting; this pod gives the revision its checkpoint");
-            let (server, control) = cold_boot(pod, shim).await?;
+            let (server, control) = cold_boot(pod, shim, boot).await?;
             store.clear_staging()?;
             let staging = store.staging_dir();
             let cycled = async {
@@ -290,8 +325,14 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     let args = &node.args;
     let seen = Instant::now();
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
-    let init = container_init(&mut runtime, sandbox, &args.container).await?;
-    let mut shim = ShimClient::connect(init).await?;
+    let init = container_init(
+        &mut runtime,
+        sandbox,
+        &args.container,
+        Duration::from_secs(args.container_timeout_s),
+    )
+    .await?;
+    let mut shim = ShimClient::connect(init, Duration::from_secs(args.shim_timeout_s)).await?;
     let progress = shim.progress().await?;
     if progress.serving {
         debug!("already serving, nothing to do");
@@ -305,10 +346,11 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     )
     .await?;
     let control = SocketAddr::new(runtime.address(sandbox).await?, args.control_port);
-    let pod = Pod::new(init, control, &args.tools_dir, &allotted)?;
+    let pod = Pod::new(init, control, &args.pod, &allotted)?;
     let served = if progress.started {
         info!("the server was started before this daemon; waiting for it to run");
-        Control::connect_when_running(pod.control(), BOOT).await?;
+        Control::connect_when_running(pod.control(), Duration::from_secs(args.boot_timeout_s))
+            .await?;
         Served::StartedEarlier
     } else {
         bring_up(node, sandbox, &pod, &mut shim).await?
@@ -327,7 +369,7 @@ fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
                     error = %format!("{error:#}").replace('\n', "; "),
                     "gave up on this pod for now"
                 );
-                sleep(RETRY).await;
+                sleep(Duration::from_secs(node.args.retry_s)).await;
             }
         }
         .instrument(span),
@@ -338,9 +380,9 @@ async fn serve(args: Args) -> Result<()> {
     std::fs::create_dir_all(&args.store_dir)
         .with_context(|| format!("create {}", args.store_dir.display()))?;
     ensure!(
-        args.tools_dir.join("criu").is_file(),
+        args.pod.tools_dir.join("criu").is_file(),
         "no criu in {}",
-        args.tools_dir.display()
+        args.pod.tools_dir.display()
     );
     let node = Arc::new(Node {
         #[cfg(feature = "nixl")]
@@ -354,7 +396,7 @@ async fn serve(args: Args) -> Result<()> {
     info!(
         label = %args.label,
         store = %args.store_dir.display(),
-        tools = %args.tools_dir.display(),
+        tools = %args.pod.tools_dir.display(),
         runtime = %args.runtime_socket.display(),
         "watching this node's pods"
     );

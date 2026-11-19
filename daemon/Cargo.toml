@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver", "cuda-13000", "dynamic-loading"] }
 cuinterpose-protocol = { git = "https://github.com/ai-dynamo/snapshot", rev = "bc9d2161d2a7f203551e5b7e237defd90b1e9aa1" }
 hex = "0.4"
