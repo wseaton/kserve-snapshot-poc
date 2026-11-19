@@ -26,6 +26,8 @@ use rustix::process::{Pid, Signal, WaitOptions};
 use snapshotd_shim::{Reply, Request, SERVER_LOG, SOCKET};
 
 const TICK: Duration = Duration::from_millis(100);
+const PROBE: Duration = Duration::from_millis(200);
+const READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 #[derive(Parser)]
 #[command(name = "snapshotd-shim")]
@@ -36,7 +38,8 @@ struct Args {
     /// Where the server's output goes; it is copied to this process's output.
     #[arg(long, default_value = SERVER_LOG)]
     log: PathBuf,
-    /// Port opened once the server answers requests, for a TCP readiness probe.
+    /// Port opened once the server answers requests. It accepts connections
+    /// and answers any HTTP request with 200, for a TCP or an HTTP probe.
     #[arg(long, default_value_t = 8001)]
     ready_port: u16,
     /// Port the server listens on; used only when no node daemon shows up.
@@ -300,8 +303,13 @@ impl Shim {
     }
 
     fn answer_probes(&self) {
-        if let Some(ready) = &self.ready {
-            while ready.accept().is_ok() {}
+        let Some(ready) = &self.ready else { return };
+        while let Ok((mut probe, _)) = ready.accept() {
+            let _ = probe.set_nonblocking(false);
+            let _ = probe.set_read_timeout(Some(PROBE));
+            let _ = probe.set_write_timeout(Some(PROBE));
+            let _ = probe.read(&mut [0; 1024]);
+            let _ = probe.write_all(READY);
         }
     }
 

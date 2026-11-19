@@ -164,6 +164,13 @@ fn serving_opens_the_readiness_port() {
     assert_eq!(daemon.call(r#""Serving""#), serde_json::json!("Done"));
     assert!(shim.ready());
     assert!(shim.ready());
+    let mut probe = TcpStream::connect(("127.0.0.1", shim.ready_port)).unwrap();
+    probe
+        .write_all(b"GET /health HTTP/1.1\r\nHost: pod\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    probe.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer:?}");
     assert_eq!(
         daemon.call(r#""State""#),
         serde_json::json!({"State": {"started": true, "serving": true}})
