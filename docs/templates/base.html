@@ -1,3 +1,4 @@
+{% import "macros.html" as macros %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -20,19 +21,27 @@
   <div class="sheet">
     <header class="bar">
       <a class="wordmark" href="{{ config.base_url | safe }}/">{{ config.title }}</a>
-      <nav aria-label="Pages">
-        {% for p in root.pages %}
-        <a href="{{ p.permalink | safe }}"{% if p.path == here %} aria-current="page"{% endif %}>{{ p.extra.nav | default(value=p.title) }}</a>
-        {% endfor %}
-        <a href="{{ config.extra.repo_url | safe }}">GitHub</a>
-      </nav>
       <div class="prefs">
+        <a href="{{ config.extra.repo_url | safe }}">GitHub</a>
         <button type="button" id="theme-toggle">Theme</button>
       </div>
     </header>
-    <main>
-      {% block content %}{% endblock content %}
-    </main>
+    <div class="layout">
+      <details class="toc" id="toc">
+        <summary>Contents</summary>
+        <nav aria-label="Contents">
+          <ul>
+            {{ macros::entry(title="Overview", url=root.permalink, path=root.path, toc=root.toc, here=here) }}
+            {% for p in root.pages %}
+            {{ macros::entry(title=p.extra.nav | default(value=p.title), url=p.permalink, path=p.path, toc=p.toc, here=here) }}
+            {% endfor %}
+          </ul>
+        </nav>
+      </details>
+      <main>
+        {% block content %}{% endblock content %}
+      </main>
+    </div>
     <footer class="colophon">
       <span>Built with <a href="https://www.getzola.org">Zola</a> from <a href="{{ config.extra.repo_url | safe }}/tree/main/docs">docs/</a>.</span>
     </footer>
@@ -44,6 +53,19 @@
       try { localStorage.setItem("theme", root.dataset.theme); } catch {}
       document.dispatchEvent(new Event("theme-change"));
     });
+  </script>
+  <script>
+    (() => {
+      const toc = document.getElementById("toc");
+      let saved = null;
+      try { saved = localStorage.getItem("toc"); } catch {}
+      const wide = matchMedia("(min-width: 56rem)").matches;
+      toc.open = wide && saved !== "closed";
+      toc.addEventListener("toggle", () => {
+        if (!matchMedia("(min-width: 56rem)").matches) return;
+        try { localStorage.setItem("toc", toc.open ? "open" : "closed"); } catch {}
+      });
+    })();
   </script>
   {% block scripts %}{% endblock scripts %}
 </body>
