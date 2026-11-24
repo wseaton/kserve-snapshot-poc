@@ -16,7 +16,7 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
   (`plain`), or run it between `cuinterpose-coordinator --prepare` and `--restore`
   (`cuinterpose`); `/checkpoint/restore` and compare. With the third argument 1, the
   `cuda_communicator.py` from the configmap replaces the image's. These runs used an earlier
-  version of `patches/vllm/0003` that suspended NCCL instead of recreating it.
+  version of `patches/vllm/0004` that suspended NCCL instead of recreating it.
 - `inspect.py`: asks each cuInterpose-preloaded process for its records.
 - `cudackpt.py`: the CUDA cycle through the driver API, in place.
 - `series3.sh`, `series4.sh`: the graph, FlashInfer backend, 13.1 driver and cuInterpose runs.
@@ -25,7 +25,7 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
 
 - `pod.yaml`: privileged, 4 GPUs, a reaping PID 1 because the restore needs the dumped PIDs free.
   Configmap `criu-tp2` from `criuexp.sh`, `noiouring.py` and `overlay.tgz`, a tarball of the
-  vLLM files `patches/vllm/0003` changes, taken from `./checkout.sh vllm`. Copy a `snapshotd`
+  vLLM files `patches/vllm/0004` changes, taken from `./checkout.sh vllm`. Copy a `snapshotd`
   built from [`daemon/`](../daemon) for x86_64 glibc to `/work/snapshotd`.
 - `criuexp.sh <tag> <remap 0|1> [vllm args]`: vLLM on the first two GPUs under `noiouring.py`,
   prepare, `snapshotd cuda checkpoint`, `criu dump`, `criu restore` into a new network namespace,
@@ -67,7 +67,7 @@ A=(--disable-custom-all-reduce --max-model-len 4096 --kv-cache-memory-bytes 1G
 ```
 
 The kept rows are the same command with `GHOST_LIMIT=160G` on an overlay built without
-`patches/vllm/0004` and `0005`.
+the connector hooks and the CPU offload patch.
 
 The [comparison](https://wseaton.github.io/snapshotd/benchmarks/#snapshotd-against-dynamo-s-cuda-path) rows, with `TP=2` and `TP=4`:
 

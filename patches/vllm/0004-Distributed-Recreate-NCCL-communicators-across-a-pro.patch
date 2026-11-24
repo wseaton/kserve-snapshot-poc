@@ -1,8 +1,8 @@
-From 409087b94cb32c01b1cbb4c5b9f6dc3a568a39fe Mon Sep 17 00:00:00 2001
+From 18bfcc24a915f9435db555fef0e59dc93632f426 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
-Date: Thu, 5 Nov 2026 12:23:51 -0500
-Subject: [PATCH] [Distributed] Recreate NCCL communicators across a process
- checkpoint
+Date: Tue, 24 Nov 2026 16:57:04 -0500
+Subject: [PATCH 4/6] [Distributed] Recreate NCCL communicators across a
+ process checkpoint
 
 /checkpoint/prepare left the NCCL communicator alive, so each TP worker
 kept its peers' buffers mapped when the process was checkpointed. On driver
@@ -14,23 +14,25 @@ and a new cuMem communicator fails its first all-reduce.
 checkpoint_prepare now destroys the communicator and checkpoint_restore
 creates a new one from a fresh unique id broadcast over the CPU group.
 CUDA graphs replay the old communicator and ncclCommDestroy waits for them,
-so the worker releases its graphs before preparing (V2 model runner only)
+so the worker releases its graphs before preparing
 and captures them again when the KV cache wakes, before scheduling resumes.
 
 With custom all-reduce off, FlashInfer all-reduce off and
 NCCL_CUMEM_ENABLE=0, a TP=2 CRIU dump and restore onto two other GPUs
 returns the same greedy completion, eager and with CUDA graphs. Recapturing
 the graphs adds about 7 s to the restore.
+
+(cherry picked from commit 409087b94cb32c01b1cbb4c5b9f6dc3a568a39fe)
 ---
  tests/distributed/test_pynccl.py              | 24 ++++++++++++++
  .../device_communicators/cuda_communicator.py | 10 ++++--
  .../device_communicators/pynccl.py            | 33 ++++++++++++++++---
  vllm/v1/worker/gpu/model_runner.py            | 15 +++++++++
- vllm/v1/worker/gpu_worker.py                  | 26 ++++++++++++++-
- 5 files changed, 101 insertions(+), 7 deletions(-)
+ vllm/v1/worker/gpu_worker.py                  | 21 +++++++++++-
+ 5 files changed, 96 insertions(+), 7 deletions(-)
 
 diff --git a/tests/distributed/test_pynccl.py b/tests/distributed/test_pynccl.py
-index 5279a05249..f679be6ea4 100644
+index 7514035787..d41805ea31 100644
 --- a/tests/distributed/test_pynccl.py
 +++ b/tests/distributed/test_pynccl.py
 @@ -81,6 +81,30 @@ def test_pynccl():
@@ -65,10 +67,10 @@ index 5279a05249..f679be6ea4 100644
  def multiple_allreduce_worker_fn():
      device = torch.device(f"cuda:{torch.distributed.get_rank()}")
 diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
-index 56c9e33ee4..06784cd17e 100644
+index 11c8de67d9..a25e70160c 100644
 --- a/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/vllm/distributed/device_communicators/cuda_communicator.py
-@@ -888,17 +888,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
+@@ -924,17 +924,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
          checkpoint_restore_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
  
      def checkpoint_prepare(self) -> None:
@@ -95,7 +97,7 @@ index 56c9e33ee4..06784cd17e 100644
          if self.all2all_manager is not None:
              self.all2all_manager.checkpoint_restore()
 diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
-index 8981594aff..15cc696ab7 100644
+index 8361b9c9cd..15d81a28cf 100644
 --- a/vllm/distributed/device_communicators/pynccl.py
 +++ b/vllm/distributed/device_communicators/pynccl.py
 @@ -140,14 +140,19 @@ class PyNcclCommunicator:
@@ -129,7 +131,7 @@ index 8981594aff..15cc696ab7 100644
  
      def _init_comm(self, device: int | str | torch.device) -> None:
          """Create the communicator on `device` from the already-resolved
-@@ -640,6 +644,27 @@ class PyNcclCommunicator:
+@@ -658,6 +662,27 @@ class PyNcclCommunicator:
      def deregister_comm_window(self, window):
          return self.nccl.ncclCommWindowDeregister(self.comm, window)
  
@@ -158,10 +160,10 @@ index 8981594aff..15cc696ab7 100644
          """Release comm GPU memory (collective, idempotent); keeps topology."""
          if self.disabled or self._suspended:
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 949dfd79f9..aac0f257a8 100644
+index 46c3643880..221fd24aec 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -114,6 +114,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
+@@ -120,6 +120,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
  from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
  from vllm.v1.worker.gpu.cudagraph_utils import (
      BatchExecutionDescriptor,
@@ -169,7 +171,7 @@ index 949dfd79f9..aac0f257a8 100644
      ModelCudaGraphManager,
      has_compiled_submodule,
      make_cudagraph_stats,
-@@ -1153,6 +1154,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1168,6 +1169,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              and self.cudagraph_manager.needs_capture()
          )
  
@@ -191,10 +193,10 @@ index 949dfd79f9..aac0f257a8 100644
      def capture_model(self, *, profile_only: bool = False) -> int:
          assert self.cudagraph_manager is not None
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 0b14b1c2ec..ea1762eddb 100644
+index 67c3e1714a..ec63157251 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -122,7 +122,7 @@ from vllm.v1.worker.startup_plan import (
+@@ -142,7 +142,7 @@ from vllm.v1.worker.startup_plan import (
      maybe_save_startup_plan,
  )
  from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -203,35 +205,37 @@ index 0b14b1c2ec..ea1762eddb 100644
  
  from ...model_executor.model_loader import TensorizerLoader
  from .gpu.cudagraph_utils import has_compiled_submodule
-@@ -225,6 +225,7 @@ class Worker(WorkerBase):
-         is_driver_worker: bool = False,
+@@ -251,6 +251,7 @@ class Worker(WorkerBase):
      ):
-         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+         if not HAS_TRITON and not current_platform.uses_standalone_cpu_model_runner():
+             raise ValueError("vLLM's model runner requires Triton.")
 +        self._checkpoint_graphs_released = False
-         if (
-             self.use_v2_model_runner
-             and not HAS_TRITON
-@@ -405,6 +406,9 @@ class Worker(WorkerBase):
-         if loader is not None:
+ 
+         super().__init__(
+             vllm_config=vllm_config,
+@@ -416,6 +417,9 @@ class Worker(WorkerBase):
+         if loader := _bound_model_loader(self.model_runner):
              loader.on_wake_up(tags)
  
 +        if wake_kv_cache and self._checkpoint_graphs_released:
 +            self._capture_released_graphs()
 +
-     def _save_discarded_weight_state(self) -> None:
-         """Save what a weight reload does not bring back: buffers and the
-         parameters named by `sleep_preserve_parameter_names`."""
-@@ -434,11 +438,31 @@ class Worker(WorkerBase):
+     def discard(self, tags: tuple[str, ...]) -> None:
+         if "weights" in tags:
+             if loader := _bound_model_loader(self.model_runner):
+@@ -436,6 +440,9 @@ class Worker(WorkerBase):
          self.sleep_mode_backend.discard(tags)
  
      def checkpoint_prepare(self) -> None:
 +        if self._checkpoint_graphs_captured():
-+            self._v2_model_runner().release_cuda_graphs()
++            self.model_runner.release_cuda_graphs()
 +            self._checkpoint_graphs_released = True
-         checkpoint_prepare_distributed_state()
- 
-     def checkpoint_restore(self) -> None:
-         checkpoint_restore_distributed_state()
+         # Connectors are created after the communicators, so release them first.
+         if has_kv_transfer_group():
+             get_kv_transfer_group().checkpoint_prepare()
+@@ -449,6 +456,18 @@ class Worker(WorkerBase):
+         if has_kv_transfer_group():
+             get_kv_transfer_group().checkpoint_restore()
  
 +    def _capture_released_graphs(self) -> None:
 +        """Capture the graphs `checkpoint_prepare` released."""
@@ -241,14 +245,9 @@ index 0b14b1c2ec..ea1762eddb 100644
 +        self._checkpoint_graphs_released = False
 +
 +    def _checkpoint_graphs_captured(self) -> bool:
-+        if self.model_config.enforce_eager or self.parallel_config.world_size == 1:
-+            return False
-+        if not self.use_v2_model_runner:
-+            raise NotImplementedError(
-+                "A process checkpoint with CUDA graphs and tensor parallelism "
-+                "requires the V2 model runner"
-+            )
-+        return True
++        return not (
++            self.model_config.enforce_eager or self.parallel_config.world_size == 1
++        )
 +
      def _weight_checksum_prefix(self) -> str:
          # data_parallel_rank is 0 in dense workers; only the index is unique.

@@ -14,11 +14,13 @@ Restore rebuilds what prepare tore down.
 The patches in [`patches/vllm`](https://github.com/wseaton/snapshotd/tree/main/patches/vllm)
 extend it:
 
-- release the weights at prepare and reload them at restore (`0002`)
-- destroy and recreate the NCCL communicator, so no GPU memory is shared at checkpoint time (`0003`)
-- free and refill the CPU KV offload region (`0004`, `0005`)
-- serve the lifecycle over the Rust frontend's gRPC `Control` service, which the daemon calls (`0006`)
-- checkpoint NIXL prefill and decode instances (`0007`)
+- give KV connectors checkpoint hooks, and checkpoint NIXL prefill and decode instances (`0001`, `0002`)
+- release the weights at prepare and reload them at restore (`0003`)
+- destroy and recreate the NCCL communicator, so no GPU memory is shared at checkpoint time (`0004`)
+- serve the lifecycle over the Rust frontend's gRPC `Control` service, which the daemon calls (`0005`, `0006`)
+
+Freeing the CPU KV offload region at prepare was measured on the earlier base and is not ported
+yet ([Open](@/open.md)).
 
 ## CUDA checkpoint driver API
 
@@ -58,7 +60,7 @@ shared allocations, unmaps them before the checkpoint, and re-exports and re-imp
 the restore.
 
 `snapshotd` asks each process over cuInterpose's control socket whether it shares memory, and runs
-the coordinator only when it does. With `patches/vllm/0003` nothing is shared and cuInterpose is
+the coordinator only when it does. With `patches/vllm/0004` nothing is shared and cuInterpose is
 not needed. At TP>1 on driver 580 it needs the CUDA 13.1 compat `libcuda`.
 
 ## NIXL and UCX

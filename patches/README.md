@@ -7,37 +7,34 @@ patches.
 
 | Directory | Base |
 | --- | --- |
-| [`vllm/`](vllm) | `a2bcb565`, a nightly that includes the checkpoint lifecycle from [vllm-project/vllm#62570](https://github.com/vllm-project/vllm/pull/62570) |
+| [`vllm/`](vllm) | `main` at `f2f9edca`, the commit of a published nightly image, which includes the checkpoint lifecycle from [vllm-project/vllm#62570](https://github.com/vllm-project/vllm/pull/62570) and the loader hooks from [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011) |
 | [`modelexpress/`](modelexpress) | `main` at `8b2e8787`, which includes in-place reload from [ai-dynamo/modelexpress#854](https://github.com/ai-dynamo/modelexpress/pull/854) |
 | [`dynamo-snapshot/`](dynamo-snapshot) | `bc9d216` |
 | [`criu/`](criu) | `criu-dev` at `1a935857`, the commit the snapshot-agent image builds |
 
 **vLLM**
-- `0001`: [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011), merged
-  2026-11-23 after this base; carried unchanged until the base moves. Sleep, wake and in-place reload hooks on `BaseModelLoader`, which ModelExpress uses
-  to stop serving before its memory is freed and to refill weights from a peer.
-- `0002`: `--checkpoint-release-weights`. `/checkpoint/prepare` also discards the weights, so the
+- `0001`, `0002`: [vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371)
+  (open), both commits, with their tests moved to main's engine-core test helper. KV connectors get
+  `checkpoint_prepare` and `checkpoint_restore`, the engine refuses to prepare with a connector
+  that does not declare `supports_checkpoint`, and NIXL prefill and decode instances are
+  checkpointed with `--checkpoint-prepare-on-startup` and restored independently, each restore
+  taking a new KV engine id and the restored pod's own side-channel address.
+- `0003`: `--checkpoint-release-weights`. `/checkpoint/prepare` also discards the weights, so the
   checkpoint does not contain them, and `/checkpoint/restore` wakes them and reloads them through
-  the model loader before the KV cache. Upstream #62570 keeps the weights in GPU memory, and so in
-  the checkpoint.
-- `0003`: `/checkpoint/prepare` destroys the NCCL communicator and `/checkpoint/restore` creates a
+  the model loader before the KV cache. Releasing the weights suspends only the `weights`
+  allocations, through a `tags` filter on the sleep backend and the allocators: parameters a reload
+  rewrites are dropped, buffers and preserved parameters go to host memory.
+- `0004`: `/checkpoint/prepare` destroys the NCCL communicator and `/checkpoint/restore` creates a
   new one, releasing CUDA graphs before and capturing them again after. At TP>1 with custom
   all-reduce off, no CUDA memory is shared between workers when the process is checkpointed, and
   cuda-checkpoint alone restores them, onto other GPUs too.
-- `0004`: the connector hooks of [vllm-project/vllm#64371](https://github.com/vllm-project/vllm/pull/64371)
-  (open), its first commit backported: KV connectors get `checkpoint_prepare` and
-  `checkpoint_restore`, and the engine refuses to prepare with a connector that does not declare
-  `supports_checkpoint`.
-- `0005`: stacked on those hooks. With the CPU KV offload connector (`--kv-offloading-size`),
-  `/checkpoint/prepare` frees the offload region and `/checkpoint/restore` refills it, so the
-  checkpoint does not grow by the region size. No flag: stock vLLM keeps the region.
-- `0006`: the checkpoint lifecycle on the Rust frontend's gRPC `Control` service
-  (`CheckpointPrepare`, `CheckpointRestore`, `GetCheckpointState`). Upstream serves it only on
-  the HTTP routes of the development server.
-- `0007`: the second commit of #64371 as of 2026-11-18, backported to this base: NIXL prefill and
-  decode instances are checkpointed with `--checkpoint-prepare-on-startup` and restored
-  independently, each restore taking a new KV engine id and the restored pod's own side-channel
-  address. It applied to the NIXL connector unchanged; the conflicts were with `0002` and `0005`.
+- `0005`, `0006`: the checkpoint lifecycle on the Rust frontend's gRPC `Control` service
+  (`CheckpointPrepare`, `CheckpointRestore`, `GetCheckpointState`), sharing one state machine with
+  the `/checkpoint` HTTP routes. Upstream serves it only over HTTP, on the inference port.
+
+Freeing the CPU KV offload region at prepare
+([fork commit](https://github.com/wseaton/vllm/commit/47906b39d1)) is not ported to this base:
+main now gives each rank its own region and sets the tier up in the background.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by

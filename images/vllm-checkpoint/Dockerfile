@@ -1,8 +1,8 @@
-ARG BASE_IMAGE=vllm/vllm-openai:nightly-a2bcb5657a881a002e79d0adab3c6b5e39436121@sha256:bd419f1669b420e7dfcfa2545a9f3b05c2312c858a215b1f287284d7398d3367
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-f2f9edcac30d128bc090a3c032e4ba125716a641@sha256:eaa63fd6ee3aac77f3158e80ed79ec425db3a53f7cd666bf1954e96abfaf19a7
 
 FROM docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS frontend
 ARG VLLM_REPO=wseaton/vllm
-ARG FRONTEND_REF=fc1214e528e728012175027e0c48d69e6a77a063
+ARG FRONTEND_REF=6c9431395f3b8dc4e5d053c4ef7503f566199a7c
 RUN set -eux; \
     git init -q /src/vllm; \
     cd /src/vllm; \
@@ -14,8 +14,8 @@ RUN set -eux; \
 FROM ${BASE_IMAGE}
 
 ARG VLLM_REPO=wseaton/vllm
-ARG VLLM_REF=fc1214e528e728012175027e0c48d69e6a77a063
-ARG VLLM_FILES="vllm/config/model.py vllm/distributed/device_communicators/cuda_communicator.py vllm/distributed/device_communicators/pynccl.py vllm/distributed/kv_transfer/kv_connector/v1/base.py vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py vllm/engine/arg_utils.py vllm/model_executor/model_loader/__init__.py vllm/model_executor/model_loader/base_loader.py vllm/model_executor/model_loader/modelexpress_loader.py vllm/model_executor/model_loader/reload/inplace.py vllm/v1/engine/core.py vllm/v1/engine/llm_engine.py vllm/v1/worker/gpu/model_runner.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_worker.py"
+ARG VLLM_REF=6c9431395f3b8dc4e5d053c4ef7503f566199a7c
+ARG VLLM_FILES="vllm/config/model.py vllm/device_allocator/__init__.py vllm/device_allocator/cumem.py vllm/device_allocator/sleep_mode_backend.py vllm/device_allocator/xpumem.py vllm/distributed/device_communicators/cuda_communicator.py vllm/distributed/device_communicators/pynccl.py vllm/distributed/kv_transfer/kv_connector/v1/base.py vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py vllm/engine/arg_utils.py vllm/v1/engine/core.py vllm/v1/engine/llm_engine.py vllm/v1/worker/gpu/model_runner.py vllm/v1/worker/gpu_worker.py"
 ARG MX_REPO=wseaton/modelexpress
 ARG MX_REF=16ecf7a627d2a117f0c4f97c7a549923d6719529
 

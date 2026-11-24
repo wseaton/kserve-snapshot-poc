@@ -18,6 +18,10 @@ Checked against the code and upstream on 2026-11-24.
   ([Limits](@/limits.md#tensor-parallel-below-a-whole-node)). The no-sharing configuration that
   would lift this has not been run under the daemon.
 
+- **Multi-pod groups.** Data and expert parallel servers span pods whose ranks differ. Their
+  checkpoints are keyed per member already; capturing and restoring a whole group together, with
+  the frontend's connections to remote engines, is not built.
+
 ### Peer selection
 
 - Choose the transport by distance; `UCX_TLS` is one setting for every pair.
@@ -62,12 +66,12 @@ Checked against the code and upstream on 2026-11-24.
 | Change | Where | State |
 | --- | --- | --- |
 | Checkpoint lifecycle | [vllm#62570](https://github.com/vllm-project/vllm/pull/62570) | merged, in our base |
-| Model loader sleep, wake and reload hooks | [vllm#57011](https://github.com/vllm-project/vllm/pull/57011), `patches/vllm/0001` | merged 2026-11-23, after our base |
-| Release weights at prepare | `patches/vllm/0002` | carried |
-| Recreate the NCCL communicator around a checkpoint | `patches/vllm/0003` | carried |
-| Connector checkpoint hooks, NIXL prefill/decode | [vllm#64371](https://github.com/vllm-project/vllm/pull/64371), `0004`, `0007` | open |
-| Free and refill the CPU KV offload region | `patches/vllm/0005` | carried, stacked on #64371 |
-| Checkpoint lifecycle on the Rust frontend's gRPC service | `patches/vllm/0006` | carried, no upstream PR yet |
+| Model loader sleep, wake and reload hooks | [vllm#57011](https://github.com/vllm-project/vllm/pull/57011) | merged, in our base |
+| Release weights at prepare, with a tag-limited sleep backend suspend | `patches/vllm/0003` | carried |
+| Recreate the NCCL communicator around a checkpoint | `patches/vllm/0004` | carried |
+| Connector checkpoint hooks, NIXL prefill/decode | [vllm#64371](https://github.com/vllm-project/vllm/pull/64371), `0001`, `0002` | open |
+| Free and refill the CPU KV offload region | [fork commit](https://github.com/wseaton/vllm/commit/47906b39d1), wanted by [vllm#69237](https://github.com/vllm-project/vllm/issues/69237) | not ported to the current base: per-rank regions and background setup changed under it |
+| Checkpoint lifecycle on the Rust frontend's gRPC service | `patches/vllm/0005`, `0006`; branch `rust-checkpoint-grpc` | carried, no upstream PR yet |
 | Refill the offload region after serving resumes | vLLM | not started |
 | Release custom all-reduce IPC buffers at prepare | vLLM | not started |
 | Rebuild FlashInfer all-reduce workspaces after a device remap | FlashInfer, vLLM | not started |

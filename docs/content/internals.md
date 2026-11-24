@@ -55,7 +55,7 @@ Experiments on Qwen3-8B TP=2
   rebuild (`CUDA_ERROR_NOT_INITIALIZED`), legacy IPC buffers survive `ncclCommSuspend`, and a new
   cuMem communicator fails its first all-reduce.
 
-What works with no cuInterpose, on the same or other GPUs, is `patches/vllm/0003` plus:
+What works with no cuInterpose, on the same or other GPUs, is `patches/vllm/0004` plus:
 
 ```text
 --disable-custom-all-reduce

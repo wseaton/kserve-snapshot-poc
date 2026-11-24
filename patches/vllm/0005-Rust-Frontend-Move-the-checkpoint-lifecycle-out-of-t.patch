@@ -1,0 +1,230 @@
+From cf69fc4a20e4acdc2f617a11145421967986049e Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Tue, 24 Nov 2026 16:33:40 -0500
+Subject: [PATCH 5/6] [Rust Frontend] Move the checkpoint lifecycle out of the
+ HTTP routes
+
+The prepare and restore state machines lived in the /checkpoint route
+handlers. Move them to a checkpoint module that returns what a request
+did, so another transport can serve the same lifecycle without copying
+the transitions. The routes keep their status codes and bodies.
+
+Assisted-by: Claude
+Signed-off-by: Will Eaton <weaton@redhat.com>
+---
+ rust/src/server/src/checkpoint.rs        | 83 ++++++++++++++++++++++++
+ rust/src/server/src/lib.rs               |  1 +
+ rust/src/server/src/routes/checkpoint.rs | 69 ++++++++------------
+ 3 files changed, 111 insertions(+), 42 deletions(-)
+ create mode 100644 rust/src/server/src/checkpoint.rs
+
+diff --git a/rust/src/server/src/checkpoint.rs b/rust/src/server/src/checkpoint.rs
+new file mode 100644
+index 0000000000..961398a29b
+--- /dev/null
++++ b/rust/src/server/src/checkpoint.rs
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++//! The process checkpoint lifecycle, shared by the HTTP routes and gRPC Control.
++
++use vllm_engine_core_client::EngineCoreClient;
++use vllm_engine_core_client::protocol::utility::{CheckpointState, PauseMode};
++
++/// An engine utility call that failed, and which one.
++pub(crate) struct CallError {
++    pub method: &'static str,
++    pub error: vllm_engine_core_client::Error,
++}
++
++/// What a prepare or restore request did.
++pub(crate) enum Transition {
++    /// Started, already under way, or already done; the state after the call.
++    Accepted(CheckpointState, Option<String>),
++    /// An engine refused to prepare and nothing changed.
++    Refused(String),
++    /// Not possible from this state.
++    Invalid(CheckpointState, Option<String>),
++}
++
++pub(crate) async fn state(
++    client: &EngineCoreClient,
++) -> Result<(CheckpointState, Option<String>), CallError> {
++    client.checkpoint_state().await.map_err(|error| CallError {
++        method: "checkpoint_state",
++        error,
++    })
++}
++
++/// Drain with `mode` and release what a process checkpoint must not contain.
++/// Repeating while preparing or prepared is a no-op.
++pub(crate) async fn prepare(
++    client: &EngineCoreClient,
++    mode: PauseMode,
++) -> Result<Transition, CallError> {
++    let (state_now, error) = state(client).await?;
++    match state_now {
++        CheckpointState::Running => {
++            let refusal = client.checkpoint_prepare(mode).await.map_err(|error| CallError {
++                method: "checkpoint_prepare",
++                error,
++            })?;
++            if let Some(refusal) = refusal {
++                return Ok(Transition::Refused(refusal));
++            }
++            let (state_now, error) = state(client).await?;
++            Ok(Transition::Accepted(state_now, error))
++        }
++        CheckpointState::Restoring | CheckpointState::Failed => {
++            Ok(Transition::Invalid(state_now, error))
++        }
++        CheckpointState::Preparing | CheckpointState::Prepared => {
++            Ok(Transition::Accepted(state_now, error))
++        }
++    }
++}
++
++/// Bring back what preparing released and serve, in the restored process or in
++/// place. Orchestrators may deliver this more than once, so a restore in
++/// progress or done is accepted.
++pub(crate) async fn restore(client: &EngineCoreClient) -> Result<Transition, CallError> {
++    let (state_now, error) = state(client).await?;
++    match state_now {
++        CheckpointState::Prepared => {
++            client.checkpoint_restore().await.map_err(|error| CallError {
++                method: "checkpoint_restore",
++                error,
++            })?;
++            let (state_now, error) = state(client).await?;
++            Ok(Transition::Accepted(state_now, error))
++        }
++        CheckpointState::Preparing | CheckpointState::Failed => {
++            Ok(Transition::Invalid(state_now, error))
++        }
++        CheckpointState::Running | CheckpointState::Restoring => {
++            Ok(Transition::Accepted(state_now, error))
++        }
++    }
++}
+diff --git a/rust/src/server/src/lib.rs b/rust/src/server/src/lib.rs
+index 92822acc4a..92f999a8b2 100644
+--- a/rust/src/server/src/lib.rs
++++ b/rust/src/server/src/lib.rs
+@@ -3,6 +3,7 @@
+ 
+ //! Minimal OpenAI-compatible HTTP server above [`vllm_chat`].
+ 
++mod checkpoint;
+ mod config;
+ mod error;
+ mod fingerprint;
+diff --git a/rust/src/server/src/routes/checkpoint.rs b/rust/src/server/src/routes/checkpoint.rs
+index 8fa65dd178..b97db125fc 100644
+--- a/rust/src/server/src/routes/checkpoint.rs
++++ b/rust/src/server/src/routes/checkpoint.rs
+@@ -10,6 +10,7 @@ use axum::http::StatusCode;
+ use serde::{Deserialize, Serialize};
+ use vllm_engine_core_client::protocol::utility::{CheckpointState, PauseMode};
+ 
++use crate::checkpoint::{self, Transition};
+ use crate::error::ApiError;
+ use crate::state::AppState;
+ use crate::utils::utility_call_error;
+@@ -41,12 +42,24 @@ fn state_response(
+     Ok((status, Json(CheckpointStateResponse { state, error })))
+ }
+ 
+-async fn current_state(state: &AppState) -> Result<(CheckpointState, Option<String>), ApiError> {
+-    state
+-        .engine_core_client()
+-        .checkpoint_state()
+-        .await
+-        .map_err(|error| utility_call_error("checkpoint_state", error))
++fn call_error(call: checkpoint::CallError) -> ApiError {
++    utility_call_error(call.method, call.error)
++}
++
++fn transition_response(transition: Transition) -> CheckpointResult {
++    match transition {
++        Transition::Accepted(checkpoint_state, error) => {
++            state_response(StatusCode::OK, checkpoint_state, error)
++        }
++        Transition::Refused(refusal) => state_response(
++            StatusCode::BAD_REQUEST,
++            CheckpointState::Running,
++            Some(refusal),
++        ),
++        Transition::Invalid(checkpoint_state, error) => {
++            state_response(StatusCode::BAD_REQUEST, checkpoint_state, error)
++        }
++    }
+ }
+ 
+ /// Drain with `mode` and release what a process checkpoint must not contain.
+@@ -57,54 +70,26 @@ pub async fn prepare(
+     params: Result<Query<PrepareParams>, QueryRejection>,
+ ) -> CheckpointResult {
+     let Query(params) = params?;
+-    let (mut checkpoint_state, mut error) = current_state(&state).await?;
+-    match checkpoint_state {
+-        CheckpointState::Running => {
+-            if let Some(refusal) = state
+-                .engine_core_client()
+-                .checkpoint_prepare(params.mode)
+-                .await
+-                .map_err(|error| utility_call_error("checkpoint_prepare", error))?
+-            {
+-                return state_response(StatusCode::BAD_REQUEST, checkpoint_state, Some(refusal));
+-            }
+-            (checkpoint_state, error) = current_state(&state).await?;
+-        }
+-        CheckpointState::Restoring | CheckpointState::Failed => {
+-            return state_response(StatusCode::BAD_REQUEST, checkpoint_state, error);
+-        }
+-        CheckpointState::Preparing | CheckpointState::Prepared => {}
+-    }
+-    state_response(StatusCode::OK, checkpoint_state, error)
++    transition_response(
++        checkpoint::prepare(state.engine_core_client(), params.mode)
++            .await
++            .map_err(call_error)?,
++    )
+ }
+ 
+ /// Bring back what preparing released and serve, in the restored process or
+ /// in place. Orchestrators may deliver this more than once, so a restore in
+ /// progress or done returns 200.
+ pub async fn restore(State(state): State<Arc<AppState>>) -> CheckpointResult {
+-    let (mut checkpoint_state, mut error) = current_state(&state).await?;
+-    match checkpoint_state {
+-        CheckpointState::Preparing | CheckpointState::Failed => {
+-            return state_response(StatusCode::BAD_REQUEST, checkpoint_state, error);
+-        }
+-        CheckpointState::Prepared => {
+-            state
+-                .engine_core_client()
+-                .checkpoint_restore()
+-                .await
+-                .map_err(|error| utility_call_error("checkpoint_restore", error))?;
+-            (checkpoint_state, error) = current_state(&state).await?;
+-        }
+-        CheckpointState::Running | CheckpointState::Restoring => {}
+-    }
+-    state_response(StatusCode::OK, checkpoint_state, error)
++    transition_response(checkpoint::restore(state.engine_core_client()).await.map_err(call_error)?)
+ }
+ 
+ /// Return 200 once every engine is prepared, 503 until then and 500 if that
+ /// cannot happen, so orchestrators can poll it to learn when the process is
+ /// safe to capture.
+ pub async fn status(State(state): State<Arc<AppState>>) -> CheckpointResult {
+-    let (checkpoint_state, error) = current_state(&state).await?;
++    let (checkpoint_state, error) =
++        checkpoint::state(state.engine_core_client()).await.map_err(call_error)?;
+     let status = match checkpoint_state {
+         CheckpointState::Prepared => StatusCode::OK,
+         CheckpointState::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+-- 
+2.54.0 (Apple Git-157)
+

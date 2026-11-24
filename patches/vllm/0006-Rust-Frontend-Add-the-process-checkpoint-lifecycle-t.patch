@@ -1,72 +1,33 @@
-From b3c279b57a69c494a651ac400c1e8dbd8454e8c3 Mon Sep 17 00:00:00 2001
+From 6c9431395f3b8dc4e5d053c4ef7503f566199a7c Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
-Date: Wed, 18 Nov 2026 14:08:47 -0500
-Subject: [PATCH] [Rust Frontend] Add the process checkpoint lifecycle to gRPC
- Control
+Date: Tue, 24 Nov 2026 16:35:57 -0500
+Subject: [PATCH 6/6] [Rust Frontend] Add the process checkpoint lifecycle to
+ gRPC Control
 
 The checkpoint lifecycle is reachable only over HTTP, on the inference
 port. An orchestrator that drives vLLM through the gRPC control port
 has no way to prepare a process for a checkpoint or bring it back.
 
 Add CheckpointPrepare, CheckpointRestore and GetCheckpointState to the
-Control service, with the semantics of the /checkpoint routes: preparing
-and restoring are idempotent, and a call the engines cannot honor fails
-with FAILED_PRECONDITION and says why. Like those routes, they need
-sleep mode. An unspecified drain mode means wait, the routes' default.
+Control service, served by the same checkpoint module as the
+/checkpoint routes: preparing and restoring are idempotent, and a call
+the engines cannot honor fails with FAILED_PRECONDITION and says why.
+Like those routes, they need sleep mode. An unspecified drain mode
+means wait, the routes' default.
 
-New methods on the Control server trait break Rust implementers, so
-vllm-proto goes to 0.7.0.
+New methods on the Control server trait break Rust implementers; they
+land in the unreleased vllm-proto 0.7.0.
 
+Assisted-by: Claude
 Signed-off-by: Will Eaton <weaton@redhat.com>
 ---
- rust/Cargo.lock                     |   2 +-
- rust/proto/Cargo.toml               |   2 +-
- rust/proto/README.md                |   2 +-
  rust/proto/control.proto            |  40 ++++
- rust/src/server/src/grpc/control.rs | 102 +++++++++-
+ rust/src/server/src/grpc/control.rs |  79 ++++++-
  rust/src/server/src/grpc/tests.rs   | 306 ++++++++++++++++++++++++++++
- 6 files changed, 450 insertions(+), 4 deletions(-)
+ 3 files changed, 424 insertions(+), 1 deletion(-)
 
-diff --git a/rust/Cargo.lock b/rust/Cargo.lock
-index 03246cfbf2..888fcecf06 100644
---- a/rust/Cargo.lock
-+++ b/rust/Cargo.lock
-@@ -5838,7 +5838,7 @@ dependencies = [
- 
- [[package]]
- name = "vllm-proto"
--version = "0.6.0"
-+version = "0.7.0"
- dependencies = [
-  "prost",
-  "prost-types",
-diff --git a/rust/proto/Cargo.toml b/rust/proto/Cargo.toml
-index 11babde435..49b9a6d72d 100644
---- a/rust/proto/Cargo.toml
-+++ b/rust/proto/Cargo.toml
-@@ -1,6 +1,6 @@
- [package]
- name = "vllm-proto"
--version = "0.6.0"
-+version = "0.7.0"
- edition.workspace = true
- license.workspace = true
- description = "Protobuf messages and gRPC bindings for the vLLM Rust frontend"
-diff --git a/rust/proto/README.md b/rust/proto/README.md
-index d77c301a0a..e105b96884 100644
---- a/rust/proto/README.md
-+++ b/rust/proto/README.md
-@@ -16,7 +16,7 @@ the schemas on pull requests, including on forks.
- 
- ```toml
- [dependencies]
--vllm-proto = "0.6"
-+vllm-proto = "0.7"
- ```
- 
- For example, import `vllm_proto::inference_client::InferenceClient` or
 diff --git a/rust/proto/control.proto b/rust/proto/control.proto
-index 52188ae0df..8e9b39f4c8 100644
+index 437ef523bd..926eb4fe0a 100644
 --- a/rust/proto/control.proto
 +++ b/rust/proto/control.proto
 @@ -31,6 +31,20 @@ service Control {
@@ -90,7 +51,7 @@ index 52188ae0df..8e9b39f4c8 100644
    rpc InitWeightTransferEngine (InitWeightTransferEngineRequest) returns (InitWeightTransferEngineResponse) {}
    rpc StartWeightUpdate (StartWeightUpdateRequest) returns (StartWeightUpdateResponse) {}
    rpc StartDraftWeightUpdate (StartDraftWeightUpdateRequest) returns (StartDraftWeightUpdateResponse) {}
-@@ -156,6 +170,32 @@ message WakeUpResponse {}
+@@ -157,6 +171,32 @@ message WakeUpResponse {}
  message IsSleepingRequest {}
  message IsSleepingResponse { bool sleeping = 1; }
  
@@ -124,10 +85,10 @@ index 52188ae0df..8e9b39f4c8 100644
  // configured NCCL, IPC, or sparse-NCCL transport rather than crossing gRPC.
  message InitWeightTransferEngineRequest { bytes init_info_json = 1; }
 diff --git a/rust/src/server/src/grpc/control.rs b/rust/src/server/src/grpc/control.rs
-index d522c7cc8e..62ee43fc5b 100644
+index c3fc84b3c1..7f17494d77 100644
 --- a/rust/src/server/src/grpc/control.rs
 +++ b/rust/src/server/src/grpc/control.rs
-@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
+@@ -10,9 +10,12 @@ use tokio_util::sync::CancellationToken;
  use tonic::{Code, Request, Response, Status};
  use vllm_engine_core_client::EngineCoreClient;
  use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
@@ -137,22 +98,11 @@ index d522c7cc8e..62ee43fc5b 100644
 +};
  
  use super::{ControlServer, pb};
++use crate::checkpoint::{self, Transition};
  use crate::config::LoraModulePath;
-@@ -101,6 +103,13 @@ impl ControlServiceImpl {
-         })
-     }
- 
-+    async fn checkpoint_state(&self) -> Result<(CheckpointState, Option<String>), Status> {
-+        self.client()
-+            .checkpoint_state()
-+            .await
-+            .map_err(|error| utility_status("checkpoint_state", error))
-+    }
-+
-     fn require_sleep_mode(&self) -> Result<(), Status> {
-         self.sleep_mode_enabled().then_some(()).ok_or_else(|| {
-             Status::failed_precondition(
-@@ -125,6 +134,37 @@ fn pause_mode(mode: i32) -> Result<EnginePauseMode, Status> {
+ use crate::lora::{
+     LoadLoraError, LoadedLora, LoraDisabledError, LoraPathAccessError, UnloadLoraError,
+@@ -125,6 +128,47 @@ fn pause_mode(mode: i32) -> Result<EnginePauseMode, Status> {
      }
  }
  
@@ -180,17 +130,27 @@ index d522c7cc8e..62ee43fc5b 100644
 +    })
 +}
 +
-+fn checkpoint_precondition(state: CheckpointState, error: Option<String>) -> Status {
-+    Status::failed_precondition(match error {
-+        Some(error) => format!("the engines are {state}: {error}"),
-+        None => format!("the engines are {state}"),
-+    })
++fn checkpoint_call_status(call: checkpoint::CallError) -> Status {
++    utility_status(call.method, call.error)
++}
++
++fn checkpoint_transition(
++    transition: Transition,
++) -> Result<Response<pb::CheckpointStateResponse>, Status> {
++    match transition {
++        Transition::Accepted(state, error) => Ok(checkpoint_state_response(state, error)),
++        Transition::Refused(refusal) => Err(Status::failed_precondition(refusal)),
++        Transition::Invalid(state, error) => Err(Status::failed_precondition(match error {
++            Some(error) => format!("the engines are {state}: {error}"),
++            None => format!("the engines are {state}"),
++        })),
++    }
 +}
 +
  fn json_object(bytes: &[u8], field: &'static str) -> Result<JsonValue, Status> {
      let value = serde_json::from_slice::<JsonValue>(bytes).map_err(|error| {
          Status::invalid_argument(format!(
-@@ -417,6 +457,66 @@ impl pb::control_server::Control for ControlServiceImpl {
+@@ -416,6 +460,39 @@ impl pb::control_server::Control for ControlServiceImpl {
          Ok(Response::new(pb::IsSleepingResponse { sleeping }))
      }
  
@@ -201,25 +161,9 @@ index d522c7cc8e..62ee43fc5b 100644
 +        self.require_sleep_mode()?;
 +        let mode = checkpoint_prepare_mode(request.into_inner().mode)?;
 +        let _guard = self.rl_lock.lock().await;
-+        let (mut state, mut error) = self.checkpoint_state().await?;
-+        match state {
-+            CheckpointState::Running => {
-+                if let Some(refusal) = self
-+                    .client()
-+                    .checkpoint_prepare(mode)
-+                    .await
-+                    .map_err(|error| utility_status("checkpoint_prepare", error))?
-+                {
-+                    return Err(Status::failed_precondition(refusal));
-+                }
-+                (state, error) = self.checkpoint_state().await?;
-+            }
-+            CheckpointState::Restoring | CheckpointState::Failed => {
-+                return Err(checkpoint_precondition(state, error));
-+            }
-+            CheckpointState::Preparing | CheckpointState::Prepared => {}
-+        }
-+        Ok(checkpoint_state_response(state, error))
++        checkpoint_transition(
++            checkpoint::prepare(self.client(), mode).await.map_err(checkpoint_call_status)?,
++        )
 +    }
 +
 +    async fn checkpoint_restore(
@@ -228,21 +172,9 @@ index d522c7cc8e..62ee43fc5b 100644
 +    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
 +        self.require_sleep_mode()?;
 +        let _guard = self.rl_lock.lock().await;
-+        let (mut state, mut error) = self.checkpoint_state().await?;
-+        match state {
-+            CheckpointState::Preparing | CheckpointState::Failed => {
-+                return Err(checkpoint_precondition(state, error));
-+            }
-+            CheckpointState::Prepared => {
-+                self.client()
-+                    .checkpoint_restore()
-+                    .await
-+                    .map_err(|error| utility_status("checkpoint_restore", error))?;
-+                (state, error) = self.checkpoint_state().await?;
-+            }
-+            CheckpointState::Running | CheckpointState::Restoring => {}
-+        }
-+        Ok(checkpoint_state_response(state, error))
++        checkpoint_transition(
++            checkpoint::restore(self.client()).await.map_err(checkpoint_call_status)?,
++        )
 +    }
 +
 +    async fn get_checkpoint_state(
@@ -250,7 +182,8 @@ index d522c7cc8e..62ee43fc5b 100644
 +        _request: Request<pb::GetCheckpointStateRequest>,
 +    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
 +        self.require_sleep_mode()?;
-+        let (state, error) = self.checkpoint_state().await?;
++        let (state, error) =
++            checkpoint::state(self.client()).await.map_err(checkpoint_call_status)?;
 +        Ok(checkpoint_state_response(state, error))
 +    }
 +
@@ -258,12 +191,12 @@ index d522c7cc8e..62ee43fc5b 100644
          &self,
          request: Request<pb::InitWeightTransferEngineRequest>,
 diff --git a/rust/src/server/src/grpc/tests.rs b/rust/src/server/src/grpc/tests.rs
-index 8bef76463d..f2eb3ffe68 100644
+index 2643665f23..5353f7c48f 100644
 --- a/rust/src/server/src/grpc/tests.rs
 +++ b/rust/src/server/src/grpc/tests.rs
-@@ -2965,3 +2965,309 @@ async fn grpc_pause_withdraws_readiness_but_not_liveness() {
- 
-     server_task.abort();
+@@ -3706,3 +3706,309 @@ async fn render_grpc_server_shutdown_ends_health_watches() {
+         .expect("server result");
+     drop(client);
  }
 +
 +/// What [`serve_checkpoint_engine`] starts as and how it answers a prepare.

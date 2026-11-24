@@ -10,5 +10,5 @@ needed. They are copied unchanged from:
 | `podresources/api.proto` | `pkg/apis/podresources/v1/api.proto` in [kubernetes/kubelet](https://github.com/kubernetes/kubelet) | `v0.35.0` |
 | `timeslice/snapshot_agent.proto` | `pkg/snapshot-agent/api/v1alpha1/snapshot_agent.proto` in [llm-d-incubation/llm-d-rl-time-slicing](https://github.com/llm-d-incubation/llm-d-rl-time-slicing) | `8757acb1` |
 
-`vllm/control.proto` is upstream's at `a2bcb565` plus the checkpoint RPCs of
+`vllm/control.proto` is upstream's at `f2f9edca` plus the checkpoint RPCs of
 [`patches/vllm/0006`](../../patches/vllm).

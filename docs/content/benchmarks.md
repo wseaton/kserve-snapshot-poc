@@ -6,7 +6,8 @@ weight = 30
 ## Setup
 
 Unless noted: 8x H200 nodes on CKS, driver 580.126.09 (CUDA 13.0), ConnectX-7 InfiniBand, vLLM
-nightly `a2bcb565` with [`patches/vllm`](https://github.com/wseaton/snapshotd/tree/main/patches/vllm),
+nightly `a2bcb565` with the patches as they were then
+([`checkpoint-patchset-with-pd`](https://github.com/wseaton/vllm/tree/checkpoint-patchset-with-pd)),
 CRIU 4.2.1 and cuInterpose from Dynamo Snapshot `bc9d216`. "cuInterpose" runs use the CUDA 13.1
 compat `libcuda`. A run passes when the restored server returns the source's greedy completion.
 Scripts: [`experiments/`](https://github.com/wseaton/snapshotd/tree/main/experiments). Bench-pod
@@ -126,7 +127,7 @@ Qwen3-8B, TP=1:
 ## `snapshotd` against Dynamo's CUDA path
 
 Qwen3-8B, one node, each rank restored onto the next rank's GPU. Mean of two runs. "No
-cuInterpose" is `patches/vllm/0003` with custom and FlashInfer all-reduce off and
+cuInterpose" is `patches/vllm/0004` with custom and FlashInfer all-reduce off and
 `NCCL_CUMEM_ENABLE=0`. The Dynamo helper runs one process per PID and action;
 `snapshotd` calls the driver for every PID in parallel.
 
@@ -164,7 +165,7 @@ stay in one pod.
 
 ## CPU KV offload
 
-`--kv-offloading-size N` keeps an N GiB region in `/dev/shm`. "Released" is `patches/vllm/0005`.
+`--kv-offloading-size N` keeps an N GiB region in `/dev/shm`. "Released" is [the CPU offload patch](https://github.com/wseaton/vllm/commit/47906b39d1), not yet ported to the current base.
 TP=2, no cuInterpose, one run each.
 
 | Offload | Region | Prepare | CRIU dump | Image | Restore total | Cold boot |
