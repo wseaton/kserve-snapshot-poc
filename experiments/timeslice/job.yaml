@@ -1,0 +1,56 @@
+# One job that takes turns on a GPU. The mount under /var/run/nvidia-container-devices is how
+# NVIDIA's container runtime is asked for a device without a resource request: it lets the pod
+# open the GPU the `holder` pod was given, which stands in for a shared DRA claim on a cluster
+# without a DRA driver.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: timeslice-__JOB__
+  labels:
+    app: timeslice-job
+    timeslice.io/job-id: __JOB__
+    timeslice.io/group: __GROUP__
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: __NODE__
+  containers:
+    - name: main
+      image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint@sha256:b58cb17af4d87569ba5614bff26fb6c8a8d826f56ca05cfc056fc3d106fc4ee9
+      command:
+        - sh
+        - -c
+        - >-
+          pip install -q "https://github.com/llm-d-incubation/llm-d-rl-time-slicing/archive/8757acba5a418c350c9c16ff0cb98530381d3d60.tar.gz#subdirectory=pkg/client/python"
+          && exec python3 /job/job.py
+      env:
+        - name: JOB_ID
+          value: __JOB__
+        - name: GROUP_ID
+          value: __GROUP__
+        - name: ORCHESTRATOR
+          value: timeslice-timesliceorchestrator.timeslice-system:50051
+        - name: CUDA_VISIBLE_DEVICES
+          value: __GPU__
+        - name: GIB
+          value: "__GIB__"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 16Gi
+        limits:
+          memory: 160Gi
+      volumeMounts:
+        - name: job
+          mountPath: /job
+        - name: gpu
+          mountPath: /var/run/nvidia-container-devices/__GPU__
+  volumes:
+    - name: gpu
+      hostPath:
+        path: /dev/null
+    - name: job
+      configMap:
+        name: timeslice-job

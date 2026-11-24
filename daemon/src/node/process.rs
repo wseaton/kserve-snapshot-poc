@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+
+use crate::{cuda, cuinterpose};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
@@ -34,26 +36,16 @@ impl HostPid {
     }
 
     pub fn child(self, pid: PodPid) -> Result<HostPid> {
-        let tasks = fs::read_dir(format!("/proc/{self}/task"))
-            .with_context(|| format!("process {self} is gone"))?;
-        for task in tasks.flatten() {
-            let Ok(children) = fs::read_to_string(task.path().join("children")) else {
-                continue;
-            };
-            for child in children.split_ascii_whitespace() {
-                let Ok(status) = fs::read_to_string(format!("/proc/{child}/status")) else {
-                    continue;
-                };
-                let inner = status
-                    .lines()
-                    .find_map(|line| line.strip_prefix("NSpid:"))
-                    .and_then(|pids| pids.split_ascii_whitespace().last());
-                if inner == Some(pid.to_string().as_str()) {
-                    return child.parse().map(HostPid).context("child PID");
-                }
-            }
-        }
-        bail!("process {self} has no child that is {pid} in its PID namespace")
+        cuda::children(self.0)
+            .into_iter()
+            .find(|&child| {
+                cuinterpose::namespace_pid(child)
+                    .is_ok_and(|inner| i64::from(inner) == i64::from(pid.0))
+            })
+            .map(HostPid)
+            .with_context(|| {
+                format!("process {self} has no child that is {pid} in its PID namespace")
+            })
     }
 
     /// `None` on a node without SELinux.

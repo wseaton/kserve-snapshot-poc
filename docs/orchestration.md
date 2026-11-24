@@ -295,6 +295,54 @@ about 2.7 Gbit/s here. A 2000 token prompt took 0.72 s through prefill and decod
 on one server, all of it the transfer, so these runs say nothing about what disaggregation costs
 or saves.
 
+## Time-slicing
+
+The same daemon can be the node agent of
+[llm-d-rl-time-slicing](https://github.com/llm-d-incubation/llm-d-rl-time-slicing), whose
+orchestrator lets several jobs take turns on a GPU. With `SNAPSHOTD_TIMESLICE_LISTEN` set
+([`components/timeslice`](../daemon/deploy/components/timeslice)) it serves that project's
+`SnapshotAgentService`, and the project's orchestrator and client libraries work against it
+unchanged. Here a snapshot parks a job where it is: its processes stay alive with their device
+memory in host memory, and nothing goes to the node's store.
+
+```mermaid
+sequenceDiagram
+  participant J as job B (timeslice client)
+  participant O as TimeSlice Orchestrator
+  participant D as snapshotd, on the jobs' node
+  J->>O: Acquire(job B, group)
+  O->>D: Status
+  D-->>O: job A running, job B saved
+  O->>D: Snapshot(job A)
+  D->>D: CUDA lock and checkpoint, every process of A's pods at once
+  O->>D: GetOperation, until complete
+  O->>D: Restore(job B)
+  D->>D: CUDA restore and unlock
+  O-->>J: granted
+```
+
+| Call | What the daemon does |
+| --- | --- |
+| `Status` | Lists every job with a pod on the node, by the `timeslice.io/job-id` label, with its state and each GPU's memory. A job is running while one of its processes holds device memory, saved while they are checkpointed, idle otherwise. Nothing is remembered: the driver and NVML are asked each time, so a restarted daemon answers the same |
+| `Snapshot`, `Restore` | Start an operation on the job's CUDA processes, found through the container runtime, and answer with its id. The `cuda` backend, which is what the orchestrator asks for; the others are refused |
+| `GetOperation` | Pending, complete or failed, and how long it took |
+| `grpc.health.v1.Health` | Serving, which the project's Python agent client checks before it calls |
+
+The orchestrator dials an agent at `<node name>:9001`. Where node names do not resolve, a headless
+Service of that name in the orchestrator's namespace does it;
+[`experiments/timeslice/run.sh`](../experiments/timeslice/run.sh) makes one.
+
+Run on one H200 with the project's orchestrator as shipped:
+
+| Jobs | Result |
+| --- | --- |
+| Two stand-ins that each hold 72 GiB, so both cannot be on the 141 GiB GPU | 8 handoffs, every one with the job's memory intact. A snapshot took 25.0 s and a restore 10.1 s on average |
+| The project's own example: two verl RL jobs (GRPO on DeepSeek-R1-Distill-Qwen-1.5B, one on math and one on code), their trainers sharing the GPU and each with a rollout engine on another node | Both trainers finished a training step, in 556 s and 874 s, through 9 handoffs with none failed. A snapshot took 6.9 s and a restore 3.9 s on average |
+
+The example ran as shipped except for the shared GPU: the cluster has no DRA driver, so the two
+trainer pods open the GPU through the container runtime's device mount instead of a shared
+`ResourceClaim`. `experiments/timeslice/run.sh verl` makes that change and no other.
+
 ## A limit on tensor parallel below a whole node
 
 A server whose workers share GPU memory (tensor parallel above 1 with vLLM's defaults, which is why

@@ -1,0 +1,161 @@
+---
+# Source: timesliceorchestrator/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: timeslice-timesliceorchestrator
+  namespace: timeslice-system
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+
+---
+# Source: timesliceorchestrator/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: timeslice-timesliceorchestrator
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Source: timesliceorchestrator/templates/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: timeslice-timesliceorchestrator
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: timeslice-timesliceorchestrator
+subjects:
+  - kind: ServiceAccount
+    name: timeslice-timesliceorchestrator
+    namespace: timeslice-system
+
+---
+# Source: timesliceorchestrator/templates/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: timeslice-timesliceorchestrator-configmap
+  namespace: timeslice-system
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+# Source: timesliceorchestrator/templates/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: timeslice-timesliceorchestrator-configmap
+  namespace: timeslice-system
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: timeslice-timesliceorchestrator-configmap
+subjects:
+  - kind: ServiceAccount
+    name: timeslice-timesliceorchestrator
+    namespace: timeslice-system
+
+---
+# Source: timesliceorchestrator/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: timeslice-timesliceorchestrator
+  namespace: timeslice-system
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: 50051
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+    - port: 8080
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+
+---
+# Source: timesliceorchestrator/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: timeslice-timesliceorchestrator
+  namespace: timeslice-system
+  labels:
+    helm.sh/chart: timesliceorchestrator-0.1.0
+    app.kubernetes.io/name: timesliceorchestrator
+    app.kubernetes.io/instance: timeslice
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: timesliceorchestrator
+      app.kubernetes.io/instance: timeslice
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: timesliceorchestrator
+        app.kubernetes.io/instance: timeslice
+    spec:
+      serviceAccountName: timeslice-timesliceorchestrator
+      containers:
+        - name: timesliceorchestrator
+          image: "ghcr.io/llm-d-incubation/llm-d-rl-time-slicing/timesliceorchestrator:latest"
+          imagePullPolicy: Always
+          args:
+            - "--snapshot-agent-port=9001"
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            {}

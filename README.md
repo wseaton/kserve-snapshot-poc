@@ -65,6 +65,7 @@ A whole run, with the transfer rate and each phase, as the bench harness draws i
 | Why a Rust daemon, its privilege model, and the experiments behind it | [docs/design.md](docs/design.md) |
 | What KServe has to lifecycle, with diagrams, and where another engine plugs in | [docs/architecture.md](docs/architecture.md) |
 | The node daemon: a pod-level diagram, how to run it on kind, and what a control plane still has to add | [docs/orchestration.md](docs/orchestration.md) |
+| The daemon as the node agent of llm-d-rl-time-slicing: two RL jobs taking turns on a GPU | [docs/orchestration.md](docs/orchestration.md#time-slicing) |
 | How to deploy either path, and the RDMA transfer settings | [deploy/README.md](deploy/README.md) |
 | What `snapshotd` does today and how to build it | [daemon/README.md](daemon/README.md) |
 | What each upstream patch changes | [patches/README.md](patches/README.md) |
@@ -89,7 +90,7 @@ DeepSeek (74 GB), 33.0 s for gpt-oss-120b (106 GB).
 | --- | --- |
 | [`daemon/`](daemon) | `snapshotd`: CUDA checkpoint and restore through the driver API with GPU remap, the cuInterpose integration, image streaming and the RDMA transfer. |
 | [`patches/`](patches) | Changes to vLLM, ModelExpress and Dynamo Snapshot as patch files against pinned commits ([`upstream.tsv`](upstream.tsv)). `./checkout.sh vllm` applies a project's patches to a clean clone in `src/`. |
-| [`experiments/`](experiments) | Pod specs and scripts for every measurement: `in-place/`, `criu/` and `bench/`, which holds the two-node harness and the trace renderer. |
+| [`experiments/`](experiments) | Pod specs and scripts for every measurement: `in-place/`, `criu/`, `bench/`, which holds the two-node harness and the trace renderer, `timeslice/` and `weights-file/`. |
 | [`deploy/`](deploy) | Kustomize for both paths: Dynamo Snapshot through KServe, and the `snapshotd` bench pods with the RDMA image transfer and ModelExpress weights as components. |
 | [`docs/`](docs) | The documents above and their images. |
 | [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot) | Submodule. The KServe integration on Dynamo Snapshot's agent: config layer, entrypoint, admission webhook and controller, smoke tests. |

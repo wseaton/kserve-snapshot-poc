@@ -1,0 +1,322 @@
+syntax = "proto3";
+
+package snapshot_agent.v1alpha1;
+
+option go_package = "github.com/llm-d-incubation/llm-d-rl-time-slicing/pkg/snapshot-agent/api/v1alpha1;v1alpha1";
+
+// SnapshotAgentService provides APIs for managing accelerator snapshots.
+service SnapshotAgentService {
+  // Snapshot triggers an asynchronous snapshot of the accelerator context for a job.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Restore triggers an asynchronous restoration of the accelerator context for a job.
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+
+  // GetOperation polls the status of a long-running snapshot or restore operation.
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+
+  // Status returns the current state of jobs and accelerators on the node.
+  rpc Status(StatusRequest) returns (StatusResponse);
+
+  // WorkloadChannel is a long-lived bidirectional stream through which an
+  // application-aware workload registers itself with the agent and receives
+  // snapshot/restore commands. Workloads that embed their engine in-process
+  // (no HTTP server) use this instead of AppEndpointConfig. The first message
+  // from the workload must be a RegisterWorkload; subsequent messages are
+  // CommandResults acknowledging AgentCommands.
+  //
+  // Registration is node-scoped: the workload registers with the agent on
+  // its own node, and Snapshot/Restore requests carrying an AppChannelConfig
+  // must be sent to that same agent.
+  rpc WorkloadChannel(stream WorkloadMessage) returns (stream AgentCommand);
+}
+
+enum Backend {
+  option deprecated = true;
+  BACKEND_UNSPECIFIED = 0;
+  BACKEND_CUDA = 1;
+}
+
+// ProcessTarget specifies a set of process IDs (PIDs) to target.
+// This is optional in some deployment modes (like 'k8s' where PIDs can be discovered automatically),
+// but required in others (like 'standalone').
+// In the future, we may add other target types (e.g., MemoryTarget)
+// to support different backends.
+message ProcessTarget {
+  repeated int32 pids = 1;
+}
+
+message CudaBackendConfig {
+  ProcessTarget explicit_target = 1;
+}
+
+// Configuration for the Direct Memory (process-level) backend.
+//
+// Experimental: this backend is driven by GPU-CR, which is itself
+// experimental — expect deployment requirements and operational caveats.
+// It is disabled by default: requests selecting it fail with
+// FAILED_PRECONDITION unless the agent runs with
+// --feature-gates=DirectMemoryBackend=true (or the FEATURE_GATES env var).
+message DirectMemoryBackendConfig {
+  // The target processes to checkpoint/restore.
+  ProcessTarget explicit_target = 1;
+}
+
+// Configuration for the TPU (libtpu) backend. Checkpoint/restore of TPU state
+// for running processes via libtpu's control-pipe protocol (gVisor's
+// tpucheckpoint CLI); targets must run with LIBTPU_CHECKPOINTING_ENABLED=true.
+message TpuBackendConfig {
+  // The target processes to checkpoint/restore. Optional in 'k8s' deployment
+  // mode (PIDs are discovered from the job's pods), required in 'standalone'.
+  // Restore is a slice-wide rendezvous inside libtpu: all of a job's TPU
+  // processes must be restored in one request, and a restore must never be
+  // retried.
+  ProcessTarget explicit_target = 1;
+}
+
+// App identifies the HTTP API dialect of an application-aware workload.
+// It grows only when a new HTTP dialect ships; workloads reached through a
+// registered workload channel never need an entry here.
+enum App {
+  APP_UNSPECIFIED = 0;
+  // vLLM's dev-mode sleep API: POST /sleep?level=N, POST /wake_up?tags=...
+  // Requires VLLM_SERVER_DEV_MODE=1 and --enable-sleep-mode on the server.
+  APP_VLLM = 1;
+  // SGLang's memory API: POST /release_memory_occupation and
+  // POST /resume_memory_occupation (JSON body). Requires
+  // --enable-memory-saver; whether suspended weights are preserved is fixed
+  // at server launch by --enable-weights-cpu-backup (see SuspendMode).
+  APP_SGLANG = 2;
+}
+
+// SuspendMode states what happens to the workload's durable state (model
+// weights, optimizer state) while suspended. Region-level engine specifics
+// (e.g. KV cache is discarded by engines in either mode) are handled by the
+// application dialect.
+enum SuspendMode {
+  // Use the application's default behavior.
+  SUSPEND_MODE_UNSPECIFIED = 0;
+  // State is preserved in host memory; Restore copies it back.
+  SUSPEND_MODE_OFFLOAD = 1;
+  // State is dropped; the application must re-provision it after Restore
+  // (e.g. RL weight sync). Unsupported by workloads that cannot reconstruct
+  // state, such as trainers.
+  SUSPEND_MODE_DISCARD = 2;
+}
+
+// AppEndpointConfig suspends/resumes an application-aware workload through
+// its HTTP API. Callers using this config supply the endpoints and therefore
+// know which application they deployed; `app` selects the HTTP dialect.
+message AppEndpointConfig {
+  App app = 1;
+  // HTTP endpoint(s) of the application server(s), e.g. "http://localhost:8000".
+  repeated string endpoints = 2;
+  // See SuspendMode. For APP_SGLANG this is advisory: the effective mode is
+  // fixed by the server's launch flags.
+  SuspendMode mode = 3;
+  // Region tags, e.g. "weights", "kv_cache". Free-form strings validated by
+  // the application; if empty, the application's full default region set is
+  // used. On Snapshot, tags select what to suspend (where the application
+  // supports it); on Restore, what to bring back.
+  repeated string tags = 4;
+}
+
+// AppChannelConfig suspends/resumes an application-aware workload through
+// its registered workload channel (see WorkloadChannel). The workload is
+// addressed by the request's job_id; callers need no endpoints and no
+// knowledge of which application is running.
+message AppChannelConfig {
+  // See SuspendMode. If unspecified, the workload's registered default mode
+  // is used (OFFLOAD if the workload did not declare one).
+  SuspendMode mode = 1;
+  // Region tags; see AppEndpointConfig.tags.
+  repeated string tags = 2;
+}
+
+// MemoryRegion identifies one device-memory range owned by a process.
+message MemoryRegion {
+  // PID of the process that owns the region.
+  int32 pid = 1;
+  // Device virtual address of the start of the region.
+  uint64 address = 2;
+  // Length of the region in bytes.
+  uint64 size_bytes = 3;
+}
+
+// Configuration for the memory-regions backend: selective checkpoint and
+// restore of specific device memory ranges of a running process (GPU-CR
+// cr_client with a `-s addr:size,...` spec). Regions are required on both
+// Snapshot and Restore; the agent performs no discovery for this backend.
+message MemoryRegionsBackendConfig {
+  repeated MemoryRegion regions = 1;
+  // snapshot_name names the snapshot slot the regions are saved to
+  // (Snapshot) or loaded from (Restore). Distinct names let multiple
+  // snapshots of the same process coexist and be swapped on demand.
+  // If empty, the request's job_id is used. Note this is deliberately NOT
+  // the request's `group`: group identifies a set of related jobs for the
+  // orchestrator and does not name agent-side storage.
+  string snapshot_name = 2;
+}
+
+message BackendConfig {
+  oneof backend {
+    CudaBackendConfig cuda = 1;
+    AppEndpointConfig app_endpoint = 2;
+    AppChannelConfig app_channel = 3;
+    // Experimental: disabled by default behind the DirectMemoryBackend
+    // feature gate; see DirectMemoryBackendConfig.
+    DirectMemoryBackendConfig direct_memory = 4;
+    MemoryRegionsBackendConfig memory_regions = 5;
+    TpuBackendConfig tpu = 6;
+  }
+}
+
+// WorkloadCapabilities is declared by a workload at registration and lets the
+// agent validate and resolve snapshot parameters without knowing the
+// application.
+message WorkloadCapabilities {
+  // Suspend modes the workload can execute. If empty, no validation is
+  // performed. A trainer that cannot reconstruct dropped state would
+  // advertise only SUSPEND_MODE_OFFLOAD.
+  repeated SuspendMode supported_modes = 1;
+  // Mode used when a snapshot request leaves the mode unspecified. If unset,
+  // SUSPEND_MODE_OFFLOAD is used.
+  SuspendMode default_mode = 2;
+  // Region tags the workload understands, e.g. "weights", "kv_cache".
+  repeated string tags = 3;
+}
+
+// RegisterWorkload is the first message a workload sends on a
+// WorkloadChannel stream. Re-registering a job_id replaces the previous
+// stream.
+message RegisterWorkload {
+  // job_id identifies the job this workload belongs to and must be unique
+  // per agent (jobs are node-scoped; group does not namespace job IDs).
+  // Snapshot/Restore requests carrying an AppChannelConfig are routed to the
+  // stream registered under the same job_id.
+  string job_id = 1;
+  // group is an optional identifier for a set of related jobs.
+  string group = 2;
+  WorkloadCapabilities capabilities = 3;
+}
+
+// CommandResult acknowledges completion of an AgentCommand.
+message CommandResult {
+  string command_id = 1;
+  bool ok = 2;
+  // error is set when ok is false.
+  string error = 3;
+}
+
+message WorkloadMessage {
+  oneof message {
+    RegisterWorkload register = 1;
+    CommandResult result = 2;
+  }
+}
+
+// SnapshotCommand instructs the workload to suspend. The mode is fully
+// resolved by the agent (never SUSPEND_MODE_UNSPECIFIED on the wire).
+message SnapshotCommand {
+  SuspendMode mode = 1;
+  repeated string tags = 2;
+}
+
+// RestoreCommand instructs the workload to resume.
+message RestoreCommand {
+  repeated string tags = 1;
+}
+
+// AgentCommand is pushed by the agent to a registered workload. Each command
+// carries a unique command_id and is sent at most once; the workload replies
+// with a CommandResult bearing the same command_id.
+message AgentCommand {
+  string command_id = 1;
+  oneof command {
+    SnapshotCommand snapshot = 2;
+    RestoreCommand restore = 3;
+  }
+}
+
+message SnapshotRequest {
+  // job_id is the unique identifier for the job, unique per agent
+  // (group does not namespace job IDs).
+  string job_id = 1;
+  // group is an optional identifier for a set of related jobs.
+  string group = 2;
+  // Deprecated: Use backend_config instead.
+  Backend backend = 3 [deprecated = true];
+  // backend_config specifies the backend-specific configuration for the snapshot.
+  // If omitted, the default backend (CUDA) will be used with default discovery
+  // based on the deployment mode.
+  BackendConfig backend_config = 4;
+}
+
+message SnapshotResponse {
+  string operation_id = 1;
+}
+
+message RestoreRequest {
+  // job_id is the unique identifier for the job, unique per agent
+  // (group does not namespace job IDs).
+  string job_id = 1;
+  // group is an optional identifier for a set of related jobs.
+  string group = 2;
+  // Deprecated: Use backend_config instead.
+  Backend backend = 3 [deprecated = true];
+  // backend_config specifies the backend-specific configuration for the restoration.
+  BackendConfig backend_config = 4;
+}
+
+message RestoreResponse {
+  string operation_id = 1;
+}
+
+message GetOperationRequest {
+  string operation_id = 1;
+}
+
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED = 0;
+  OPERATION_STATUS_PENDING = 1;
+  OPERATION_STATUS_COMPLETE = 2;
+  OPERATION_STATUS_FAILED = 3;
+}
+
+message GetOperationResponse {
+  OperationStatus status = 1;
+  // storage_bytes is set on COMPLETE
+  optional int64 storage_bytes = 2;
+  // snapshot_device_bytes is set on COMPLETE
+  optional int64 snapshot_device_bytes = 3;
+  int64 elapsed_ms = 4;
+  // error is set on FAILED
+  optional string error = 5;
+}
+
+message StatusRequest {}
+
+enum JobState {
+    JOB_STATE_UNSPECIFIED = 0;
+    JOB_STATE_IDLE = 1;
+    JOB_STATE_RUNNING = 2;
+    JOB_STATE_TRANSITIONING = 3;
+    JOB_STATE_SAVED = 4;
+    JOB_STATE_FAULTED = 5;
+}
+
+message JobStatus {
+    string job_id = 1;
+    JobState state = 2;
+}
+
+message AcceleratorStatus {
+    string id = 1;
+    int64 memory_used_bytes = 2;
+    int64 memory_total_bytes = 3;
+}
+
+message StatusResponse {
+  repeated JobStatus job_statuses = 1;
+  repeated AcceleratorStatus accelerator_statuses = 2;
+}

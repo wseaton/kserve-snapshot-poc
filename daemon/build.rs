@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("vllm", "control.proto", true),
         ("cri", "api.proto", false),
         ("podresources", "api.proto", false),
+        ("timeslice", "snapshot_agent.proto", true),
     ] {
         let include = root.join(directory);
         let proto = include.join(file);

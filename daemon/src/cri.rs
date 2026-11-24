@@ -106,10 +106,8 @@ impl Runtime {
             .with_context(|| format!("pod address {ip:?} of {}", sandbox.name))
     }
 
-    /// The host PID of the running container called `container` in
-    /// `sandbox`, once it has one.
-    pub async fn pid(&mut self, sandbox: &Sandbox, container: &str) -> Result<Option<i32>> {
-        let containers = self
+    async fn running(&mut self, sandbox: &Sandbox) -> Result<Vec<pb::Container>> {
+        Ok(self
             .client
             .list_containers(pb::ListContainersRequest {
                 filter: Some(pb::ContainerFilter {
@@ -123,24 +121,43 @@ impl Runtime {
             .await
             .context("ListContainers")?
             .into_inner()
-            .containers;
-        let Some(found) = containers.into_iter().find(|c| {
-            c.labels
-                .get(CONTAINER_NAME)
-                .is_some_and(|name| name == container)
-        }) else {
-            return Ok(None);
-        };
+            .containers)
+    }
+
+    async fn init(&mut self, container: pb::Container) -> Result<i32> {
         let status = self
             .client
             .container_status(pb::ContainerStatusRequest {
-                container_id: found.id,
+                container_id: container.id,
                 verbose: true,
             })
             .await
             .context("ContainerStatus")?
             .into_inner();
-        container_pid(&status.info).map(Some)
+        container_pid(&status.info)
+    }
+
+    /// The host PID of the running container called `container` in
+    /// `sandbox`, once it has one.
+    pub async fn pid(&mut self, sandbox: &Sandbox, container: &str) -> Result<Option<i32>> {
+        let found = self.running(sandbox).await?.into_iter().find(|c| {
+            c.labels
+                .get(CONTAINER_NAME)
+                .is_some_and(|name| name == container)
+        });
+        match found {
+            Some(found) => self.init(found).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The host PID of every running container in `sandbox`.
+    pub async fn pids(&mut self, sandbox: &Sandbox) -> Result<Vec<i32>> {
+        let mut pids = Vec::new();
+        for container in self.running(sandbox).await? {
+            pids.push(self.init(container).await?);
+        }
+        Ok(pids)
     }
 }
 

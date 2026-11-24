@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use procfs::process::Process;
 use prost::Message;
 use rustix::mm::{Advice, MapFlags, ProtFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
@@ -164,32 +165,24 @@ impl AsMut<[u8]> for HugeRegion {
 
 /// Share of `[address, address + len)` backed by transparent huge pages.
 pub fn huge_page_fraction(ranges: &[(usize, usize)]) -> f64 {
-    let Ok(smaps) = fs::read_to_string("/proc/self/smaps") else {
+    let Ok(smaps) = Process::myself().and_then(|process| process.smaps()) else {
         return 0.0;
     };
     let total: usize = ranges.iter().map(|(_, len)| len).sum();
-    let mut inside = false;
-    let mut huge_kib = 0u64;
-    for line in smaps.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let Some(first) = fields.next() else { continue };
-        if let Some((start, end)) = first.split_once('-')
-            && let (Ok(start), Ok(end)) = (
-                usize::from_str_radix(start, 16),
-                usize::from_str_radix(end, 16),
-            )
-        {
-            inside = ranges
-                .iter()
-                .any(|&(address, len)| start < address + len && end > address);
-        } else if inside && first == "AnonHugePages:" {
-            huge_kib += fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        }
-    }
+    let overlaps = |start: u64, end: u64| {
+        ranges
+            .iter()
+            .any(|&(address, len)| start < (address + len) as u64 && end > address as u64)
+    };
+    let huge: u64 = smaps
+        .iter()
+        .filter(|map| overlaps(map.address.0, map.address.1))
+        .filter_map(|map| map.extension.map.get("AnonHugePages"))
+        .sum();
     if total == 0 {
         0.0
     } else {
-        (huge_kib * 1024) as f64 / total as f64
+        huge as f64 / total as f64
     }
 }
 

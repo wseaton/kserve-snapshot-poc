@@ -16,6 +16,7 @@ mod node;
 mod peer;
 mod podresources;
 mod store;
+mod timeslice;
 #[cfg(any(test, feature = "nixl"))]
 mod topology;
 #[cfg(feature = "nixl")]
@@ -53,7 +54,7 @@ enum Command {
     /// Mount a directory into a container's mount namespace.
     Inject(inject::Args),
     /// Checkpoint and restore the opted-in pods of this node.
-    Node(node::Args),
+    Node(Box<node::Args>),
     /// cuInterpose shared-memory tracking.
     #[command(subcommand)]
     Cuinterpose(CuinterposeCommand),
@@ -210,7 +211,7 @@ impl Command {
     fn run(self) -> Result<()> {
         match self {
             Self::Inject(args) => inject::run(&args),
-            Self::Node(args) => node::run(args),
+            Self::Node(args) => node::run(*args),
             Self::Cuda(command) => cuda_command(command),
             Self::Cuinterpose(command) => cuinterpose_command(command),
             Self::Image(ImageCommand::Hold {

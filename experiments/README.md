@@ -99,3 +99,41 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
   a phone: capture, transfer, restore and the cold boot beside them. `lifecycle.sh` writes it as
   `lifecycle.html`.
 - Notes and results: [cross-node.md](../docs/cross-node.md), [memory-capture.md](../docs/memory-capture.md).
+
+## `timeslice/`: llm-d-rl-time-slicing's orchestrator, with snapshotd as its node agent
+
+Results and how the calls map are in
+[docs/orchestration.md](../docs/orchestration.md#time-slicing).
+
+- `run.sh up|jobs|verl|down`: installs the project's TimeSlice Orchestrator, points it at the
+  daemon on one node, and runs jobs that take turns on one of that node's GPUs. The daemon has to
+  serve the agent API (`SNAPSHOTD_TIMESLICE_LISTEN`).
+- `orchestrator.yaml`: the project's orchestrator chart, rendered at commit `8757acb`.
+- `job.py`, `job.yaml`: a stand-in job. Each burst adds to a tensor that fills most of the GPU
+  and checks that every earlier burst's additions are still there.
+- `run.sh verl` fetches the project's own example, two verl RL jobs whose trainers share the GPU,
+  and changes only how the trainer pods get at it.
+
+## `weights-file/`: weights kept in files beside the checkpoint
+
+vLLM's sleep-mode allocator already owns the weights' device memory and can copy it to host
+memory and back. These runs point that copy at files, so the weights are in neither the process
+nor the CRIU image, and compare it with reloading them through the model loader. Qwen3-8B
+(15.9 GiB of weights) at TP=1 on one H200, `restore-bench.sh` in one pod:
+
+| Weights at restore | Weights back on the GPU | Restore, total | CRIU image |
+| --- | --- | --- | --- |
+| Released at prepare, reloaded by vLLM (`RELEASE_WEIGHTS=1`) | 2.80 s | 5.57 s | 4.6 GB |
+| Kept on the GPU, so in the process image (`RELEASE_WEIGHTS=0`) | in the image | 10.3 s | 20.5 GB |
+| In files, read back through a pinned buffer by 8 threads | 1.21 s | 3.83 s | 4.6 GB |
+
+- `vllm-overlay.diff`: the change to vLLM, against the files in the `vllm-checkpoint` image. Pack
+  the two patched files as `OVERLAY` and set `VLLM_CHECKPOINT_WEIGHTS_DIR`.
+- `pin.py <file> <GiB>`: what a copy between a GPU and a shared file mapping costs, pageable and
+  pinned. 16 GiB from a pinned tmpfs file reached the GPU in 0.31 s, after 0.94 s to pin it; a
+  mapping of a file on disk cannot be pinned and took 2.8 s.
+- `gpucr-micro.sh`, `hold.py`: the same question put to GPU-CR, the engine llm-d-rl-time-slicing
+  carries: 16 GiB back on the GPU in 0.43 s from tmpfs. `MODE=gpucr` in `restore-bench.sh` runs
+  GPU-CR around the CUDA checkpoint; its dump covers memory from `cudaMalloc` only, which is
+  0.5 GiB of this server's 17.9.
+

@@ -26,7 +26,9 @@ kube = { version = "5", default-features = false, features = ["client", "openssl
 libc = "0.2"
 libloading = "0.9"
 nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
+nvml-wrapper = "0.13"
 openssl = "0.10"
+procfs = { version = "0.18", default-features = false }
 prost = "0.14"
 rustix = { version = "1", features = ["fs", "mm", "mount", "net", "pipe", "process", "thread"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,11 +37,12 @@ snapshotd-shim = { path = "shim" }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-openssl = { version = "0.6", optional = true }
 tonic = "0.14"
+tonic-health = "0.14"
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = "1.29"
+uuid = { version = "1.29", features = ["v4"] }
 walkdir = { version = "2", optional = true }
 
 [dev-dependencies]

@@ -10,8 +10,8 @@
 //! restore:    restore all (GPU pairs) ─► unlock all
 //! ```
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -21,10 +21,13 @@ use cudarc::driver::sys::{
     CUuuid,
 };
 use libloading::Library;
+use nvml_wrapper::Nvml;
+use procfs::process::Process;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 const LIBCUDA: &str = "libcuda.so.1";
+const NVML: &str = "libnvidia-ml.so.1";
 
 type Init = unsafe extern "C" fn(u32) -> CUresult;
 type GetState = unsafe extern "C" fn(i32, *mut CUprocessState) -> CUresult;
@@ -33,6 +36,15 @@ type Lock = unsafe extern "C" fn(i32, *mut CUcheckpointLockArgs) -> CUresult;
 type Checkpoint = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
 type Restore = unsafe extern "C" fn(i32, *mut CUcheckpointRestoreArgs) -> CUresult;
 type Unlock = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
+
+/// Where a process stands in the driver's checkpoint cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Running,
+    Locked,
+    Checkpointed,
+    Failed,
+}
 
 pub struct Driver {
     get_state: GetState,
@@ -81,6 +93,15 @@ impl Driver {
             (self.get_state)(pid, &mut state)
         })?;
         Ok(state)
+    }
+
+    pub fn phase(&self, pid: i32) -> Result<Phase> {
+        Ok(match self.state(pid)? {
+            CUprocessState::CU_PROCESS_STATE_RUNNING => Phase::Running,
+            CUprocessState::CU_PROCESS_STATE_LOCKED => Phase::Locked,
+            CUprocessState::CU_PROCESS_STATE_CHECKPOINTED => Phase::Checkpointed,
+            _ => Phase::Failed,
+        })
     }
 
     pub fn is_cuda_process(&self, pid: i32) -> bool {
@@ -182,31 +203,25 @@ pub struct Gpu {
     pub minor: u32,
 }
 
-impl Gpu {
-    /// Read one `/proc/driver/nvidia/gpus/*/information`.
-    pub fn parse(information: &str) -> Option<Self> {
-        let field = |name: &str| {
-            information
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(|value| value.trim_start_matches(':').trim())
-        };
-        Some(Self {
-            uuid: field("GPU UUID")?.parse().ok()?,
-            minor: field("Device Minor")?.parse().ok()?,
-        })
-    }
+pub fn nvml() -> Result<Nvml> {
+    Nvml::builder()
+        .lib_path(OsStr::new(NVML))
+        .init()
+        .with_context(|| format!("load {NVML}"))
 }
 
 /// Every GPU of this node, in the order the driver enumerates them.
 pub fn node_gpus() -> Result<Vec<Gpu>> {
-    let mut gpus = Vec::new();
-    for entry in fs::read_dir("/proc/driver/nvidia/gpus").context("list the driver's GPUs")? {
-        let path = entry?.path().join("information");
-        let information =
-            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        gpus.extend(Gpu::parse(&information));
-    }
+    let nvml = nvml()?;
+    let mut gpus = (0..nvml.device_count().context("count the GPUs")?)
+        .map(|index| {
+            let device = nvml.device_by_index(index).context("open a GPU")?;
+            Ok(Gpu {
+                uuid: device.uuid().context("read a GPU's UUID")?.parse()?,
+                minor: device.minor_number().context("read a GPU's minor")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     gpus.sort_by_key(|gpu| gpu.minor);
     Ok(gpus)
 }
@@ -226,24 +241,25 @@ pub fn pick(node: &[Gpu], uuids: &[GpuUuid]) -> Result<Vec<Gpu>> {
         .collect())
 }
 
+/// The children of every thread of `pid`.
+pub fn children(pid: i32) -> Vec<i32> {
+    let Ok(tasks) = Process::new(pid).and_then(|process| process.tasks()) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| task.children().ok())
+        .flatten()
+        .filter_map(|child| i32::try_from(child).ok())
+        .collect()
+}
+
 pub fn process_tree(root: i32) -> Vec<i32> {
     let mut pids = vec![root];
     let mut next = 0;
     while let Some(&pid) = pids.get(next) {
         next += 1;
-        let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
-            continue;
-        };
-        for task in tasks.flatten() {
-            let Ok(children) = fs::read_to_string(task.path().join("children")) else {
-                continue;
-            };
-            pids.extend(
-                children
-                    .split_ascii_whitespace()
-                    .filter_map(|c| c.parse::<i32>().ok()),
-            );
-        }
+        pids.extend(children(pid));
     }
     pids
 }
@@ -383,19 +399,6 @@ impl fmt::Display for GpuMap {
 #[cfg(test)]
 mod tests {
     use crate::cuda::{Gpu, GpuMap, GpuUuid, pick, process_tree};
-
-    #[test]
-    fn the_driver_information_gives_uuid_and_minor() {
-        let information = "Model: \t\t NVIDIA H200\nIRQ:   \t\t 255\nGPU UUID: \t GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\nVideo BIOS: \t 97.00.c4.00.11\nBus Type: \t PCIe\nDevice Minor: \t 3\nGPU Excluded:\t No\n";
-        let gpu = Gpu::parse(information).unwrap();
-        assert_eq!(
-            gpu.uuid.to_string(),
-            "GPU-03e97d3f-21d4-1c89-f142-657edeaf3566"
-        );
-        assert_eq!(gpu.minor, 3);
-        assert!(Gpu::parse("Model: NVIDIA H200\nDevice Minor: 3\n").is_none());
-        assert!(Gpu::parse("GPU UUID: GPU-03e97d3f-21d4-1c89-f142-657edeaf3566\n").is_none());
-    }
 
     #[test]
     fn a_pods_gpus_come_back_in_the_nodes_order() {

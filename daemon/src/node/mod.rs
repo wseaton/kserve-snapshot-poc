@@ -40,6 +40,7 @@ use crate::podresources;
 #[cfg(feature = "nixl")]
 use crate::store::directory_bytes;
 use crate::store::{RevisionKey, RevisionStore};
+use crate::timeslice;
 use crate::vllm::{Control, Lifecycle};
 
 #[derive(clap::Args)]
@@ -101,6 +102,8 @@ pub struct Args {
     retry_s: u64,
     #[command(flatten)]
     pod: pod::Options,
+    #[command(flatten)]
+    timeslice: timeslice::Args,
     #[cfg(feature = "nixl")]
     #[command(flatten)]
     peers: peer::Args,
@@ -411,6 +414,7 @@ async fn serve(args: Args) -> Result<()> {
     });
     let args = &node.args;
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
+    timeslice::start(&args.timeslice, &args.runtime_socket)?;
     info!(
         label = %args.label,
         store = %args.store_dir.display(),

@@ -23,6 +23,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail, ensure};
 use cuinterpose_protocol::{NamespacePid, Record, Reply, Request, Response};
 use openssl::hash::{Hasher, MessageDigest};
+use procfs::process::{MMapPath, MemoryMaps, Process};
 use serde::{Deserialize, Serialize};
 
 pub const FRONTEND_LIBRARY: &str = "libcuinterpose.so";
@@ -152,35 +153,17 @@ struct MappedFile {
     inode: u64,
 }
 
-/// Find `path` in a `/proc/PID/maps` listing. A replaced file shows up with a
+/// Find `path` among a process's mappings. A replaced file shows up with a
 /// ` (deleted)` suffix, which does not match.
-fn find_mapping(maps: &str, path: &Path) -> Result<Option<MappedFile>> {
-    let path = path.to_string_lossy();
-    for line in maps.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let (Some(_), Some(_), Some(_), Some(device), Some(inode)) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            continue;
-        };
-        let rest: Vec<&str> = fields.collect();
-        if rest.join(" ") != path {
-            continue;
-        }
-        let (major, minor) = device
-            .split_once(':')
-            .with_context(|| format!("malformed maps device {device:?}"))?;
-        return Ok(Some(MappedFile {
-            major: u32::from_str_radix(major, 16)?,
-            minor: u32::from_str_radix(minor, 16)?,
-            inode: inode.parse()?,
-        }));
-    }
-    Ok(None)
+fn find_mapping(maps: &MemoryMaps, path: &Path) -> Option<MappedFile> {
+    let map = maps
+        .iter()
+        .find(|map| matches!(&map.pathname, MMapPath::Path(mapped) if mapped == path))?;
+    Some(MappedFile {
+        major: u32::try_from(map.dev.0).ok()?,
+        minor: u32::try_from(map.dev.1).ok()?,
+        inode: map.inode,
+    })
 }
 
 /// Require that every participant loaded the frontend from the bundle and that
@@ -195,9 +178,10 @@ fn check_loaded_libraries(config: &Config, pids: &[i32]) -> Result<()> {
             .map_or_else(|| path.clone(), |dir| dir.join(name));
         let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
         for &pid in pids {
-            let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+            let maps = Process::new(pid)
+                .and_then(|process| process.maps())
                 .with_context(|| format!("read /proc/{pid}/maps"))?;
-            match find_mapping(&maps, &loaded)? {
+            match find_mapping(&maps, &loaded) {
                 Some(mapped) => ensure!(
                     libc::major(metadata.dev()) == mapped.major
                         && libc::minor(metadata.dev()) == mapped.minor
@@ -217,17 +201,13 @@ fn check_loaded_libraries(config: &Config, pids: &[i32]) -> Result<()> {
 
 /// The innermost PID of a process, which names its control socket.
 pub fn namespace_pid(pid: i32) -> Result<NamespacePid> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))
-        .with_context(|| format!("read /proc/{pid}/status"))?;
-    parse_namespace_pid(&status).with_context(|| format!("pid {pid}: no NSpid line"))
-}
-
-fn parse_namespace_pid(status: &str) -> Option<NamespacePid> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpid:"))
-        .and_then(|pids| pids.split_ascii_whitespace().last())
-        .and_then(|pid| pid.parse().ok())
+    Process::new(pid)
+        .and_then(|process| process.status())
+        .with_context(|| format!("read /proc/{pid}/status"))?
+        .nspid
+        .and_then(|pids| pids.last().copied())
+        .and_then(|inner| NamespacePid::try_from(inner).ok())
+        .with_context(|| format!("pid {pid}: no NSpid line"))
 }
 
 pub fn inspect(socket_dir: &Path, pid: NamespacePid) -> Result<Vec<Record>> {
@@ -376,10 +356,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use cuinterpose_protocol::{AllocationReference, MemoryLocation, MulticastProperties, Record};
+    use procfs::FromRead;
+    use procfs::process::{MemoryMaps, Process};
 
     use crate::cuinterpose::{
         CORE_LIBRARY, Config, FRONTEND_LIBRARY, Manifest, MappedFile, Sharing, find_mapping,
-        hash_libraries, parse_namespace_pid,
+        hash_libraries,
     };
 
     fn bundle(label: &str, frontend: &[u8], core: &[u8]) -> Config {
@@ -484,10 +466,11 @@ mod tests {
 7f02-7f03 r-xp 00001000 00:2a 1234 /tmp/snapshot-cuda/libcuinterpose.so
 7f04-7f05 r--p 00000000 fd:01 99 /tmp/snapshot-cuda/libcuinterpose_core.so (deleted)
 7f06-7f07 rw-p 00000000 00:00 0 [heap]
-7f08-7f09 rw-p 00000000 00:00 0
+7f08-7f09 rw-p 00000000 00:00 0\x20
 ";
+        let maps = MemoryMaps::from_read(maps.as_bytes()).unwrap();
         assert_eq!(
-            find_mapping(maps, Path::new("/tmp/snapshot-cuda/libcuinterpose.so")).unwrap(),
+            find_mapping(&maps, Path::new("/tmp/snapshot-cuda/libcuinterpose.so")),
             Some(MappedFile {
                 major: 0,
                 minor: 0x2a,
@@ -495,20 +478,20 @@ mod tests {
             })
         );
         assert_eq!(
-            find_mapping(maps, Path::new("/tmp/snapshot-cuda/libcuinterpose_core.so")).unwrap(),
+            find_mapping(
+                &maps,
+                Path::new("/tmp/snapshot-cuda/libcuinterpose_core.so")
+            ),
             None
         );
-        assert_eq!(
-            find_mapping(maps, Path::new("/tmp/other.so")).unwrap(),
-            None
-        );
+        assert_eq!(find_mapping(&maps, Path::new("/tmp/other.so")), None);
     }
 
     #[test]
     fn finds_this_process_mapping_its_own_executable() {
         let exe = std::fs::read_link("/proc/self/exe").unwrap();
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let mapped = find_mapping(&maps, &exe).unwrap().unwrap();
+        let maps = Process::myself().unwrap().maps().unwrap();
+        let mapped = find_mapping(&maps, &exe).unwrap();
         let metadata = std::fs::metadata(&exe).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(mapped.inode, metadata.ino());
@@ -517,16 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_pid_is_the_innermost() {
-        assert_eq!(
-            parse_namespace_pid("Name:\tpython3\nNSpid:\t41872\t893\n"),
-            Some(893)
-        );
-        assert_eq!(
-            parse_namespace_pid("Name:\tpython3\nNSpid:\t17\n"),
-            Some(17)
-        );
-        assert_eq!(parse_namespace_pid("Name:\tpython3\n"), None);
+    fn namespace_pid_of_this_process_is_its_pid_here() {
         let own = crate::cuinterpose::namespace_pid(std::process::id() as i32).unwrap();
         assert!(own > 0);
     }
