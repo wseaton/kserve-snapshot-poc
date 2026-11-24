@@ -900,7 +900,10 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.to_string(), wanted);
         }
-        let lws = grouped(&[WORKLOAD, (LWS_REVISION, "5b6d"), (MEMBER, "3")], Some("4"));
+        let lws = grouped(
+            &[WORKLOAD, (LWS_REVISION, "5b6d"), (MEMBER, "3")],
+            Some("4"),
+        );
         assert_eq!(
             labels.revision_of(&lws).unwrap().to_string(),
             "serving/qwen+3/5b6d",
