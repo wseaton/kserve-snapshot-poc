@@ -6,6 +6,7 @@
 # Environment:
 #   MODEL        model directory (required)
 #   TP           tensor parallel size (default 8)
+#   DP           data parallel size; the server takes TP*DP GPUs (default 1)
 #   MODE         plain: cuda-checkpoint only; cuinterpose: preload cuInterpose and run its
 #                prepare and restore phases around the CUDA checkpoint; gpucr: preload GPU-CR's
 #                vGPU library, which moves the device memory it tracks into a file before the
@@ -32,7 +33,7 @@
 #                captured elsewhere onto this pod's GPUs; serve: cold boot and leave the
 #                server running, as a ModelExpress peer for example (default all)
 #   GPU_POSITIONS  positions, among the GPUs the container can open, of the ones to run on, such
-#                as "4 5 6 7"; they must be allocated to the pod (default: its first TP GPUs).
+#                as "4 5 6 7"; they must be allocated to the pod (default: its first TP*DP GPUs).
 #                A restore on another node lands on the same positions there
 #   RELEASE_WEIGHTS  0: keep the weights in the checkpoint instead of releasing them at prepare
 #                and reloading them at restore (default 1)
@@ -53,7 +54,8 @@
 # may see every GPU on the node, so the GPUs to use come from the kubelet's device checkpoint.
 set -u
 TAG=$1; shift
-: "${MODEL:?}" "${TP:=8}" "${MODE:=plain}" "${REMAP:=0}" "${CUDA_TOOL:=snapshotd}" "${STREAM:=0}" "${PHASE:=all}"
+: "${MODEL:?}" "${TP:=8}" "${DP:=1}" "${MODE:=plain}" "${REMAP:=0}" "${CUDA_TOOL:=snapshotd}" "${STREAM:=0}" "${PHASE:=all}"
+NGPU=$((TP * DP))
 W=/work/$TAG; IMG=${CKPT_DIR:-$W/img}
 if [ "$PHASE" != restore ]; then rm -rf "$W" "$IMG"; fi
 mkdir -p "$W" "$IMG" /work/empty; cd "$W" || exit 1
@@ -73,7 +75,7 @@ lap() {
 }
 fail() { R[result]=$1; report; killall9; exit 1; }
 report() {
-  local out="{\"tag\": \"$TAG\", \"mode\": \"$MODE\", \"cuda_tool\": \"$CUDA_TOOL\", \"stream\": \"$STREAM\", \"tp\": $TP, \"remap\": \"$REMAP\""
+  local out="{\"tag\": \"$TAG\", \"mode\": \"$MODE\", \"cuda_tool\": \"$CUDA_TOOL\", \"stream\": \"$STREAM\", \"tp\": $TP, \"dp\": $DP, \"remap\": \"$REMAP\""
   for k in "${!R[@]}"; do out+=", \"$k\": \"${R[$k]}\""; done
   echo "RESULT $out}"
 }
@@ -105,15 +107,15 @@ for e in entries:
         print("\n".join(d for ids in e["DeviceIDs"].values() for d in ids))
 PY
 )
-[ "${#MINE[@]}" -ge "$TP" ] || fail NOT_ENOUGH_GPUS
+[ "${#MINE[@]}" -ge "$NGPU" ] || fail NOT_ENOUGH_GPUS
 mine() { [[ " ${MINE[*]} " == *" $1 "* ]]; }
 SRC=()
 if [ -n "${GPU_POSITIONS:-}" ]; then
   for p in $GPU_POSITIONS; do mine "${VISIBLE[$p]}" || fail GPU_NOT_ALLOCATED; SRC+=("${VISIBLE[$p]}"); done
 else
-  for u in "${VISIBLE[@]}"; do mine "$u" && [ "${#SRC[@]}" -lt "$TP" ] && SRC+=("$u"); done
+  for u in "${VISIBLE[@]}"; do mine "$u" && [ "${#SRC[@]}" -lt "$NGPU" ] && SRC+=("$u"); done
 fi
-[ "${#SRC[@]}" = "$TP" ] || fail NOT_ENOUGH_GPUS
+[ "${#SRC[@]}" = "$NGPU" ] || fail NOT_ENOUGH_GPUS
 if [ "$PHASE" = restore ]; then
   . "$W/capture.env" || fail NO_CAPTURE
   cp "$W/vllm.log.captured" "$W/vllm.log"
@@ -175,7 +177,7 @@ if [ ! -L "$HOME/.humming" ]; then
   ln -s /compile-cache/humming "$HOME/.humming"
 fi
 T=$(now)
-setsid "${LAUNCH[@]}" vllm serve "$MODEL" --served-model-name m --tensor-parallel-size "$TP" \
+setsid "${LAUNCH[@]}" vllm serve "$MODEL" --served-model-name m --tensor-parallel-size "$TP" --data-parallel-size "$DP" \
   --enable-sleep-mode "${RELEASE[@]}" "${MX_ARGS[@]}" --host 127.0.0.1 --port 8000 "$@" \
   < /dev/null > "$W/vllm.log" 2>&1 &
 VP=$!
