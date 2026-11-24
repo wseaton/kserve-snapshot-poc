@@ -97,7 +97,23 @@ DeepSeek (74 GB), 33.0 s for gpt-oss-120b (106 GB).
 
 ## Status
 
-Built and measured from a privileged bench pod: the vLLM patches, `snapshotd`'s CUDA, cuInterpose,
-image and transfer parts, and restore across nodes up to TP=8. Running end to end through KServe:
-the integration on Dynamo Snapshot's agent. Design only: the `snapshotd` DaemonSet that restores
-into a new pod and ties these into KServe ([docs/design.md](docs/design.md)).
+`snapshotd node` runs as a DaemonSet and restores into ordinary pods: on containerd and on
+OpenShift with CRI-O and SELinux, from a Deployment or a KServe `LLMInferenceService`, on the
+node that took the checkpoint or on one that pulls it from a peer, and with prefill and decode
+pods. CI runs it on kind without GPUs. It also serves llm-d-rl-time-slicing's node agent API.
+[docs/orchestration.md](docs/orchestration.md) has each of these with what was measured, and what
+a control plane still has to add.
+
+Measured from a privileged bench pod only: restore across nodes at TP=8 with the image streamed
+over InfiniBand and weights from a serving peer. The earlier integration on Dynamo Snapshot's
+agent also runs end to end through KServe.
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
+
+Files derived from other projects keep those projects' licenses: the patches under
+[`patches/`](patches) (vLLM, ModelExpress and Dynamo Snapshot are Apache-2.0; CRIU is GPL-2.0),
+`experiments/weights-file/vllm-overlay.diff`, the schemas under
+[`daemon/proto/`](daemon/proto) and `experiments/timeslice/orchestrator.yaml`.
