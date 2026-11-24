@@ -21,7 +21,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use tokio::task::JoinHandle;
@@ -29,6 +29,7 @@ use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::cri::{Runtime, Sandbox};
+use crate::metrics::{self, How, Metrics, Step};
 use crate::node::manifest::Manifest;
 use crate::node::pod::Pod;
 use crate::node::process::{HostPid, PodPid};
@@ -39,7 +40,7 @@ use crate::peer::{self, Peers};
 use crate::podresources;
 #[cfg(feature = "nixl")]
 use crate::store::directory_bytes;
-use crate::store::{RevisionKey, RevisionStore};
+use crate::store::{Class, Classes, RevisionKey, RevisionStore};
 use crate::timeslice;
 use crate::vllm::{Control, Lifecycle};
 
@@ -78,6 +79,32 @@ pub struct Args {
     /// Free space the store must have before a checkpoint is taken.
     #[arg(long, env = "SNAPSHOTD_MIN_FREE_GIB", default_value_t = 256)]
     min_free_gib: u64,
+    /// GiB one namespace may hold in the store before its checkpoints stop
+    /// being taken.
+    #[arg(long, env = "SNAPSHOTD_NAMESPACE_LIMIT_GIB")]
+    namespace_limit_gib: Option<u64>,
+    /// Hours the store keeps a revision after a pod of it last started.
+    #[arg(long, env = "SNAPSHOTD_RETAIN_HOURS")]
+    retain_hours: Option<u64>,
+    /// JSON file of more store classes: an object of name to `dir` and,
+    /// optionally, `min_free_gib`, `namespace_limit_gib` and `retain_hours`.
+    /// The options above describe the class `default`.
+    #[arg(long, env = "SNAPSHOTD_CLASSES_FILE")]
+    classes_file: Option<PathBuf>,
+    /// Pod annotation that names the store class a pod's checkpoints go to.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_CLASS_ANNOTATION",
+        default_value = "snapshot.llm-d.ai/class"
+    )]
+    class_annotation: String,
+    /// Seconds between looks at the stores, which measure them and remove
+    /// what is past its retention.
+    #[arg(long, env = "SNAPSHOTD_SWEEP_S", default_value_t = 600)]
+    sweep_s: u64,
+    /// Address to serve Prometheus metrics on, at /metrics.
+    #[arg(long, env = "SNAPSHOTD_METRICS_LISTEN", default_value = "0.0.0.0:9090")]
+    metrics_listen: SocketAddr,
     /// Pod label that names a pod's revision.
     #[arg(
         long,
@@ -111,6 +138,8 @@ pub struct Args {
 
 struct Node {
     args: Args,
+    classes: Classes,
+    metrics: Arc<Metrics>,
     #[cfg(feature = "nixl")]
     peers: Option<Arc<Peers>>,
     /// A lock for each revision, held while its checkpoint is pulled, so
@@ -182,6 +211,17 @@ enum Served {
     Captured,
 }
 
+impl Served {
+    fn how(self) -> How {
+        match self {
+            Self::StartedEarlier => How::StartedEarlier,
+            Self::Restored => How::Restore,
+            Self::ColdBooted => How::ColdBoot,
+            Self::Captured => How::Capture,
+        }
+    }
+}
+
 impl fmt::Display for Served {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -242,15 +282,31 @@ async fn pull_from_peers(
 }
 
 async fn cold_boot(
+    node: &Node,
     pod: &Pod,
     shim: &mut ShimClient,
-    within: Duration,
 ) -> Result<(PodPid, Control, Lifecycle)> {
     let asked = Instant::now();
     let server = shim.start().await?;
+    let within = Duration::from_secs(node.args.boot_timeout_s);
     let (control, state) = Control::connect_when_up(pod.control(), within).await?;
     info!(seconds = %seconds(asked), ?state, "the server is up");
+    node.metrics.stepped(Step::ColdBoot, asked.elapsed());
     Ok((server, control, state))
+}
+
+async fn cold_boot_only(
+    node: &Node,
+    pod: &Pod,
+    shim: &mut ShimClient,
+    because: String,
+) -> Result<Served> {
+    warn!(because, "cold booting, with no checkpoint taken");
+    let (_, control, state) = cold_boot(node, pod, shim).await?;
+    if state == Lifecycle::Prepared {
+        pod.resume(control).await?;
+    }
+    Ok(Served::ColdBooted)
 }
 
 async fn adopt_or_give_up(
@@ -281,7 +337,6 @@ async fn bring_up(
 ) -> Result<Served> {
     let args = &node.args;
     let revision = revision_of(sandbox, &args.label, &args.revision_label)?;
-    let store = RevisionStore::open(&args.store_dir, &revision, &sandbox.uid)?;
     info!(
         pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
         %revision,
@@ -292,43 +347,52 @@ async fn bring_up(
         "new pod"
     );
     pod.mount_tools().await?;
+    let named = sandbox.annotations.get(&args.class_annotation);
+    let class = match node.classes.get(named.map(String::as_str)) {
+        Ok(class) => class,
+        Err(error) => return cold_boot_only(node, pod, shim, format!("{error:#}")).await,
+    };
+    let store = RevisionStore::open(&class.dir, &revision, &sandbox.uid)?;
     #[cfg(feature = "nixl")]
     if let Some(peers) = &node.peers {
         let turn = node.pull_turn(&revision)?;
         let _turn = turn.lock().await;
         if !store.image_ready() && !store.failed_before() {
+            let asked = Instant::now();
             pull_from_peers(peers, &revision, &store).await?;
+            if store.image_ready() {
+                node.metrics.stepped(Step::Pull, asked.elapsed());
+            }
         }
     }
-    let boot = Duration::from_secs(args.boot_timeout_s);
     let plan = Plan::choose(
         store.failed_before(),
         Image::of(&store, pod)?,
-        store.ensure_room(args.min_free_gib << 30),
+        class.room(&revision),
     );
     match plan {
         Plan::Restore => {
             info!("restoring the revision's checkpoint");
+            let asked = Instant::now();
             let restored = pod.restore(&store.image_dir()).await;
             adopt_or_give_up(restored, pod, &store, shim).await?;
+            node.metrics.stepped(Step::Restore, asked.elapsed());
             Ok(Served::Restored)
         }
-        Plan::ColdBoot(because) => {
-            warn!(because, "cold booting, with no checkpoint taken");
-            let (_, control, state) = cold_boot(pod, shim, boot).await?;
-            if state == Lifecycle::Prepared {
-                pod.resume(control).await?;
-            }
-            Ok(Served::ColdBooted)
-        }
+        Plan::ColdBoot(because) => cold_boot_only(node, pod, shim, because).await,
         Plan::Capture => {
             info!("cold booting; this pod gives the revision its checkpoint");
-            let (server, control, _) = cold_boot(pod, shim, boot).await?;
+            let (server, control, _) = cold_boot(node, pod, shim).await?;
             store.clear_staging()?;
             let staging = store.staging_dir();
             let cycled = async {
+                let asked = Instant::now();
                 pod.checkpoint(control, shim, server, staging).await?;
-                pod.restore(staging).await
+                node.metrics.stepped(Step::Checkpoint, asked.elapsed());
+                let asked = Instant::now();
+                let restored = pod.restore(staging).await?;
+                node.metrics.stepped(Step::Restore, asked.elapsed());
+                Ok(restored)
             }
             .await;
             adopt_or_give_up(cycled, pod, &store, shim).await?;
@@ -378,7 +442,53 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     };
     shim.serving().await?;
     info!(seconds = %seconds(seen), how = %served, "serving");
+    node.metrics
+        .served(&sandbox.namespace, workload_of(node, sandbox), served.how());
     Ok(())
+}
+
+fn workload_of<'a>(node: &Node, sandbox: &'a Sandbox) -> &'a str {
+    sandbox
+        .labels
+        .get(&node.args.label)
+        .map_or("", String::as_str)
+}
+
+/// Remove what is past its retention and measure what is left.
+async fn look_at_stores(node: &Arc<Node>) {
+    let node = Arc::clone(node);
+    let looked = tokio::task::spawn_blocking(move || {
+        let mut seen = Vec::new();
+        for (name, class) in node.classes.iter() {
+            match class.sweep(SystemTime::now()) {
+                Ok(removed) => {
+                    for (revision, bytes) in &removed {
+                        info!(
+                            class = name,
+                            %revision,
+                            gib = %report::gib(*bytes),
+                            "removed a revision no pod has started within its retention"
+                        );
+                    }
+                    let bytes = removed.iter().map(|(_, bytes)| bytes).sum();
+                    node.metrics.swept(name, removed.len() as u64, bytes);
+                }
+                Err(error) => {
+                    warn!(class = name, error = %format_args!("{error:#}"), "could not sweep a store")
+                }
+            }
+            seen.push((
+                name.to_string(),
+                class.usage(),
+                class.free_bytes().unwrap_or(0),
+            ));
+        }
+        node.metrics.stored(&seen);
+    })
+    .await;
+    if looked.is_err() {
+        warn!("a look at the stores panicked");
+    }
 }
 
 fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
@@ -390,6 +500,8 @@ fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
                     error = %format!("{error:#}").replace('\n', "; "),
                     "gave up on this pod for now"
                 );
+                node.metrics
+                    .failed(&sandbox.namespace, workload_of(&node, &sandbox));
                 sleep(Duration::from_secs(node.args.retry_s)).await;
             }
         }
@@ -398,32 +510,52 @@ fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
 }
 
 async fn serve(args: Args) -> Result<()> {
-    std::fs::create_dir_all(&args.store_dir)
-        .with_context(|| format!("create {}", args.store_dir.display()))?;
+    let classes = Classes::load(
+        Class {
+            dir: args.store_dir.clone(),
+            min_free_gib: args.min_free_gib,
+            namespace_limit_gib: args.namespace_limit_gib,
+            retain_hours: args.retain_hours,
+        },
+        args.classes_file.as_deref(),
+    )?;
     ensure!(
         args.pod.tools_dir.join("criu").is_file(),
         "no criu in {}",
         args.pod.tools_dir.display()
     );
+    let metrics = Arc::new(Metrics::default());
+    metrics::start(args.metrics_listen, Arc::clone(&metrics)).await?;
     let node = Arc::new(Node {
         #[cfg(feature = "nixl")]
-        peers: Peers::start(&args.peers, &args.store_dir).await?,
+        peers: Peers::start(&args.peers, classes.clone()).await?,
+        classes,
+        metrics,
         #[cfg(feature = "nixl")]
         pulling: std::sync::Mutex::default(),
         args,
     });
     let args = &node.args;
     let mut runtime = Runtime::connect(&args.runtime_socket).await?;
-    timeslice::start(&args.timeslice, &args.runtime_socket)?;
+    timeslice::start(
+        &args.timeslice,
+        &args.runtime_socket,
+        Arc::clone(&node.metrics),
+    )?;
     info!(
         label = %args.label,
-        store = %args.store_dir.display(),
+        classes = %node.classes,
         tools = %args.pod.tools_dir.display(),
         runtime = %args.runtime_socket.display(),
         "watching this node's pods"
     );
     let mut watched: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut looked = None::<Instant>;
     loop {
+        if looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(args.sweep_s)) {
+            look_at_stores(&node).await;
+            looked = Some(Instant::now());
+        }
         match runtime.sandboxes(&args.label).await {
             Ok(sandboxes) => {
                 watched.retain(|id, task| {

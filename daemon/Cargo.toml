@@ -28,6 +28,7 @@ libloading = "0.9"
 nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
 nvml-wrapper = "0.13"
 openssl = "0.10"
+prometheus-client = "0.26"
 procfs = { version = "0.18", default-features = false }
 prost = "0.14"
 rustix = { version = "1", features = ["fs", "mm", "mount", "net", "pipe", "process", "thread"] }

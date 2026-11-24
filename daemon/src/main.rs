@@ -11,6 +11,7 @@ mod image;
 mod inject;
 #[cfg(any(test, feature = "nixl"))]
 mod lanes;
+mod metrics;
 mod node;
 #[cfg(feature = "nixl")]
 mod peer;

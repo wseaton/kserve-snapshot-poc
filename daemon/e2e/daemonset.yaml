@@ -18,3 +18,21 @@ spec:
             - --store-dir=/store
             - --tools-dir=/tools
             - --min-free-gib=1
+          env:
+            - name: SNAPSHOTD_CLASSES_FILE
+              value: /etc/snapshotd/classes/classes.json
+            - name: SNAPSHOTD_SWEEP_S
+              value: "2"
+          volumeMounts:
+            - name: classes
+              mountPath: /etc/snapshotd/classes
+            - name: scratch
+              mountPath: /stores/scratch
+      volumes:
+        - name: classes
+          configMap:
+            name: snapshotd-classes
+        - name: scratch
+          hostPath:
+            path: /var/lib/snapshotd-scratch
+            type: DirectoryOrCreate

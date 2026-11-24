@@ -12,6 +12,9 @@ spec:
     metadata:
       labels:
         app: snapshotd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
     spec:
       serviceAccountName: snapshotd
       hostPID: true
@@ -48,6 +51,9 @@ spec:
             - --tools-dir=/tools
           securityContext:
             privileged: true
+          ports:
+            - name: metrics
+              containerPort: 9090
           env:
             - name: NVIDIA_VISIBLE_DEVICES
               value: all

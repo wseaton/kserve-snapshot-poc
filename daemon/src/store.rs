@@ -1,17 +1,25 @@
-//! A node's checkpoint store: one directory per revision of each workload.
+//! A node's checkpoint stores. Each class of store is a directory, with one
+//! directory per revision of each workload:
 //!
 //! ```text
-//! <store>/<namespace>/<workload>/<hash>/image/           the checkpoint; it appears whole, by rename
-//! <store>/<namespace>/<workload>/<hash>/incoming-<pod>/  a capture or a pull in progress
-//! <store>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
+//! <class>/<namespace>/<workload>/<hash>/image/           the checkpoint; it appears whole, by rename
+//! <class>/<namespace>/<workload>/<hash>/incoming-<pod>/  a capture or a pull in progress
+//! <class>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
+//! <class>/<namespace>/<workload>/<hash>/used             touched when a pod of the revision starts
 //! ```
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
+
+pub const DEFAULT_CLASS: &str = "default";
+const USED: &str = "used";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RevisionKey {
@@ -70,9 +78,197 @@ impl fmt::Display for RevisionKey {
     }
 }
 
-pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
+/// One place checkpoints are kept, and what it allows.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Class {
+    pub dir: PathBuf,
+    /// GiB the directory must have free before a checkpoint is taken.
+    #[serde(default)]
+    pub min_free_gib: u64,
+    /// GiB one namespace may hold here before its checkpoints stop being taken.
+    #[serde(default)]
+    pub namespace_limit_gib: Option<u64>,
+    /// Hours a revision is kept after a pod of it last started.
+    #[serde(default)]
+    pub retain_hours: Option<u64>,
+}
+
+impl Class {
+    /// Whether a checkpoint of `revision` may be taken now.
+    pub fn room(&self, revision: &RevisionKey) -> Result<()> {
+        ensure_room(&self.dir, self.min_free_gib << 30)?;
+        if let Some(limit) = self.namespace_limit_gib {
+            let held = directory_bytes(&self.dir.join(&revision.namespace));
+            ensure!(
+                held < limit << 30,
+                "namespace {} holds {held} bytes in {} and may hold {limit} GiB",
+                revision.namespace,
+                self.dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn usage(&self) -> Vec<Usage> {
+        let mut held: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+        for (revision, dir) in revisions(&self.dir) {
+            let (bytes, count) = held
+                .entry((revision.namespace, revision.workload))
+                .or_default();
+            *bytes += directory_bytes(&dir);
+            *count += 1;
+        }
+        held.into_iter()
+            .map(|((namespace, workload), (bytes, revisions))| Usage {
+                namespace,
+                workload,
+                bytes,
+                revisions,
+            })
+            .collect()
+    }
+
+    pub fn free_bytes(&self) -> Result<u64> {
+        free_bytes(&self.dir)
+    }
+
+    /// Returns the revisions it removed and the bytes each held.
+    pub fn sweep(&self, now: SystemTime) -> Result<Vec<(RevisionKey, u64)>> {
+        let Some(hours) = self.retain_hours else {
+            return Ok(Vec::new());
+        };
+        let kept = Duration::from_secs(hours.saturating_mul(3600));
+        let mut removed = Vec::new();
+        for (revision, dir) in revisions(&self.dir) {
+            if now.duration_since(last_used(&dir)?).unwrap_or_default() <= kept {
+                continue;
+            }
+            let bytes = directory_bytes(&dir);
+            fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+            for emptied in dir.ancestors().skip(1).take(2) {
+                let _ = fs::remove_dir(emptied);
+            }
+            removed.push((revision, bytes));
+        }
+        Ok(removed)
+    }
+}
+
+/// What one workload's revisions hold in a class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub namespace: String,
+    pub workload: String,
+    pub bytes: u64,
+    pub revisions: u64,
+}
+
+fn subdirectories(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.path())))
+        .collect()
+}
+
+fn revisions(store: &Path) -> Vec<(RevisionKey, PathBuf)> {
+    let mut found = Vec::new();
+    for (namespace, dir) in subdirectories(store) {
+        for (workload, dir) in subdirectories(&dir) {
+            for (hash, dir) in subdirectories(&dir) {
+                if let Ok(revision) = RevisionKey::new(&namespace, &workload, &hash) {
+                    found.push((revision, dir));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn last_used(revision_dir: &Path) -> Result<SystemTime> {
+    let marker = revision_dir.join(USED);
+    let dated = if marker.exists() {
+        marker.as_path()
+    } else {
+        revision_dir
+    };
+    fs::metadata(dated)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("read when {} was last used", dated.display()))
+}
+
+/// The classes of store a daemon offers, by name. One is always `default`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Classes(BTreeMap<String, Class>);
+
+impl fmt::Display for Classes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let named: Vec<String> = self
+            .iter()
+            .map(|(name, class)| format!("{name}={}", class.dir.display()))
+            .collect();
+        f.write_str(&named.join(","))
+    }
+}
+
+impl Classes {
+    /// `default`, and the classes of the JSON object in `file` if one is given.
+    pub fn load(default: Class, file: Option<&Path>) -> Result<Self> {
+        let mut classes = match file {
+            Some(file) => {
+                let text =
+                    fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+                serde_json::from_str::<BTreeMap<String, Class>>(&text)
+                    .with_context(|| format!("parse {}", file.display()))?
+            }
+            None => BTreeMap::new(),
+        };
+        ensure!(
+            !classes.contains_key(DEFAULT_CLASS),
+            "the class {DEFAULT_CLASS:?} is set by the daemon's own options"
+        );
+        classes.insert(DEFAULT_CLASS.to_string(), default);
+        for (name, class) in &classes {
+            fs::create_dir_all(&class.dir)
+                .with_context(|| format!("create {} for class {name}", class.dir.display()))?;
+        }
+        Ok(Self(classes))
+    }
+
+    /// The class a pod named, or the default when it named none.
+    pub fn get(&self, name: Option<&str>) -> Result<&Class> {
+        let name = name.unwrap_or(DEFAULT_CLASS);
+        match self.0.get(name) {
+            Some(class) => Ok(class),
+            None => bail!("this node has no store class {name:?}"),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Class)> {
+        self.0.iter().map(|(name, class)| (name.as_str(), class))
+    }
+
+    /// In whichever class holds it.
+    #[cfg(any(test, feature = "nixl"))]
+    pub fn image_of(&self, revision: &RevisionKey) -> Option<PathBuf> {
+        self.0
+            .values()
+            .map(|class| revision.image_dir(&class.dir))
+            .find(|image| image.is_dir())
+    }
+}
+
+fn free_bytes(dir: &Path) -> Result<u64> {
     let stat = rustix::fs::statvfs(dir).with_context(|| format!("stat {}", dir.display()))?;
-    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+pub fn ensure_room(dir: &Path, bytes: u64) -> Result<()> {
+    let free = free_bytes(dir)?;
     ensure!(
         free >= bytes,
         "{} has {free} bytes free and needs {bytes}",
@@ -103,9 +299,13 @@ pub struct RevisionStore {
 }
 
 impl RevisionStore {
+    /// Opening a revision for a pod counts as using it.
     pub fn open(store: &Path, revision: &RevisionKey, pod_uid: &str) -> Result<Self> {
         let dir = revision.dir(store);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        File::create(dir.join(USED))
+            .and_then(|used| used.set_modified(SystemTime::now()))
+            .with_context(|| format!("mark {} used", dir.display()))?;
         Ok(Self {
             staging: dir.join(format!("incoming-{pod_uid}")),
             failure: dir.join(format!("failed-{pod_uid}")),
@@ -123,10 +323,6 @@ impl RevisionStore {
 
     pub fn staging_dir(&self) -> &Path {
         &self.staging
-    }
-
-    pub fn ensure_room(&self, bytes: u64) -> Result<()> {
-        ensure_room(&self.dir, bytes)
     }
 
     pub fn clear_staging(&self) -> Result<()> {
@@ -158,18 +354,216 @@ impl RevisionStore {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use anyhow::anyhow;
 
-    use crate::store::{RevisionKey, RevisionStore, directory_bytes, ensure_room};
+    use crate::store::{
+        Class, Classes, RevisionKey, RevisionStore, USED, Usage, directory_bytes, ensure_room,
+    };
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("snapshotd-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn class(dir: &Path) -> Class {
+        Class {
+            dir: dir.to_path_buf(),
+            min_free_gib: 0,
+            namespace_limit_gib: None,
+            retain_hours: None,
+        }
+    }
+
+    fn revision(name: &str) -> RevisionKey {
+        name.parse().unwrap()
+    }
+
+    /// A revision with an image of `bytes`, last used `idle_hours` ago.
+    fn held(store: &Path, name: &str, bytes: usize, idle_hours: u64) -> PathBuf {
+        let key = revision(name);
+        let opened = RevisionStore::open(store, &key, "pod").unwrap();
+        fs::create_dir_all(opened.image_dir()).unwrap();
+        fs::write(opened.image_dir().join("pages-1.img"), vec![0; bytes]).unwrap();
+        let used = SystemTime::now() - Duration::from_secs(idle_hours * 3600);
+        File::options()
+            .write(true)
+            .open(key.dir(store).join(USED))
+            .unwrap()
+            .set_modified(used)
+            .unwrap();
+        key.dir(store)
+    }
+
+    #[test]
+    fn a_pod_gets_the_class_it_names_and_the_default_when_it_names_none() {
+        let dir = scratch("classes");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("classes.json");
+        let shared = dir.join("shared");
+        fs::write(
+            &file,
+            format!(
+                r#"{{"shared": {{"dir": "{}", "namespace_limit_gib": 500, "retain_hours": 24}}}}"#,
+                shared.display()
+            ),
+        )
+        .unwrap();
+        let classes = Classes::load(class(&dir.join("local")), Some(&file)).unwrap();
+        assert_eq!(classes.get(None).unwrap().dir, dir.join("local"));
+        assert_eq!(
+            classes.get(Some("shared")).unwrap(),
+            &Class {
+                dir: shared.clone(),
+                min_free_gib: 0,
+                namespace_limit_gib: Some(500),
+                retain_hours: Some(24),
+            }
+        );
+        assert!(shared.is_dir() && dir.join("local").is_dir());
+        assert!(classes.get(Some("fast")).is_err());
+        assert_eq!(
+            classes.to_string(),
+            format!(
+                "default={},shared={}",
+                dir.join("local").display(),
+                shared.display()
+            )
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_classes_file_cannot_redefine_default_or_carry_unknown_fields() {
+        let dir = scratch("bad-classes");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("classes.json");
+        for text in [
+            r#"{"default": {"dir": "/elsewhere"}}"#,
+            r#"{"shared": {"dir": "/shared", "retain_days": 1}}"#,
+            r#"{"shared": {"min_free_gib": 1}}"#,
+            "not json",
+        ] {
+            fs::write(&file, text).unwrap();
+            assert!(Classes::load(class(&dir), Some(&file)).is_err(), "{text}");
+        }
+        assert!(Classes::load(class(&dir), Some(&dir.join("missing.json"))).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_is_found_in_whichever_class_holds_it() {
+        let dir = scratch("image-of");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("classes.json");
+        fs::write(
+            &file,
+            format!(
+                r#"{{"shared": {{"dir": "{}"}}}}"#,
+                dir.join("shared").display()
+            ),
+        )
+        .unwrap();
+        let classes = Classes::load(class(&dir.join("local")), Some(&file)).unwrap();
+        held(&dir.join("shared"), "serving/qwen/aaa", 10, 0);
+        let opened = RevisionStore::open(&dir.join("local"), &revision("serving/qwen/bbb"), "pod");
+        assert!(opened.is_ok());
+        assert_eq!(
+            classes.image_of(&revision("serving/qwen/aaa")),
+            Some(dir.join("shared/serving/qwen/aaa/image"))
+        );
+        assert_eq!(classes.image_of(&revision("serving/qwen/bbb")), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_namespace_at_its_limit_gets_no_more_checkpoints() {
+        let dir = scratch("limit");
+        let limited = Class {
+            namespace_limit_gib: Some(1),
+            ..class(&dir)
+        };
+        let full = held(&dir, "serving/qwen/aaa", 16, 0).join("image/pages-2.img");
+        limited.room(&revision("serving/glm/bbb")).unwrap();
+        File::create(full).unwrap().set_len(1 << 30).unwrap();
+        assert!(limited.room(&revision("serving/glm/bbb")).is_err());
+        limited.room(&revision("batch/glm/bbb")).unwrap();
+        class(&dir).room(&revision("serving/glm/bbb")).unwrap();
+        let cramped = Class {
+            min_free_gib: u64::MAX >> 30,
+            ..class(&dir)
+        };
+        assert!(cramped.room(&revision("batch/glm/bbb")).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_revisions_idle_past_the_retention_are_swept() {
+        let dir = scratch("sweep");
+        let kept = Class {
+            retain_hours: Some(24),
+            ..class(&dir)
+        };
+        let old = held(&dir, "serving/qwen/aaa", 1000, 25);
+        let recent = held(&dir, "serving/qwen/bbb", 10, 23);
+        let alone = held(&dir, "batch/glm/ccc", 100, 48);
+        assert!(class(&dir).sweep(SystemTime::now()).unwrap().is_empty());
+        let mut removed = kept.sweep(SystemTime::now()).unwrap();
+        removed.sort_by_key(|(_, bytes)| *bytes);
+        assert_eq!(
+            removed,
+            [
+                (revision("batch/glm/ccc"), 100),
+                (revision("serving/qwen/aaa"), 1000)
+            ]
+        );
+        assert!(!old.exists() && !alone.exists() && recent.join("image").is_dir());
+        assert!(!dir.join("batch").exists() && dir.join("serving/qwen").is_dir());
+        assert!(kept.sweep(SystemTime::now()).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pod_that_starts_marks_its_revision_used() {
+        let dir = scratch("used");
+        let kept = Class {
+            retain_hours: Some(1),
+            ..class(&dir)
+        };
+        let stale = held(&dir, "serving/qwen/aaa", 10, 5);
+        RevisionStore::open(&dir, &revision("serving/qwen/aaa"), "another").unwrap();
+        assert!(kept.sweep(SystemTime::now()).unwrap().is_empty());
+        assert!(stale.join("image").is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_adds_up_each_workloads_revisions() {
+        let dir = scratch("usage");
+        held(&dir, "serving/qwen/aaa", 1000, 0);
+        held(&dir, "serving/qwen/bbb", 200, 0);
+        held(&dir, "batch/glm/ccc", 30, 0);
+        let usage = |namespace: &str, workload: &str, bytes, revisions| Usage {
+            namespace: namespace.to_string(),
+            workload: workload.to_string(),
+            bytes,
+            revisions,
+        };
+        assert_eq!(
+            class(&dir).usage(),
+            [
+                usage("batch", "glm", 30, 1),
+                usage("serving", "qwen", 1200, 2)
+            ]
+        );
+        assert!(class(&dir.join("missing")).usage().is_empty());
+        assert!(class(&dir).free_bytes().unwrap() > 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn open(root: &Path, pod: &str) -> RevisionStore {

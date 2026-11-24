@@ -10,5 +10,10 @@ images:
   - name: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
     newName: localhost/snapshotd-e2e
     newTag: dev
+configMapGenerator:
+  - name: snapshotd-classes
+    namespace: snapshotd
+    literals:
+      - 'classes.json={"scratch": {"dir": "/stores/scratch", "namespace_limit_gib": 1}}'
 patches:
   - path: daemonset.yaml

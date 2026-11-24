@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::cri::Runtime;
 use crate::cuda::{self, Driver, GpuMap, Phase};
+use crate::metrics::{Action, Metrics, Outcome};
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -110,12 +111,6 @@ impl Seen {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
-    Snapshot,
-    Restore,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
     Nothing,
@@ -150,6 +145,7 @@ struct Agent {
     args: Args,
     runtime_socket: PathBuf,
     nvml: Arc<Nvml>,
+    metrics: Arc<Metrics>,
     book: Mutex<Book>,
 }
 
@@ -296,6 +292,12 @@ impl Agent {
         };
         let ms = milliseconds(entry.started);
         let error = outcome.err().map(|error| format!("{error:#}"));
+        let how = if error.is_none() {
+            Outcome::Complete
+        } else {
+            Outcome::Failed
+        };
+        self.metrics.operated(action, how, entry.started.elapsed());
         match &error {
             None => info!(job, ?action, ms, "time-slicing operation done"),
             Some(error) => warn!(job, ?action, ms, error, "time-slicing operation failed"),
@@ -427,7 +429,7 @@ impl SnapshotAgentService for Service {
     }
 }
 
-pub fn start(args: &Args, runtime_socket: &Path) -> Result<()> {
+pub fn start(args: &Args, runtime_socket: &Path, metrics: Arc<Metrics>) -> Result<()> {
     let Some(address) = args.timeslice_listen else {
         return Ok(());
     };
@@ -435,6 +437,7 @@ pub fn start(args: &Args, runtime_socket: &Path) -> Result<()> {
         args: args.clone(),
         runtime_socket: runtime_socket.to_path_buf(),
         nvml: Arc::new(cuda::nvml()?),
+        metrics,
         book: Mutex::default(),
     });
     info!(%address, label = %args.timeslice_job_label, "serving the time-slicing agent API");

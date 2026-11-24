@@ -24,6 +24,7 @@ pub struct Sandbox {
     pub namespace: String,
     pub name: String,
     pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
 }
 
 pub struct Runtime {
@@ -82,6 +83,7 @@ impl Runtime {
                     namespace: metadata.namespace,
                     name: metadata.name,
                     labels: sandbox.labels,
+                    annotations: sandbox.annotations,
                 })
             })
             .collect())

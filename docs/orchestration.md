@@ -82,6 +82,9 @@ For every pod on its node that carries the label `snapshot.llm-d.ai/workload`:
 4. If a checkpoint or restore fails, the container exits, starts over, and cold boots with no
    second attempt.
 
+It keeps the checkpoint in the pod's [store class](#store-classes) and counts what it did in
+its [metrics](#status).
+
 The daemon does not watch or write anything in the Kubernetes API. Its one read is its own node's
 labels, when it is told to choose peers by topology. There is no custom resource, webhook,
 controller or scheduling gate.
@@ -295,6 +298,52 @@ about 2.7 Gbit/s here. A 2000 token prompt took 0.72 s through prefill and decod
 on one server, all of it the transfer, so these runs say nothing about what disaggregation costs
 or saves.
 
+## Store classes
+
+Where a checkpoint is kept is a store class: a directory, and what it allows. A pod names its
+class in the annotation `snapshot.llm-d.ai/class`, and gets `default` when it names none. The
+annotation is part of the pod template, so it is part of the revision. A pod that names a class
+its node does not have cold boots and is not checkpointed.
+
+`default` is the daemon's own `--store-dir`, `--min-free-gib`, `--namespace-limit-gib` and
+`--retain-hours`. More classes come from a JSON file named by `SNAPSHOTD_CLASSES_FILE`:
+
+```json
+{
+  "shared": {"dir": "/stores/shared", "min_free_gib": 100, "namespace_limit_gib": 500, "retain_hours": 168}
+}
+```
+
+| Setting | What it does |
+| --- | --- |
+| `dir` | Where the class's revisions go. It is whatever the DaemonSet mounts there, so a class on any StorageClass is a PVC on the DaemonSet |
+| `min_free_gib` | No checkpoint is taken while the directory's filesystem has less free. 0 when left out |
+| `namespace_limit_gib` | Once a namespace holds this much in the class on this node, its new revisions cold boot and are not checkpointed. The checkpoints it has are still restored |
+| `retain_hours` | A revision is removed when no pod of it has started for this long. Kept for good when left out |
+
+A class on a volume every node mounts holds one copy for all of them, and a node that finds the
+revision there does not pull it. A daemon asked for a revision by a peer looks in every class it
+has. [`daemon/e2e`](../daemon/e2e) runs a second class next to the default.
+
+## Status
+
+The daemon writes no status objects. It serves Prometheus metrics at `/metrics` on port 9090
+(`SNAPSHOTD_METRICS_LISTEN`), and the DaemonSet carries the `prometheus.io` scrape annotations.
+
+| Metric | Labels | What it counts |
+| --- | --- | --- |
+| `snapshotd_pods_total` | `namespace`, `workload`, `how` | Pods brought to serving: `restore`, `capture` (cold boot, checkpoint, restore), `cold_boot` or `started_earlier` |
+| `snapshotd_pod_failures_total` | `namespace`, `workload` | Attempts that ended in an error; the container then starts over cold |
+| `snapshotd_step_seconds` | `step` | A histogram for `cold_boot`, `checkpoint`, `restore` and `pull` |
+| `snapshotd_store_bytes`, `snapshotd_store_revisions` | `class`, `namespace`, `workload` | What a workload's revisions hold in a class on this node, as of the last look |
+| `snapshotd_store_free_bytes` | `class` | Free space on the class's filesystem |
+| `snapshotd_swept_revisions_total`, `snapshotd_swept_bytes_total` | `class` | Revisions removed for being past the class's retention |
+| `snapshotd_timeslice_operations_total` | `action`, `outcome` | [Time-slicing](#time-slicing) snapshots and restores |
+| `snapshotd_timeslice_operation_seconds` | `action` | A histogram of how long they took |
+
+The stores are looked at every `SNAPSHOTD_SWEEP_S` seconds, 600 unless set, which is also when
+revisions past their retention are removed.
+
 ## Time-slicing
 
 The same daemon can be the node agent of
@@ -391,12 +440,12 @@ been run with.
 | Readiness and traffic | The shim opens a port once the server serves, and every probe of the pod points at it | Readiness owned by the platform: a readiness gate the engine sets. A probe left on the server's own port passes during cold boot, before the checkpoint stops the server |
 | Connections during the dump | The daemon closes its own, and CRIU dumps without locking the network, so a connection someone else holds is carried into the image and is dead after the restore | Keep everything else off the server until the pod is ready (kubelet probes, an endpoint picker scraping metrics, a mesh sidecar), or accept that such a client sees a reset |
 | Rollouts | A new template is a new revision and is captured again on every node it lands on | Surge capacity while old and new revisions overlap, what a rollback reuses, and whether a rollout of a one-replica service should capture at all, since it only makes that replica slower |
-| Checkpoint storage | One directory per revision on the node's disk. Nothing is ever deleted, and the space is not charged to any pod | Retention and eviction per node, deletion when the workload goes away (the daemon cannot see that without the API), quotas per tenant, and accounting. With weights kept in the checkpoint an image is the size of the model per revision per node |
+| Checkpoint storage | One directory per revision in a [store class](#store-classes). A class can hold back free space, stop a namespace at a size, and remove revisions no pod has started for a while. The space is not charged to any pod | Deletion when the workload goes away (the daemon cannot see that without the API), a quota summed over nodes, and eviction under pressure instead of by age. With weights kept in the checkpoint an image is the size of the model per revision per node |
 | What a checkpoint contains | Process memory, written to the node's disk unencrypted | It can hold whatever the server had in memory: credentials from its environment, request data. Decide on encryption at rest, who may read the store, and whether tenants may share nodes |
 | Trust between nodes | A daemon reaches another through its kube-rbac-proxy with a ServiceAccount token, and the chunks are encrypted with a key made per transfer. Every daemon is the same ServiceAccount, and any daemon may pull any revision | An identity per node, so a compromised node cannot ask for revisions it has no pod of: the holder checking that the asking node runs that revision, or node-attested identities. NetworkPolicy around the proxy and NIXL ports |
 | A bad checkpoint | A failed restore is remembered for that pod only. The next pod on the node tries the same checkpoint again | Reject a checkpoint for the whole revision after a failed restore, on every node, and report it |
 | Failure of the daemon | A pod whose daemon dies mid-operation waits; a pod that starts with no daemon cold boots after 30 s | Timeouts on every step, a daemon restart that resumes or cleans up, and upgrades of the DaemonSet that do not strand pods |
-| Observability | The daemon's log and one marker file | Pod conditions and events, restore and capture timings as metrics, and a way to list which nodes hold which revision |
+| Observability | The daemon's log and its [metrics](#status): pods by how they came up, how long each step took, failures, and what each class holds for each workload | Pod conditions and events, and one place that lists which nodes hold which revision |
 | An API for operators | None | A resource that says a checkpoint exists, where, for which revision and in what state, so it can be listed, deleted and recaptured |
 | Scale to zero | A checkpoint outlives its pods, so a pod that returns to a node that has it is restored | Whether nodes keep checkpoints for workloads at zero, and for how long |
 | Autoscaler tuning | None | Scale-up now takes seconds for later replicas and a cold boot plus a capture for the first. Stabilization windows, cooldowns and readiness budgets chosen for cold boots are wrong for both |

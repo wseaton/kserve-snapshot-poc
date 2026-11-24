@@ -5,7 +5,8 @@
 #
 # It checks that the first replica of a revision is checkpointed and comes back as the same
 # process, that later replicas are restored from that checkpoint instead of booting and carry
-# their pod's security label, and that a new revision boots and is checkpointed again.
+# their pod's security label, that a new revision boots and is checkpointed again, that a pod's
+# checkpoint goes to the store class it names, and that the daemon's metrics count all of it.
 #
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e)
@@ -87,4 +88,42 @@ for address in $(addresses); do
   got=$(info "$address")
   [ "$got" = "$third" ] || fail "replica $address of the prepared revision is not a restore: $got"
 done
+
+# A pod that names a store class has its checkpoint kept there, and one that names a class the
+# node does not have boots without one.
+class() {
+  settle 1
+  k patch deploy/stand-in --type=merge \
+    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"snapshot.llm-d.ai/class\":\"$1\"}}}}}"
+  settle 1
+}
+logged() { k -n snapshotd logs ds/snapshotd -c snapshotd | grep -c "$1" || true; }
+class scratch
+settle 2
+[ "$(logged "checkpoint published on this node image=/stores/scratch/default/stand-in/")" = 1 ] \
+  || fail "the checkpoint of a pod that named the scratch class is not in /stores/scratch"
+[ "$(logged "restored .*from=/stores/scratch/default/stand-in/.*/image")" = 1 ] \
+  || fail "the second replica was not restored from the scratch class"
+class nowhere
+[ "$(logged 'no store class \\"nowhere\\"')" = 1 ] || fail "a pod that named an unknown class was not cold booted for it"
+[[ $(info "$(addresses)") == *" Running" ]] || fail "the pod that named an unknown class is not serving"
+
+metrics() {
+  k get --raw "/api/v1/namespaces/snapshotd/pods/$(k -n snapshotd get pods -l app=snapshotd -o jsonpath='{.items[0].metadata.name}'):9090/proxy/metrics"
+}
+for _ in $(seq 20); do
+  metrics | grep -q 'snapshotd_store_revisions{class="scratch",namespace="default",workload="stand-in"} 1' && break
+  sleep 1
+done
+for line in \
+  'snapshotd_store_revisions{class="scratch",namespace="default",workload="stand-in"} 1' \
+  'snapshotd_store_revisions{class="default",namespace="default",workload="stand-in"} 3' \
+  'snapshotd_pods_total{namespace="default",workload="stand-in",how="cold_boot"} 1' \
+  'snapshotd_pods_total{namespace="default",workload="stand-in",how="capture"} 4' \
+  'snapshotd_pods_total{namespace="default",workload="stand-in",how="restore"} 6' \
+  'snapshotd_step_seconds_count{step="checkpoint"} 4' \
+  'snapshotd_store_free_bytes{class="scratch"}'; do
+  metrics | grep -qF "$line" || { metrics | grep -v '^#' >&2; fail "the daemon's metrics have no: $line"; }
+done
+echo "the daemon's metrics count what it did and what each class holds"
 echo PASS

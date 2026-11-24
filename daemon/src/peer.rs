@@ -6,7 +6,7 @@
 //!        ─► take a lane ─► upgrade and receive ─► publish
 //! ```
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
 use crate::lanes::Lanes;
-use crate::store::{RevisionKey, RevisionStore, directory_bytes};
+use crate::store::{Classes, RevisionKey, RevisionStore, directory_bytes};
 use crate::topology::{Candidate, Place, nearest_first};
 use crate::transfer::{self, Endpoint, Pool};
 use crate::tunnel::{self, Holder, Identity, Refusal, Status, Tunnel, Work};
@@ -100,7 +100,7 @@ pub struct Peers {
     identity: Identity,
     busy_timeout: Duration,
     place: Place,
-    store: PathBuf,
+    classes: Classes,
     /// One lane for each transfer this daemon can take part in at once,
     /// sending or receiving, each with its share of the registered pool.
     transfers: Lanes<Endpoint>,
@@ -110,7 +110,7 @@ pub struct Peers {
 }
 
 impl Peers {
-    pub async fn start(args: &Args, store: &Path) -> Result<Option<Arc<Self>>> {
+    pub async fn start(args: &Args, classes: Classes) -> Result<Option<Arc<Self>>> {
         let (Some(name), Some(own_ip), Some(ca_file)) =
             (&args.peers, args.own_ip, &args.peer_ca_file)
         else {
@@ -141,7 +141,7 @@ impl Peers {
             },
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             place,
-            store: store.to_path_buf(),
+            classes,
             transfers: Lanes::start(lanes, move |lane| {
                 Endpoint::new(&format!("{agent}-{lane}"), pool, false)
             })?,
@@ -164,17 +164,14 @@ impl Peers {
 impl Holder for Peers {
     fn status(&self, revision: &RevisionKey) -> Status {
         Status {
-            held: revision.image_dir(&self.store).is_dir(),
+            held: self.classes.image_of(revision).is_some(),
             free_lanes: self.turns.available_permits(),
             place: self.place.clone(),
         }
     }
 
     fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
-        let image = revision.image_dir(&self.store);
-        if !image.is_dir() {
-            return Err(Refusal::NoImage);
-        }
+        let image = self.classes.image_of(revision).ok_or(Refusal::NoImage)?;
         let turn = Arc::clone(&self.turns)
             .try_acquire_owned()
             .map_err(|_| Refusal::Busy)?;
