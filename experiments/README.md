@@ -1,6 +1,6 @@
 # Experiments
 
-The runs behind [docs/design.md](../docs/design.md): TP=2 Qwen3-8B on one 8x H200 waldorf node, driver
+The runs behind [Internals](https://wseaton.github.io/snapshotd/internals/) and [Benchmarks](https://wseaton.github.io/snapshotd/benchmarks/): TP=2 Qwen3-8B on one 8x H200 CKS node, driver
 580.126.09, the nightly image `quay.io/wseaton/vllm-checkpoint@sha256:e2659cc1…`. Both pods mount
 Dynamo's agent image for the cuInterpose libraries, coordinator and CRIU, and the compat image for
 its CUDA 13.1 `libcuda`. Put Qwen3-8B at `/models/Qwen3-8B` before running anything.
@@ -56,7 +56,7 @@ The processes stay alive: lock, checkpoint, restore and unlock them in place.
 - `offload-check.sh`: as `POST_CHECK`, counts the bytes CPU KV offload loads back after the
   restore.
 
-The CPU KV offload rows in [design.md](../docs/design.md):
+The [CPU KV offload](https://wseaton.github.io/snapshotd/benchmarks/#cpu-kv-offload) rows:
 
 ```bash
 export MODEL=/models/Qwen3-8B TP=2 NCCL_CUMEM_ENABLE=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 \
@@ -69,7 +69,7 @@ A=(--disable-custom-all-reduce --max-model-len 4096 --kv-cache-memory-bytes 1G
 The kept rows are the same command with `GHOST_LIMIT=160G` on an overlay built without
 `patches/vllm/0004` and `0005`.
 
-The comparison rows in [benchmarks.md](../docs/benchmarks.md), with `TP=2` and `TP=4`:
+The [comparison](https://wseaton.github.io/snapshotd/benchmarks/#snapshotd-against-dynamo-s-cuda-path) rows, with `TP=2` and `TP=4`:
 
 ```bash
 export MODEL=/models/Qwen3-8B TP=4 REMAP=rotate
@@ -98,12 +98,12 @@ Run the cuInterpose rows before any row that sets `OVERLAY`, which patches vLLM 
 - `bench/trace-render.py <output dir> [--png FILE]`: draws a run as a standalone page that reads on
   a phone: capture, transfer, restore and the cold boot beside them. `lifecycle.sh` writes it as
   `lifecycle.html`.
-- Notes and results: [cross-node.md](../docs/cross-node.md), [memory-capture.md](../docs/memory-capture.md).
+- Results: [benchmarks](https://wseaton.github.io/snapshotd/benchmarks/).
 
 ## `timeslice/`: llm-d-rl-time-slicing's orchestrator, with snapshotd as its node agent
 
 Results and how the calls map are in
-[docs/orchestration.md](../docs/orchestration.md#time-slicing).
+[Time-slicing](https://wseaton.github.io/snapshotd/timeslicing/).
 
 - `run.sh up|jobs|verl|down`: installs the project's TimeSlice Orchestrator, points it at the
   daemon on one node, and runs jobs that take turns on one of that node's GPUs. The daemon has to
@@ -121,11 +121,7 @@ memory and back. These runs point that copy at files, so the weights are in neit
 nor the CRIU image, and compare it with reloading them through the model loader. Qwen3-8B
 (15.9 GiB of weights) at TP=1 on one H200, `restore-bench.sh` in one pod:
 
-| Weights at restore | Weights back on the GPU | Restore, total | CRIU image |
-| --- | --- | --- | --- |
-| Released at prepare, reloaded by vLLM (`RELEASE_WEIGHTS=1`) | 2.80 s | 5.57 s | 4.6 GB |
-| Kept on the GPU, so in the process image (`RELEASE_WEIGHTS=0`) | in the image | 10.3 s | 20.5 GB |
-| In files, read back through a pinned buffer by 8 threads | 1.21 s | 3.83 s | 4.6 GB |
+Results: [benchmarks](https://wseaton.github.io/snapshotd/benchmarks/#where-the-weights-come-from).
 
 - `vllm-overlay.diff`: the change to vLLM, against the files in the `vllm-checkpoint` image. Pack
   the two patched files as `OVERLAY` and set `VLLM_CHECKPOINT_WEIGHTS_DIR`.

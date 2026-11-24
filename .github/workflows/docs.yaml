@@ -1,0 +1,56 @@
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - docs/**
+      - .github/workflows/docs.yaml
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - .github/workflows/docs.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
+      - id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
+      - run: zola check --skip-external-links
+        working-directory: docs
+      - run: zola build ${BASE_URL:+--base-url "$BASE_URL"}
+        working-directory: docs
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/public
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

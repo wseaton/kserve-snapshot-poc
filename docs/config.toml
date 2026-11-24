@@ -1,0 +1,15 @@
+base_url = "https://wseaton.github.io/snapshotd"
+title = "snapshotd"
+description = "Restore vLLM replicas from CRIU checkpoints instead of cold booting them."
+compile_sass = true
+build_search_index = false
+
+[markdown]
+smart_punctuation = false
+
+[markdown.highlighting]
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[extra]
+repo_url = "https://github.com/wseaton/snapshotd"

@@ -1,4 +1,4 @@
-//! snapshotd: the privileged node path for snapshot scale-out. See docs/design.md.
+//! snapshotd: the privileged node path for snapshot scale-out. See https://wseaton.github.io/snapshotd/internals/.
 //!
 //! `node` is the daemon. The other subcommands are its building blocks,
 //! usable on their own from a privileged container.

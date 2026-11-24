@@ -2,7 +2,7 @@
 
 [`config-layer/`](config-layer) holds one `LLMInferenceServiceConfig`, named `snapshotd`. An
 `LLMInferenceService` that lists it under `baseRefs` gets its replicas checkpointed and restored by
-the `snapshotd` DaemonSet ([docs/orchestration.md](../../../docs/orchestration.md)). Nothing else is
+the `snapshotd` DaemonSet ([Running the daemon](https://wseaton.github.io/snapshotd/running/)). Nothing else is
 installed for KServe: no webhook, no controller, no custom resource.
 
 ```yaml
@@ -26,7 +26,7 @@ the same changes to both of KServe's templates and differs in three ways: vLLM r
 `--checkpoint-prepare-on-startup` and the NIXL connector in each pod's role, the shim's port is
 8090 because the decode pod's routing sidecar and vLLM already have 8000 and 8001, and the prefill
 pods are labelled `<service name>-prefill`. [`qwen3-8b-pd/`](qwen3-8b-pd) is an example, and
-[Prefill and decode](../../../docs/orchestration.md#prefill-and-decode) has what was measured.
+[Benchmarks](https://wseaton.github.io/snapshotd/benchmarks/#the-daemon) has what was measured.
 
 ## Before a service can use it
 
@@ -101,7 +101,7 @@ node selection, the router and scheduler, autoscaling. For the server itself:
 - `VLLM_ADDITIONAL_ARGS` and the `main` container's `args` are passed to `vllm serve`.
 - `spec.parallelism.tensor` and `.expert` become `--tensor-parallel-size` and
   `--enable-expert-parallel`. Read the limit on tensor parallel below a whole node in
-  [docs/orchestration.md](../../../docs/orchestration.md#a-limit-on-tensor-parallel-below-a-whole-node)
+  [Limits](https://wseaton.github.io/snapshotd/limits/#tensor-parallel-below-a-whole-node)
   first.
 - More environment variables, by name.
 

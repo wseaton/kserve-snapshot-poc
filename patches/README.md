@@ -49,7 +49,7 @@ patches.
 - `0001`: accept CoreWeave's volume-mounts `NVIDIA_VISIBLE_DEVICES`, skip the per-GPU device-list
   marker mounts at dump, and log every CRIU error line on a failed restore.
 - `0002`: expose cuInterpose's coordinator as a library, so a node agent can run its phases
-  in-process. Proposed for upstream; see [docs/design.md](../docs/design.md).
+  in-process. Proposed for upstream; see [Open](https://wseaton.github.io/snapshotd/open/#upstream-changes).
 - `0003`: build the image's CRIU with libselinux and with the patches in an `agent/criu/`
   directory, which the image workflow fills from [`criu/`](criu).
 

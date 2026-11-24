@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write headline.svg: seconds until a DeepSeek-V4.1-Flash replica serves, by how it starts.
 
-Numbers are from docs/cross-node.md and NVIDIA's 2026-11-10 post. Run it again after changing them.
+Numbers are from docs/content/benchmarks.md and NVIDIA's 2026-11-10 post. Run it again after changing them.
 """
 import os
 
