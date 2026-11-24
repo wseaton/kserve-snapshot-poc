@@ -1,9 +1,7 @@
 """A stand-in for a training job that takes turns on a GPU through the TimeSlice Orchestrator.
 
 Each burst adds to a tensor that fills most of the GPU and checks that every earlier burst's
-additions are still there, so a job whose device memory did not survive being parked shows up.
-It gives the memory back in a last turn of its own: a job that exits while it is being parked
-leaves the GPU full for a moment, and a restore of the next job into a full GPU fails for good.
+additions are still there, so a job whose device memory did not survive being paused shows up.
 """
 import os
 import time
@@ -43,7 +41,7 @@ for burst in range(1, BURSTS + 1):
             f"counter {int(held[0])} (expected {want}), intact {intact}"
         )
         if not intact:
-            raise SystemExit("device memory did not survive being parked")
+            raise SystemExit("device memory did not survive being paused")
         time.sleep(max(0.0, BURST_S - (time.monotonic() - started)))
     time.sleep(IDLE_S)
 with client.on_accelerators(timeout_sec=900.0):

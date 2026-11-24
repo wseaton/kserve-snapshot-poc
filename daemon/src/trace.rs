@@ -73,7 +73,6 @@ impl Trace {
         });
     }
 
-    /// The value of a counter now.
     pub fn counter(&self, name: &'static str, value: u64) {
         self.push(Event {
             name,

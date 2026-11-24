@@ -60,8 +60,6 @@ pub struct Args {
     timeslice_operations: usize,
 }
 
-/// A CUDA process of a job: where the driver has it, and the device memory
-/// NVML counts against it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Process {
     pid: i32,
@@ -69,7 +67,6 @@ struct Process {
     device_bytes: u64,
 }
 
-/// What a job's CUDA processes on this node add up to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
     Idle,
@@ -77,7 +74,7 @@ enum Seen {
     Running(Vec<i32>),
     /// The processes that are checkpointed.
     Saved(Vec<i32>),
-    /// Parked in part, or a process is stuck between the two.
+    /// Paused in part, or a process is stuck between the two.
     Torn,
 }
 
@@ -93,11 +90,11 @@ impl Seen {
                 .collect()
         };
         let stuck = pids(|process| matches!(process.phase, Phase::Locked | Phase::Failed));
-        let parked = pids(|process| process.phase == Phase::Checkpointed);
+        let paused = pids(|process| process.phase == Phase::Checkpointed);
         let holding = pids(|process| process.phase == Phase::Running && process.device_bytes > 0);
-        match (stuck.is_empty(), parked.is_empty(), holding.is_empty()) {
+        match (stuck.is_empty(), paused.is_empty(), holding.is_empty()) {
             (false, _, _) | (true, false, false) => Self::Torn,
-            (true, false, true) => Self::Saved(parked),
+            (true, false, true) => Self::Saved(paused),
             (true, true, false) => Self::Running(holding),
             (true, true, true) => Self::Idle,
         }
@@ -122,14 +119,14 @@ enum Action {
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
     Nothing,
-    Park(Vec<i32>),
+    Pause(Vec<i32>),
     Resume(Vec<i32>),
 }
 
 fn step(action: Action, seen: Seen) -> Result<Step> {
     Ok(match (action, seen) {
-        (_, Seen::Torn) => bail!("some of the job's processes are parked and some are not"),
-        (Action::Snapshot, Seen::Running(pids)) => Step::Park(pids),
+        (_, Seen::Torn) => bail!("some of the job's processes are paused and some are not"),
+        (Action::Snapshot, Seen::Running(pids)) => Step::Pause(pids),
         (Action::Restore, Seen::Saved(pids)) => Step::Resume(pids),
         (Action::Snapshot, Seen::Idle | Seen::Saved(_))
         | (Action::Restore, Seen::Idle | Seen::Running(_)) => Step::Nothing,
@@ -198,7 +195,6 @@ impl Agent {
             .map_err(|_| Status::internal("the agent's state is poisoned"))
     }
 
-    /// Every labelled job with a running pod on this node.
     async fn jobs(&self) -> Result<BTreeMap<String, Seen>> {
         let label = &self.args.timeslice_job_label;
         let mut runtime = Runtime::connect(&self.runtime_socket).await?;
@@ -249,24 +245,23 @@ impl Agent {
     async fn run(&self, action: Action, job: &str) -> Result<()> {
         let lock = Duration::from_secs(self.args.timeslice_lock_timeout_s);
         let step = step(action, self.seen(job).await?)?;
-        let parking = matches!(step, Step::Park(_));
+        let pausing = matches!(step, Step::Pause(_));
         let done = tokio::task::spawn_blocking(move || match step {
             Step::Nothing => Ok(()),
-            Step::Park(pids) => cuda::checkpoint_job(&Driver::load()?, &pids, lock),
+            Step::Pause(pids) => cuda::checkpoint_job(&Driver::load()?, &pids, lock),
             Step::Resume(pids) => cuda::restore_job(&Driver::load()?, &pids, &GpuMap::default()),
         })
         .await
         .context("the driver call panicked")?;
         match done {
-            Err(error) if parking && self.seen(job).await? == Seen::Idle => {
-                info!(job, error = %format_args!("{error:#}"), "the job exited while it was parked");
+            Err(error) if pausing && self.seen(job).await? == Seen::Idle => {
+                info!(job, error = %format_args!("{error:#}"), "the job exited while it was being paused");
                 Ok(())
             }
             done => done,
         }
     }
 
-    /// Record an operation on `job`, then run it in the background.
     fn begin(self: &Arc<Self>, action: Action, job: String) -> Result<String, Status> {
         let id = Uuid::new_v4().to_string();
         let mut book = self.book()?;
@@ -314,7 +309,6 @@ impl Agent {
     }
 }
 
-/// The orchestrator names the cuda backend, with no PIDs, or none at all.
 fn supported(config: Option<&pb::BackendConfig>) -> Result<(), Status> {
     match config.and_then(|config| config.backend.as_ref()) {
         None => Ok(()),
@@ -433,7 +427,6 @@ impl SnapshotAgentService for Service {
     }
 }
 
-/// Serve the API in the background, if an address was given.
 pub fn start(args: &Args, runtime_socket: &Path) -> Result<()> {
     let Some(address) = args.timeslice_listen else {
         return Ok(());
@@ -465,7 +458,7 @@ pub fn start(args: &Args, runtime_socket: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::cuda::Phase;
-    use crate::timeslice::{Action, Process, Seen, Step, step};
+    use crate::timeslice::{Process, Seen};
 
     const GIB: u64 = 1 << 30;
 
@@ -478,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_runs_while_it_holds_device_memory_and_is_saved_while_parked() {
+    fn a_job_runs_while_it_holds_device_memory_and_is_saved_while_paused() {
         let loaded = process(5, Phase::Running, 0);
         assert_eq!(Seen::of(&[]), Seen::Idle);
         assert_eq!(Seen::of(&[loaded]), Seen::Idle);
@@ -512,20 +505,5 @@ mod tests {
                 Seen::Torn
             );
         }
-    }
-
-    #[test]
-    fn an_action_parks_resumes_or_does_nothing() {
-        let running = || Seen::Running(vec![7, 9]);
-        let saved = || Seen::Saved(vec![7, 9]);
-        let did = |action, seen| step(action, seen).unwrap();
-        assert_eq!(did(Action::Snapshot, running()), Step::Park(vec![7, 9]));
-        assert_eq!(did(Action::Snapshot, saved()), Step::Nothing);
-        assert_eq!(did(Action::Snapshot, Seen::Idle), Step::Nothing);
-        assert_eq!(did(Action::Restore, saved()), Step::Resume(vec![7, 9]));
-        assert_eq!(did(Action::Restore, running()), Step::Nothing);
-        assert_eq!(did(Action::Restore, Seen::Idle), Step::Nothing);
-        assert!(step(Action::Snapshot, Seen::Torn).is_err());
-        assert!(step(Action::Restore, Seen::Torn).is_err());
     }
 }

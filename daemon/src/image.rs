@@ -300,7 +300,6 @@ impl Arena {
     }
 }
 
-/// A checkpoint held in memory.
 pub struct Store {
     pub manifest: Manifest,
     pub segments: Vec<HugeRegion>,

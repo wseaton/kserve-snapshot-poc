@@ -37,7 +37,6 @@ type Checkpoint = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
 type Restore = unsafe extern "C" fn(i32, *mut CUcheckpointRestoreArgs) -> CUresult;
 type Unlock = unsafe extern "C" fn(i32, *mut libc::c_void) -> CUresult;
 
-/// Where a process stands in the driver's checkpoint cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Running,

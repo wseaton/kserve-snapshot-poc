@@ -5,7 +5,7 @@ The node agent for restore on scale-up, as a Cargo workspace of two crates:
 - `snapshotd` (this directory). `snapshotd node` is the daemon: it finds opted-in pods through CRI,
   checkpoints the first of a revision, restores the rest, and pulls a checkpoint from another
   node's daemon when its own node has none. It can also serve llm-d-rl-time-slicing's node agent
-  API, parking a job's CUDA processes in place and resuming them. How it fits into a cluster is in
+  API, pausing a job's CUDA processes in place and resuming them. How it fits into a cluster is in
   [docs/orchestration.md](../docs/orchestration.md); manifests are in [`deploy/`](deploy). The other
   subcommands, below, are the daemon's building blocks and are what
   [`experiments/bench`](../experiments/bench) calls.

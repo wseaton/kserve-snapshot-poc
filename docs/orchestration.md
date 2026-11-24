@@ -302,7 +302,7 @@ The same daemon can be the node agent of
 orchestrator lets several jobs take turns on a GPU. With `SNAPSHOTD_TIMESLICE_LISTEN` set
 ([`components/timeslice`](../daemon/deploy/components/timeslice)) it serves that project's
 `SnapshotAgentService`, and the project's orchestrator and client libraries work against it
-unchanged. Here a snapshot parks a job where it is: its processes stay alive with their device
+unchanged. Here a snapshot pauses a job where it is: its processes stay alive with their device
 memory in host memory, and nothing goes to the node's store.
 
 ```mermaid

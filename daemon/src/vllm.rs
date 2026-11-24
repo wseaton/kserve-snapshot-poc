@@ -23,8 +23,7 @@ pub enum Lifecycle {
     Restoring,
 }
 
-/// Turn a state response into a lifecycle; a failed lifecycle is an error
-/// carrying the server's reason.
+/// A failed lifecycle is an error carrying the server's reason.
 pub fn lifecycle(response: &pb::CheckpointStateResponse) -> Result<Lifecycle> {
     match response.state() {
         pb::CheckpointState::Running => Ok(Lifecycle::Running),

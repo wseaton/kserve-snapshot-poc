@@ -57,7 +57,6 @@ impl fmt::Display for Place {
     }
 }
 
-/// A peer that holds what is wanted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub address: SocketAddr,

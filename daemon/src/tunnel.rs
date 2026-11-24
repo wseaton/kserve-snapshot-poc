@@ -59,7 +59,6 @@ pub struct Status {
     pub place: Place,
 }
 
-/// The daemon that answers its peers.
 pub trait Holder: Send + Sync + 'static {
     fn status(&self, revision: &RevisionKey) -> Status;
     /// Decide whether to hand `revision` over, and what to do with the
@@ -266,7 +265,6 @@ fn refused(status: StatusCode) -> anyhow::Error {
     }
 }
 
-/// Ask the daemon behind the proxy at `peer` what it has of `revision`.
 pub async fn inquire(
     peer: SocketAddr,
     identity: &Identity,

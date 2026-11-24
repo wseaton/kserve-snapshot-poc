@@ -151,7 +151,6 @@ impl Runtime {
         }
     }
 
-    /// The host PID of every running container in `sandbox`.
     pub async fn pids(&mut self, sandbox: &Sandbox) -> Result<Vec<i32>> {
         let mut pids = Vec::new();
         for container in self.running(sandbox).await? {

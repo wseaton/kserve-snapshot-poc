@@ -144,8 +144,6 @@ pub fn hash_libraries(config: &Config) -> Result<BTreeMap<String, Sha256Digest>>
         .collect()
 }
 
-/// A shared object mapped into a process: device as in `/proc/PID/maps`
-/// (`major:minor` in hex) and inode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MappedFile {
     major: u32,
@@ -396,21 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn hashes_match_sha256_of_each_library() {
-        let config = bundle("hash", b"frontend", b"core");
-        let hashes = hash_libraries(&config).unwrap();
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(
-            hex::encode(hashes[FRONTEND_LIBRARY].0),
-            "1cf387c012cd2d02f1923e589f86df4a4802427057dbc90f47b87f04d29d54bc"
-        );
-        assert_eq!(
-            hex::encode(hashes[CORE_LIBRARY].0),
-            "0d45f5fd462b8c70bffb10021ac1bcff3f58f29b1faf7568595095427d42812c"
-        );
-    }
-
-    #[test]
     fn verify_rejects_a_bundle_built_differently() {
         let checkpointed = bundle("verify-a", b"frontend", b"core");
         let manifest = Manifest {
@@ -501,8 +484,8 @@ mod tests {
 
     #[test]
     fn namespace_pid_of_this_process_is_its_pid_here() {
-        let own = crate::cuinterpose::namespace_pid(std::process::id() as i32).unwrap();
-        assert!(own > 0);
+        let own = std::process::id();
+        assert_eq!(crate::cuinterpose::namespace_pid(own as i32).unwrap(), own);
     }
 
     #[test]

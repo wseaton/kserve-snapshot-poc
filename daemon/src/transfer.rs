@@ -45,7 +45,6 @@ const RECEIVER: &str = "snapshotd-receive";
 const SENDER: &str = "snapshotd-send";
 const HUGE_PAGE: u64 = 2 << 20;
 
-/// How the registered region is cut up.
 #[derive(Clone, Copy, Debug, clap::Args, Serialize, Deserialize)]
 pub struct Pool {
     /// Chunks in flight at once.
@@ -335,7 +334,6 @@ pub fn send_directory(dir: &Path, to: &str, pool: Pool, trace: Option<PathBuf>) 
     Ok(())
 }
 
-/// Chunks are encrypted with `key` when there is one. Returns how the transfer went.
 pub fn send_over(
     stream: impl Control,
     dir: &Path,
