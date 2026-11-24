@@ -6,7 +6,7 @@ The node agent for restore on scale-up, as a Cargo workspace of two crates:
   checkpoints the first of a revision, restores the rest, and pulls a checkpoint from another
   node's daemon when its own node has none. It can also serve llm-d-rl-time-slicing's node agent
   API, pausing a job's CUDA processes in place and resuming them. How it fits into a cluster is in
-  [docs/orchestration.md](../docs/orchestration.md); manifests are in [`deploy/`](deploy). The other
+  [Running the daemon](https://wseaton.github.io/snapshotd/running/); manifests are in [`deploy/`](deploy). The other
   subcommands, below, are the daemon's building blocks and are what
   [`experiments/bench`](../experiments/bench) calls.
 - `snapshotd-shim` ([`shim/`](shim)). PID 1 of the workload container. It is built static, against
@@ -70,7 +70,7 @@ snapshotd image hold --images-dir DIR [--reserve-gib N]
 
 The other end of `criu dump --stream` and `criu restore --stream`: it takes one dump into
 anonymous 2 MiB-aligned huge-page segments and answers restores from them until killed. See
-[docs/memory-capture.md](../docs/memory-capture.md).
+[Internals](https://wseaton.github.io/snapshotd/internals/#huge-page-capture).
 
 ## Copy to another node
 
@@ -88,4 +88,4 @@ sends while CRIU dumps and writes nothing on the source. On the target, `--direc
 `O_DIRECT`, `--mmap` copies into RAM-backed files in parallel, and `--hold` keeps the image in
 memory and serves the restore itself. `--trace` writes a per-chunk timeline for
 `experiments/bench/trace-merge.py`. Results are in
-[docs/cross-node.md](../docs/cross-node.md).
+[Benchmarks](https://wseaton.github.io/snapshotd/benchmarks/).

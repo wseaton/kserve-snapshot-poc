@@ -1,0 +1,13 @@
+<script src="{{ get_url(path='vendor/mermaid.min.js', cachebust=true) | safe }}"></script>
+<script type="module">
+  const nodes = [...document.querySelectorAll("pre.mermaid")];
+  const sources = nodes.map((node) => node.textContent);
+  async function draw() {
+    const dark = document.documentElement.dataset.theme === "dark";
+    mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "neutral", fontFamily: "Public Sans, sans-serif" });
+    nodes.forEach((node, i) => { node.removeAttribute("data-processed"); node.textContent = sources[i]; });
+    await mermaid.run({ nodes });
+  }
+  document.addEventListener("theme-change", draw);
+  draw();
+</script>

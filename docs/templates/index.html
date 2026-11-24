@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="panel post">
+  <div class="panel-body">
+    <header>
+      <h1>{{ config.title }}</h1>
+      <p class="standfirst">{{ config.description }}</p>
+    </header>
+    {{ section.content | safe }}
+  </div>
+</article>
+{% endblock content %}
+{% block scripts %}{% if section.extra.mermaid %}{% include "mermaid.html" %}{% endif %}{% endblock scripts %}
