@@ -38,8 +38,8 @@ flowchart LR
     receive --> criu --> gpu --> restore --> ready
   end
   peer[A replica that is serving]
-  send == "InfiniBand, during the dump" ==> receive
-  peer == "weights, GPU to GPU" ==> restore
+  source == "image over InfiniBand, during the dump" ==> target
+  peer == "weights, GPU to GPU" ==> target
 {% end %}
 
 1. **Prepare.** vLLM drains and frees its KV cache and weights. About 5 GB stays on each GPU.

@@ -13,8 +13,8 @@ patches.
 | [`criu/`](criu) | `criu-dev` at `1a935857`, the commit the snapshot-agent image builds |
 
 **vLLM**
-- `0001`: [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011) (open), carried
-  unchanged. Sleep, wake and in-place reload hooks on `BaseModelLoader`, which ModelExpress uses
+- `0001`: [vllm-project/vllm#57011](https://github.com/vllm-project/vllm/pull/57011), merged
+  2026-11-23 after this base; carried unchanged until the base moves. Sleep, wake and in-place reload hooks on `BaseModelLoader`, which ModelExpress uses
   to stop serving before its memory is freed and to refill weights from a peer.
 - `0002`: `--checkpoint-release-weights`. `/checkpoint/prepare` also discards the weights, so the
   checkpoint does not contain them, and `/checkpoint/restore` wakes them and reloads them through

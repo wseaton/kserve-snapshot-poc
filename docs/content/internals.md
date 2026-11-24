@@ -9,7 +9,7 @@ mermaid = true
 ## Checkpoint order
 
 {% mermaid() %}
-flowchart LR
+flowchart TB
   subgraph PREP["vLLM, before"]
     V1["/checkpoint/prepare<br/>drain, drop KV cache and weights,<br/>tear down communicators"]
   end
@@ -30,10 +30,7 @@ flowchart LR
   subgraph POST["vLLM, after"]
     V2["/checkpoint/restore<br/>communicators, weights,<br/>KV cache, CUDA graphs"]
   end
-  V1 --> C1
-  C3 --> IMG[("image")]
-  IMG --> S1
-  S3 --> V2
+  PREP --> CK --> IMG[("image")] --> RS --> POST
 {% end %}
 
 - **cuInterpose** is needed only while processes share GPU memory at checkpoint time; the driver

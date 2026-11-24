@@ -4,7 +4,7 @@ Three paths, all kustomize:
 
 | | Node agent | Checkpoint goes to | Weights after restore |
 | --- | --- | --- | --- |
-| [`snapshotd/node`](snapshotd/node) | `snapshotd node` DaemonSet | node disk, pulled by peers | in the checkpoint |
+| [`snapshotd/node`](snapshotd/node) | `snapshotd node` DaemonSet | node disk, pulled by peers | model volume |
 | [`snapshotd/`](snapshotd) bench pods | `snapshotd` from scripts | node disk, or the target's RAM over InfiniBand | ModelExpress peer, else model volume |
 | [`dynamo-snapshot/`](dynamo-snapshot) | Dynamo Snapshot `bc9d216` | a `ReadWriteMany` volume | ModelExpress peer, else model volume |
 

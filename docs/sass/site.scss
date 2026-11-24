@@ -185,24 +185,24 @@ table.catalog { width: 100%; border-collapse: collapse; background: var(--surfac
 .entry { font-weight: 600; color: var(--ink); }
 
 .post .panel-body { padding: 26px 18px 34px; font-size: 15px; line-height: 1.6; }
-.post .panel-body > * { max-width: 42rem; }
+.post .panel-body > * { max-width: 44rem; }
+.post .panel-body > :is(.diagram, .codeblock, table, p:has(> img)) { max-width: none; }
 .post header { margin-bottom: 26px; padding-bottom: 18px; border-bottom: 1px solid var(--rule); }
-.post h1 { font-size: 24px; line-height: 1.2; letter-spacing: -0.015em; font-weight: 700; margin: 0 0 10px; text-wrap: balance; }
+.post h1 { font-size: 30px; line-height: 1.2; letter-spacing: -0.015em; font-weight: 700; margin: 0 0 10px; text-wrap: balance; }
 .standfirst { color: var(--ink-2); margin: 0; }
 
 .post h2 {
-  margin: 34px 0 12px;
-  padding-top: 12px;
+  margin: 40px 0 12px;
+  padding-top: 14px;
   border-top: 1px solid var(--rule-hard);
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 400;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-size: 21px;
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   color: var(--ink);
 }
 
-.post h3 { font-size: 15px; font-weight: 700; margin: 24px 0 6px; }
+.post h3 { font-size: 17px; font-weight: 700; margin: 28px 0 8px; }
 .post p, .post ul, .post ol { margin: 0 0 14px; }
 .post li { margin-bottom: 4px; }
 .post ul, .post ol { padding-left: 22px; }
@@ -262,6 +262,30 @@ blockquote { margin: 0 0 14px; padding-left: 12px; border-left: 3px solid var(--
   .catalog td { display: block; width: auto !important; padding: 1px 18px; border: 0; white-space: normal !important; }
 }
 
+.codeblock { position: relative; }
+
+.codeblock .copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--rule-hard);
+  border-radius: 4px;
+  padding: 2px 7px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.codeblock:hover .copy, .codeblock .copy:focus-visible { opacity: 1; }
+
+@media (hover: none) { .codeblock .copy { opacity: 1; } }
+
 .layout { display: flex; align-items: stretch; }
 .layout > main { flex: 1; min-width: 0; }
 
@@ -300,3 +324,4 @@ blockquote { margin: 0 0 14px; padding-left: 12px; border-left: 3px solid var(--
 .post .panel-body img { max-width: 100%; height: auto; }
 .post .panel-body > p > img { display: block; }
 .post h2 a.zola-anchor, .post h3 a.zola-anchor { color: inherit; }
+.diagram svg { max-height: 640px; }

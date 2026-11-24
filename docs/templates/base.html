@@ -67,6 +67,30 @@
       });
     })();
   </script>
+  <script>
+    for (const pre of document.querySelectorAll("pre:not(.mermaid)")) {
+      const code = pre.querySelector("code");
+      if (!code) continue;
+      const wrap = document.createElement("div");
+      wrap.className = "codeblock";
+      pre.replaceWith(wrap);
+      wrap.append(pre);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "copy";
+      button.textContent = "Copy";
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(code.innerText.replace(/\n$/, ""));
+          button.textContent = "Copied";
+        } catch {
+          button.textContent = "Failed";
+        }
+        setTimeout(() => { button.textContent = "Copy"; }, 1500);
+      });
+      wrap.append(button);
+    }
+  </script>
   {% block scripts %}{% endblock scripts %}
 </body>
 </html>

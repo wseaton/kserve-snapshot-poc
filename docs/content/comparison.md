@@ -71,7 +71,7 @@ Notes on the rows:
 - Run on a shared volume alone. Our times need RDMA between nodes and, with weights released, a
   serving peer. Over TCP the copy ran at 2.3 Gbit/s.
 - Support three engines, with published results on 22 configurations.
-- `snapshotd node` keeps weights in the checkpoint. The released-weights, peer and streaming path
-  has been run only from bench pods.
+- `snapshotd node` releases the weights and reloads them from the model volume. Peer weights and
+  streamed capture have run only from bench pods.
 - In our peer run the source stops at the dump and a second server is cold-booted as the peer. A
   source that keeps serving through capture is not exercised.

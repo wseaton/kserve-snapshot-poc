@@ -62,7 +62,8 @@ Each gap below is the current behavior, then what is missing.
 - A dying daemon strands pods mid-operation; a pod with no daemon cold boots after 30 s.
 - Connections other clients hold to the server are dead after restore.
 - Only one container per pod (`--container`) is handled.
-- Weights stay in the checkpoint; peer reload is not wired in.
+- Weights are released and reloaded from the model volume. ModelExpress peer reload is not wired
+  in.
 - The checkpoint RPCs exist only in `patches/vllm/0006`, on the Rust frontend.
 
 Not needed, unlike the Dynamo Snapshot integration: `SnapshotJob`/`PodSnapshot`, donor pods, pods

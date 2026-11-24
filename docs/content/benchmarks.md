@@ -196,7 +196,8 @@ as a 32-bit field, so it cannot keep a 128 GiB region (from its source, not run)
 
 ## The daemon
 
-`snapshotd node` as a DaemonSet, Qwen3-8B TP=1 unless noted, weights in the checkpoint. Times are
+`snapshotd node` as a DaemonSet, Qwen3-8B TP=1 unless noted, weights released and reloaded from the
+model volume. Times are
 pod creation to Ready.
 
 | Run | First replica | Later, same node | Later, other node | Pull |

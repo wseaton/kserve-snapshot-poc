@@ -6,6 +6,25 @@ weight = 70
 nav = "Open"
 +++
 
+Checked against the code and upstream on 2026-11-24.
+
+## Daemon
+
+- **Peer weights.** `snapshotd node` reloads weights from the model volume. ModelExpress reload
+  from a serving replica, the fastest path measured, runs only from bench pods.
+- **Streamed capture.** The daemon dumps to its node store; streaming the dump to another node's RAM
+  runs only from bench pods.
+- **Partial-node TP>1** restores only onto the same device minors
+  ([Limits](@/limits.md#tensor-parallel-below-a-whole-node)). The no-sharing configuration that
+  would lift this has not been run under the daemon.
+
+### Peer selection
+
+- Choose the transport by distance; `UCX_TLS` is one setting for every pair.
+- Remember delivered bandwidth and failures per peer.
+- Weigh load against distance; nearness always wins today.
+- Let a control plane name the source and place checkpoints ahead of scale-out.
+
 ## Restore
 
 - **gpt-oss-120b does not survive `--checkpoint-release-weights`.** After reload every worker logs
@@ -25,18 +44,11 @@ nav = "Open"
 - **~5 GB per GPU stays allocated after prepare** (2.7 GB of per-layer blocks, 1.5 GB in a private
   pool). Releasing it would take ~33 GB off a DeepSeek image. The owning vLLM objects are not
   identified.
-- **Restore from a stream is slower than from files** (9.8 s against 5.1 s at TP=8): CRIU cannot
-  seek a stream. `vmsplice` was not tried.
-- **The RDMA leg from `image hold` memory** is not written; `transfer` copies through its own pool.
-- **Host memory.** The image needs its size in RAM on the target until restore, charged to the pod.
-- **cuInterpose state and the manifest** are still files beside the stream.
-
-## Peer selection
-
-- Choose the transport by distance; `UCX_TLS` is one setting for every pair.
-- Remember delivered bandwidth and failures per peer.
-- Weigh load against distance; nearness always wins today.
-- Let a control plane name the source and place checkpoints ahead of scale-out.
+- **Restore from a stream is slower than from files** (9.8 s against 5.1 s at TP=8; 20.2 s with
+  `transfer receive --hold`): CRIU reads a stream range by range. This is why the RAM path writes
+  files to tmpfs instead. `vmsplice` was not tried.
+- **Target RAM.** On the bench RAM path the image holds its size in the target's memory until
+  restore, charged to the pod.
 
 ## Platform
 
@@ -49,14 +61,17 @@ nav = "Open"
 
 | Change | Where | State |
 | --- | --- | --- |
-| Recreate the NCCL communicator around a checkpoint, recapturing graphs | vLLM, `patches/vllm/0003` | tested at TP=2 onto other GPUs |
-| Free and refill the CPU KV offload region, on [vllm#64371](https://github.com/vllm-project/vllm/pull/64371) | vLLM, `patches/vllm/0005` | tested at 16 and 128 GiB |
-| Checkpoint lifecycle on the Rust frontend's gRPC `Control` service | vLLM, `patches/vllm/0006` | in use |
-| NIXL prefill and decode checkpointing, second commit of #64371 | vLLM, `patches/vllm/0007` | in use |
+| Checkpoint lifecycle | [vllm#62570](https://github.com/vllm-project/vllm/pull/62570) | merged, in our base |
+| Model loader sleep, wake and reload hooks | [vllm#57011](https://github.com/vllm-project/vllm/pull/57011), `patches/vllm/0001` | merged 2026-11-23, after our base |
+| Release weights at prepare | `patches/vllm/0002` | carried |
+| Recreate the NCCL communicator around a checkpoint | `patches/vllm/0003` | carried |
+| Connector checkpoint hooks, NIXL prefill/decode | [vllm#64371](https://github.com/vllm-project/vllm/pull/64371), `0004`, `0007` | open |
+| Free and refill the CPU KV offload region | `patches/vllm/0005` | carried, stacked on #64371 |
+| Checkpoint lifecycle on the Rust frontend's gRPC service | `patches/vllm/0006` | carried, no upstream PR yet |
 | Refill the offload region after serving resumes | vLLM | not started |
-| Release custom all-reduce IPC buffers at prepare | vLLM | not started; removes `--disable-custom-all-reduce` |
+| Release custom all-reduce IPC buffers at prepare | vLLM | not started |
 | Rebuild FlashInfer all-reduce workspaces after a device remap | FlashInfer, vLLM | not started |
 | A new cuMem NCCL communicator after a GPU remap | NCCL or the driver | not reported |
-| cuInterpose coordinator as a library | ai-dynamo/snapshot, `patches/dynamo-snapshot/0002` | proposed |
+| cuInterpose coordinator as a library | `patches/dynamo-snapshot/0002` | carried |
 | Caller-provided NIXL buffers | [nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672) | open |
-| SELinux decided from the process's own label | CRIU, `patches/criu/0001` | in use |
+| SELinux decided from the process's own label | `patches/criu/0001` | carried |
