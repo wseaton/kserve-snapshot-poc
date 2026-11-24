@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: snapshotd
+  namespace: snapshotd
+spec:
+  template:
+    spec:
+      nodeSelector: null
+      initContainers:
+        - name: tools
+          imagePullPolicy: Never
+          command: [cp, -a, /opt/tools/., /tools/]
+      containers:
+        - name: snapshotd
+          imagePullPolicy: Never
+          args:
+            - --store-dir=/store
+            - --tools-dir=/tools
+            - --min-free-gib=1

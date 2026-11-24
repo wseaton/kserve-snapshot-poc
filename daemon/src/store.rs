@@ -7,6 +7,9 @@
 //! <class>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
 //! <class>/<namespace>/<workload>/<hash>/used             touched when a pod of the revision starts
 //! ```
+//!
+//! `<workload>` names a role and a group member too when the pod has them; see
+//! [`Workload`].
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
@@ -21,36 +24,102 @@ use serde::Deserialize;
 pub const DEFAULT_CLASS: &str = "default";
 const USED: &str = "used";
 
+/// Separates a workload's name from its role, and the role from the member.
+/// Label values contain neither.
+const ROLE_SEPARATOR: char = '@';
+const MEMBER_SEPARATOR: char = '+';
+
+/// What a checkpoint is of: a workload, the role it plays in a disaggregated
+/// deployment, and which pod of a multi-pod group it is. Its path component
+/// is `name`, `name@role`, `name+member` or `name@role+member`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Workload {
+    name: String,
+    role: Option<String>,
+    member: Option<u32>,
+}
+
+impl Workload {
+    pub fn new(name: &str, role: Option<&str>, member: Option<u32>) -> Result<Self> {
+        ensure!(valid_part(name), "{name:?} cannot name a workload");
+        if let Some(role) = role {
+            ensure!(valid_part(role), "{role:?} cannot name a role");
+        }
+        Ok(Self {
+            name: name.to_string(),
+            role: role.map(str::to_string),
+            member,
+        })
+    }
+
+    /// Which pod of its group this is, when the group has more than one.
+    pub fn member(&self) -> Option<u32> {
+        self.member
+    }
+}
+
+impl FromStr for Workload {
+    type Err = anyhow::Error;
+
+    fn from_str(component: &str) -> Result<Self> {
+        let (rest, member) = match component.split_once(MEMBER_SEPARATOR) {
+            Some((rest, member)) => {
+                ensure!(
+                    !member.is_empty() && member.chars().all(|c| c.is_ascii_digit()),
+                    "{member:?} cannot name a member"
+                );
+                (rest, Some(member.parse().context("a member index")?))
+            }
+            None => (component, None),
+        };
+        let (name, role) = match rest.split_once(ROLE_SEPARATOR) {
+            Some((name, role)) => (name, Some(role)),
+            None => (rest, None),
+        };
+        Self::new(name, role, member)
+    }
+}
+
+impl fmt::Display for Workload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(role) = &self.role {
+            write!(f, "{ROLE_SEPARATOR}{role}")?;
+        }
+        if let Some(member) = self.member {
+            write!(f, "{MEMBER_SEPARATOR}{member}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RevisionKey {
     namespace: String,
-    workload: String,
+    workload: Workload,
     hash: String,
 }
 
 impl RevisionKey {
-    pub fn new(namespace: &str, workload: &str, hash: &str) -> Result<Self> {
-        for part in [namespace, workload, hash] {
-            ensure!(
-                !part.is_empty()
-                    && !part.starts_with('.')
-                    && part
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-                "{part:?} cannot name part of a revision"
-            );
+    pub fn new(namespace: &str, workload: Workload, hash: &str) -> Result<Self> {
+        for part in [namespace, hash] {
+            ensure!(valid_part(part), "{part:?} cannot name part of a revision");
         }
         Ok(Self {
             namespace: namespace.to_string(),
-            workload: workload.to_string(),
+            workload,
             hash: hash.to_string(),
         })
+    }
+
+    pub fn workload(&self) -> &Workload {
+        &self.workload
     }
 
     fn dir(&self, store: &Path) -> PathBuf {
         store
             .join(&self.namespace)
-            .join(&self.workload)
+            .join(self.workload.to_string())
             .join(&self.hash)
     }
 
@@ -58,6 +127,14 @@ impl RevisionKey {
     pub fn image_dir(&self, store: &Path) -> PathBuf {
         self.dir(store).join("image")
     }
+}
+
+fn valid_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('.')
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 impl FromStr for RevisionKey {
@@ -68,7 +145,7 @@ impl FromStr for RevisionKey {
         let [namespace, workload, hash] = parts[..] else {
             anyhow::bail!("{name:?} is not <namespace>/<workload>/<hash>");
         };
-        Self::new(namespace, workload, hash)
+        Self::new(namespace, workload.parse()?, hash)
     }
 }
 
@@ -114,7 +191,7 @@ impl Class {
         let mut held: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
         for (revision, dir) in revisions(&self.dir) {
             let (bytes, count) = held
-                .entry((revision.namespace, revision.workload))
+                .entry((revision.namespace, revision.workload.to_string()))
                 .or_default();
             *bytes += directory_bytes(&dir);
             *count += 1;
@@ -180,7 +257,9 @@ fn revisions(store: &Path) -> Vec<(RevisionKey, PathBuf)> {
     for (namespace, dir) in subdirectories(store) {
         for (workload, dir) in subdirectories(&dir) {
             for (hash, dir) in subdirectories(&dir) {
-                if let Ok(revision) = RevisionKey::new(&namespace, &workload, &hash) {
+                if let Ok(revision) =
+                    format!("{namespace}/{workload}/{hash}").parse::<RevisionKey>()
+                {
                     found.push((revision, dir));
                 }
             }
@@ -361,7 +440,8 @@ mod tests {
     use anyhow::anyhow;
 
     use crate::store::{
-        Class, Classes, RevisionKey, RevisionStore, USED, Usage, directory_bytes, ensure_room,
+        Class, Classes, RevisionKey, RevisionStore, USED, Usage, Workload, directory_bytes,
+        ensure_room, revisions,
     };
 
     fn scratch(name: &str) -> PathBuf {
@@ -567,7 +647,7 @@ mod tests {
     }
 
     fn open(root: &Path, pod: &str) -> RevisionStore {
-        let key = RevisionKey::new("serving", "qwen3-8b", "7b9f694bf8").unwrap();
+        let key: RevisionKey = "serving/qwen3-8b/7b9f694bf8".parse().unwrap();
         RevisionStore::open(root, &key, pod).unwrap()
     }
 
@@ -593,6 +673,100 @@ mod tests {
         ] {
             assert!(name.parse::<RevisionKey>().is_err(), "{name:?}");
         }
+    }
+
+    fn key(role: Option<&str>, member: Option<u32>) -> RevisionKey {
+        RevisionKey::new(
+            "serving",
+            Workload::new("qwen", role, member).unwrap(),
+            "5d8c",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn roles_and_group_members_keep_their_own_revision_of_a_workload() {
+        let cases = [
+            (None, None, "serving/qwen/5d8c"),
+            (Some("prefill"), None, "serving/qwen@prefill/5d8c"),
+            (Some("decode"), None, "serving/qwen@decode/5d8c"),
+            (None, Some(0), "serving/qwen+0/5d8c"),
+            (Some("decode"), Some(0), "serving/qwen@decode+0/5d8c"),
+            (Some("decode"), Some(12), "serving/qwen@decode+12/5d8c"),
+        ];
+        let keys: Vec<RevisionKey> = cases
+            .iter()
+            .map(|(role, member, name)| {
+                let key = key(*role, *member);
+                assert_eq!(key.to_string(), *name);
+                assert_eq!(revision(name), key, "{name} parses back");
+                assert_eq!(key.workload().member(), *member);
+                key
+            })
+            .collect();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(
+            key(Some("decode"), Some(1)).image_dir(Path::new("/store")),
+            Path::new("/store/serving/qwen@decode+1/5d8c/image")
+        );
+
+        for (name, role) in [
+            ("qwen", Some("")),
+            ("qwen", Some("pre@fill")),
+            ("qwen", Some("pre+fill")),
+            ("qwen", Some(".hidden")),
+            ("qwen", Some("pre/fill")),
+            ("qw@en", None),
+            ("qw+en", None),
+            ("", Some("prefill")),
+        ] {
+            assert!(
+                Workload::new(name, role, None).is_err(),
+                "{name:?} {role:?}"
+            );
+        }
+        for name in [
+            "serving/qwen@/5d8c",
+            "serving/@prefill/5d8c",
+            "serving/qwen@pre@fill/5d8c",
+            "serving/qwen@.prefill/5d8c",
+            "serving/qwen+/5d8c",
+            "serving/qwen+-1/5d8c",
+            "serving/qwen+1x/5d8c",
+            "serving/qwen+1+2/5d8c",
+            "serving/qwen+99999999999/5d8c",
+            "serving/qwen+1@decode/5d8c",
+            "serving@x/qwen/5d8c",
+            "serving/qwen/5d8c@x",
+        ] {
+            assert!(name.parse::<RevisionKey>().is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_store_lists_each_role_of_a_workload_as_its_own_revision() {
+        let dir = scratch("roles");
+        held(&dir, "serving/qwen@prefill/5d8c", 10, 0);
+        held(&dir, "serving/qwen@decode/5d8c", 20, 0);
+        held(&dir, "serving/qwen@decode+1/5d8c", 20, 0);
+        let mut found: Vec<String> = revisions(&dir)
+            .into_iter()
+            .map(|(revision, _)| revision.to_string())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "serving/qwen@decode+1/5d8c",
+                "serving/qwen@decode/5d8c",
+                "serving/qwen@prefill/5d8c"
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

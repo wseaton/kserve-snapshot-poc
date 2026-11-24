@@ -1,0 +1,91 @@
+# Prefill and decode share a workload label and a revision; only the role tells their
+# checkpoints apart.
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: stand-in-pd
+  namespace: default
+spec:
+  roles:
+    - name: prefill
+      spec:
+        replicas: 1
+        leaderWorkerTemplate:
+          size: 1
+          workerTemplate:
+            metadata:
+              labels:
+                snapshot.llm-d.ai/workload: stand-in-pd
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: main
+                  image: ghcr.io/wseaton/snapshotd/snapshotd
+                  imagePullPolicy: Never
+                  command: [snapshotd-shim, --, stand-in, serve]
+                  ports:
+                    - name: control
+                      containerPort: 50051
+                    - name: ready
+                      containerPort: 8001
+                  readinessProbe:
+                    tcpSocket:
+                      port: ready
+                    periodSeconds: 1
+    - name: decode
+      spec:
+        replicas: 1
+        leaderWorkerTemplate:
+          size: 1
+          workerTemplate:
+            metadata:
+              labels:
+                snapshot.llm-d.ai/workload: stand-in-pd
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: main
+                  image: ghcr.io/wseaton/snapshotd/snapshotd
+                  imagePullPolicy: Never
+                  command: [snapshotd-shim, --, stand-in, serve]
+                  ports:
+                    - name: control
+                      containerPort: 50051
+                    - name: ready
+                      containerPort: 8001
+                  readinessProbe:
+                    tcpSocket:
+                      port: ready
+                    periodSeconds: 1
+---
+# A data-parallel server that spans two pods: each pod holds different ranks, so neither can be
+# restored on its own.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: stand-in-group
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    workerTemplate:
+      metadata:
+        labels:
+          snapshot.llm-d.ai/workload: stand-in-group
+      spec:
+        terminationGracePeriodSeconds: 2
+        containers:
+          - name: main
+            image: ghcr.io/wseaton/snapshotd/snapshotd
+            imagePullPolicy: Never
+            command: [snapshotd-shim, --, stand-in, serve]
+            ports:
+              - name: control
+                containerPort: 50051
+              - name: ready
+                containerPort: 8001
+            readinessProbe:
+              tcpSocket:
+                port: ready
+              periodSeconds: 1

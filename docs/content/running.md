@@ -76,6 +76,26 @@ For each pod on its node with the workload label:
 It writes nothing to the Kubernetes API. Its one read is its own node's labels, for
 `--topology-levels`.
 
+## Revisions, roles and groups
+
+A checkpoint is keyed by namespace, workload, role, group member and revision:
+
+| Part | From | Default label |
+| --- | --- | --- |
+| workload | `--label` | `snapshot.llm-d.ai/workload` |
+| role | `--role-label` | `disaggregatedset.x-k8s.io/role` |
+| member, only in groups of more than one pod | `--member-label`, `--group-size-annotation` | `leaderworkerset.sigs.k8s.io/worker-index`, `.../size` |
+| revision, first label present | `--revision-label` | `disaggregatedset.x-k8s.io/revision`, `leaderworkerset.sigs.k8s.io/template-revision-hash`, `pod-template-hash` |
+
+A DisaggregatedSet's prefill and decode pods share one revision, so the role keeps their
+checkpoints apart even under one workload label. Slices, LWS replica groups and DisaggregatedSet
+subroles are interchangeable and share a checkpoint. A checkpoint never crosses a
+DisaggregatedSet revision, which is the boundary the llm-d rollout screener pairs pods within.
+
+Pods of a multi-pod group (data or expert parallel across nodes) hold different ranks and have to
+be captured and restored together. The daemon does not do that yet; it cold boots them and logs
+why. Example: [`deploy/snapshotd/disaggregatedset`](https://github.com/wseaton/snapshotd/tree/main/deploy/snapshotd/disaggregatedset).
+
 ## Checkpoints between nodes
 
 With the [`peers`](https://github.com/wseaton/snapshotd/tree/main/daemon/deploy/components/peers)
@@ -201,7 +221,7 @@ checkpointed.
 ## Prefill and decode
 
 Needs the NIXL connector with [vllm#64371](https://github.com/vllm-project/vllm/pull/64371),
-carried as `patches/vllm/0007`. Examples:
+carried as `patches/vllm/0002`. Examples:
 [`workload-pd`](https://github.com/wseaton/snapshotd/tree/main/deploy/snapshotd/workload-pd) and
 [`kserve/qwen3-8b-pd`](https://github.com/wseaton/snapshotd/tree/main/deploy/snapshotd/kserve/qwen3-8b-pd).
 

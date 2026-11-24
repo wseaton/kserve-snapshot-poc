@@ -40,7 +40,7 @@ use crate::peer::{self, Peers};
 use crate::podresources;
 #[cfg(feature = "nixl")]
 use crate::store::directory_bytes;
-use crate::store::{Class, Classes, RevisionKey, RevisionStore};
+use crate::store::{Class, Classes, RevisionKey, RevisionStore, Workload};
 use crate::timeslice;
 use crate::vllm::{Control, Lifecycle};
 
@@ -105,13 +105,40 @@ pub struct Args {
     /// Address to serve Prometheus metrics on, at /metrics.
     #[arg(long, env = "SNAPSHOTD_METRICS_LISTEN", default_value = "0.0.0.0:9090")]
     metrics_listen: SocketAddr,
-    /// Pod label that names a pod's revision.
+    /// Pod labels that name a pod's revision, in order; the first a pod
+    /// carries is used.
     #[arg(
         long,
         env = "SNAPSHOTD_REVISION_LABEL",
-        default_value = "pod-template-hash"
+        value_delimiter = ',',
+        default_value = "disaggregatedset.x-k8s.io/revision,leaderworkerset.sigs.k8s.io/template-revision-hash,pod-template-hash"
     )]
-    revision_label: String,
+    revision_label: Vec<String>,
+    /// Pod label that names a workload's role, such as prefill or decode. Pods
+    /// of one workload in different roles keep separate checkpoints. Empty to
+    /// ignore roles.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_ROLE_LABEL",
+        default_value = "disaggregatedset.x-k8s.io/role"
+    )]
+    role_label: String,
+    /// Pod label that names which pod of a multi-pod group a pod is. Empty
+    /// to treat every pod as a whole replica.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_MEMBER_LABEL",
+        default_value = "leaderworkerset.sigs.k8s.io/worker-index"
+    )]
+    member_label: String,
+    /// Pod annotation that says how many pods a group has. The member label
+    /// counts only when it is above 1.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_GROUP_SIZE_ANNOTATION",
+        default_value = "leaderworkerset.sigs.k8s.io/size"
+    )]
+    group_size_annotation: String,
     /// Seconds between looks at the runtime's pods.
     #[arg(long, env = "SNAPSHOTD_POLL_S", default_value_t = 2)]
     poll_s: u64,
@@ -249,16 +276,93 @@ async fn container_init(
     }
 }
 
-fn revision_of(sandbox: &Sandbox, label: &str, revision_label: &str) -> Result<RevisionKey> {
-    let workload = sandbox
-        .labels
-        .get(label)
-        .context("the opt-in label is gone")?;
-    let hash = sandbox
-        .labels
-        .get(revision_label)
-        .with_context(|| format!("no {revision_label} label; is the pod from a Deployment?"))?;
-    RevisionKey::new(&sandbox.namespace, workload, hash)
+impl Args {
+    fn labels(&self) -> Labels<'_> {
+        Labels {
+            workload: &self.label,
+            role: &self.role_label,
+            member: &self.member_label,
+            group_size: &self.group_size_annotation,
+            revision: &self.revision_label,
+        }
+    }
+}
+
+/// Which labels name a pod's workload, role, group member and revision.
+struct Labels<'a> {
+    workload: &'a str,
+    role: &'a str,
+    member: &'a str,
+    group_size: &'a str,
+    revision: &'a [String],
+}
+
+impl Labels<'_> {
+    fn workload(&self, sandbox: &Sandbox) -> Result<Workload> {
+        let name = sandbox
+            .labels
+            .get(self.workload)
+            .context("the opt-in label is gone")?;
+        let role = configured(self.role)
+            .and_then(|label| sandbox.labels.get(label))
+            .map(String::as_str);
+        Workload::new(name, role, self.member(sandbox)?)
+    }
+
+    fn member(&self, sandbox: &Sandbox) -> Result<Option<u32>> {
+        let (Some(label), Some(annotation)) =
+            (configured(self.member), configured(self.group_size))
+        else {
+            return Ok(None);
+        };
+        let Some(size) = sandbox.annotations.get(annotation) else {
+            return Ok(None);
+        };
+        let size: u32 = size
+            .parse()
+            .with_context(|| format!("{annotation} is {size:?}, not a pod count"))?;
+        if size <= 1 {
+            return Ok(None);
+        }
+        let member = sandbox
+            .labels
+            .get(label)
+            .with_context(|| format!("a pod of a group of {size} has no {label} label"))?;
+        member
+            .parse()
+            .map(Some)
+            .with_context(|| format!("{label} is {member:?}, not a pod index"))
+    }
+
+    fn revision_of(&self, sandbox: &Sandbox) -> Result<RevisionKey> {
+        let hash = self
+            .revision
+            .iter()
+            .find_map(|label| sandbox.labels.get(label))
+            .with_context(|| {
+                format!(
+                    "the pod has none of the revision labels {}",
+                    self.revision.join(", ")
+                )
+            })?;
+        RevisionKey::new(&sandbox.namespace, self.workload(sandbox)?, hash)
+    }
+
+    /// The workload as metrics name it, which is how the store names it.
+    fn workload_of(&self, sandbox: &Sandbox) -> String {
+        match self.workload(sandbox) {
+            Ok(workload) => workload.to_string(),
+            Err(_) => sandbox
+                .labels
+                .get(self.workload)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn configured(label: &str) -> Option<&str> {
+    (!label.is_empty()).then_some(label)
 }
 
 #[cfg(feature = "nixl")]
@@ -336,7 +440,7 @@ async fn bring_up(
     shim: &mut ShimClient,
 ) -> Result<Served> {
     let args = &node.args;
-    let revision = revision_of(sandbox, &args.label, &args.revision_label)?;
+    let revision = args.labels().revision_of(sandbox)?;
     info!(
         pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
         %revision,
@@ -352,6 +456,12 @@ async fn bring_up(
         Ok(class) => class,
         Err(error) => return cold_boot_only(node, pod, shim, format!("{error:#}")).await,
     };
+    if let Some(member) = revision.workload().member() {
+        let because = format!(
+            "pod {member} of a multi-pod group; its group would have to be captured and restored together"
+        );
+        return cold_boot_only(node, pod, shim, because).await;
+    }
     let store = RevisionStore::open(&class.dir, &revision, &sandbox.uid)?;
     #[cfg(feature = "nixl")]
     if let Some(peers) = &node.peers {
@@ -442,16 +552,16 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     };
     shim.serving().await?;
     info!(seconds = %seconds(seen), how = %served, "serving");
-    node.metrics
-        .served(&sandbox.namespace, workload_of(node, sandbox), served.how());
+    node.metrics.served(
+        &sandbox.namespace,
+        &workload_of(node, sandbox),
+        served.how(),
+    );
     Ok(())
 }
 
-fn workload_of<'a>(node: &Node, sandbox: &'a Sandbox) -> &'a str {
-    sandbox
-        .labels
-        .get(&node.args.label)
-        .map_or("", String::as_str)
+fn workload_of(node: &Node, sandbox: &Sandbox) -> String {
+    node.args.labels().workload_of(sandbox)
 }
 
 /// Remove what is past its retention and measure what is left.
@@ -501,7 +611,7 @@ fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
                     "gave up on this pod for now"
                 );
                 node.metrics
-                    .failed(&sandbox.namespace, workload_of(&node, &sandbox));
+                    .failed(&sandbox.namespace, &workload_of(&node, &sandbox));
                 sleep(Duration::from_secs(node.args.retry_s)).await;
             }
         }
@@ -587,9 +697,238 @@ pub fn run(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::anyhow;
+    use std::collections::HashMap;
 
-    use crate::node::{Image, Plan};
+    use anyhow::anyhow;
+    use clap::Parser;
+
+    use crate::cri::Sandbox;
+    use crate::node::{Args, Image, Labels, Plan};
+
+    fn sandbox(labels: &[(&str, &str)]) -> Sandbox {
+        grouped(labels, None)
+    }
+
+    fn grouped(labels: &[(&str, &str)], size: Option<&str>) -> Sandbox {
+        Sandbox {
+            id: "id".to_string(),
+            uid: "uid".to_string(),
+            namespace: "serving".to_string(),
+            name: "pod".to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>(),
+            annotations: size
+                .map(|size| HashMap::from([(GROUP_SIZE.to_string(), size.to_string())]))
+                .unwrap_or_default(),
+        }
+    }
+
+    const WORKLOAD: (&str, &str) = ("snapshot.llm-d.ai/workload", "qwen");
+    const DS_REVISION: &str = "disaggregatedset.x-k8s.io/revision";
+    const DS_ROLE: &str = "disaggregatedset.x-k8s.io/role";
+    const MEMBER: &str = "leaderworkerset.sigs.k8s.io/worker-index";
+    const LWS_REVISION: &str = "leaderworkerset.sigs.k8s.io/template-revision-hash";
+    const GROUP_SIZE: &str = "leaderworkerset.sigs.k8s.io/size";
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn parse(argv: &[&str]) -> Args {
+        Cli::try_parse_from(argv).unwrap().args
+    }
+
+    fn defaults() -> Args {
+        parse(&["node", "--store-dir", "/store", "--tools-dir", "/tools"])
+    }
+
+    #[test]
+    fn the_default_labels_cover_deployments_and_disaggregated_sets() {
+        let args = defaults();
+        assert_eq!(
+            args.revision_label,
+            [DS_REVISION, LWS_REVISION, "pod-template-hash"]
+        );
+        assert_eq!(args.role_label, DS_ROLE);
+        assert_eq!(args.member_label, MEMBER);
+        assert_eq!(args.group_size_annotation, GROUP_SIZE);
+        let listed = parse(&[
+            "node",
+            "--store-dir",
+            "/store",
+            "--tools-dir",
+            "/tools",
+            "--revision-label",
+            "a,b",
+            "--role-label",
+            "",
+        ]);
+        assert_eq!(listed.revision_label, ["a", "b"]);
+        assert_eq!(listed.role_label, "");
+    }
+
+    #[test]
+    fn roles_of_one_disaggregated_revision_get_separate_checkpoints() {
+        let args = defaults();
+        let labels = args.labels();
+        let pod = |role: &str, slice: &str| {
+            sandbox(&[
+                WORKLOAD,
+                (DS_REVISION, "6f9b7c"),
+                (DS_ROLE, role),
+                ("disaggregatedset.x-k8s.io/slice", slice),
+                ("leaderworkerset.sigs.k8s.io/template-revision-hash", "aa11"),
+            ])
+        };
+        let prefill = labels.revision_of(&pod("prefill", "0")).unwrap();
+        let decode = labels.revision_of(&pod("decode", "0")).unwrap();
+        assert_eq!(prefill.to_string(), "serving/qwen@prefill/6f9b7c");
+        assert_eq!(decode.to_string(), "serving/qwen@decode/6f9b7c");
+        assert_eq!(
+            labels.revision_of(&pod("prefill", "3")).unwrap(),
+            prefill,
+            "slices are copies of one template and share its checkpoint"
+        );
+        assert_eq!(
+            labels.workload_of(&pod("decode", "0")),
+            decode.workload().to_string()
+        );
+
+        let next = sandbox(&[WORKLOAD, (DS_REVISION, "0c41e2"), (DS_ROLE, "prefill")]);
+        assert_ne!(labels.revision_of(&next).unwrap(), prefill);
+    }
+
+    #[test]
+    fn a_deployment_pod_keeps_its_key() {
+        let args = defaults();
+        let labels = args.labels();
+        let pod = sandbox(&[WORKLOAD, ("pod-template-hash", "7b9f694bf8")]);
+        assert_eq!(
+            labels.revision_of(&pod).unwrap().to_string(),
+            "serving/qwen/7b9f694bf8"
+        );
+        assert_eq!(labels.workload_of(&pod), "qwen");
+
+        let both = sandbox(&[
+            WORKLOAD,
+            ("pod-template-hash", "7b9f694bf8"),
+            (DS_REVISION, "6f9b7c"),
+        ]);
+        assert_eq!(
+            labels.revision_of(&both).unwrap().to_string(),
+            "serving/qwen/6f9b7c",
+            "the first listed revision label wins"
+        );
+    }
+
+    #[test]
+    fn a_pod_without_a_revision_or_with_a_bad_role_is_refused() {
+        let args = defaults();
+        let labels = args.labels();
+        let error = labels
+            .revision_of(&sandbox(&[WORKLOAD, (DS_ROLE, "prefill")]))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the pod has none of the revision labels disaggregatedset.x-k8s.io/revision, leaderworkerset.sigs.k8s.io/template-revision-hash, pod-template-hash"
+        );
+        assert!(
+            labels
+                .revision_of(&sandbox(&[(DS_REVISION, "6f9b7c")]))
+                .is_err()
+        );
+        assert!(
+            labels
+                .revision_of(&sandbox(&[
+                    WORKLOAD,
+                    (DS_REVISION, "6f9b7c"),
+                    (DS_ROLE, "")
+                ]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pods_of_a_multi_pod_group_are_told_apart_by_member() {
+        let args = defaults();
+        let labels = args.labels();
+        let pod = |member: &str, group: &str, size: Option<&str>| {
+            grouped(
+                &[
+                    WORKLOAD,
+                    (DS_REVISION, "6f9b7c"),
+                    (DS_ROLE, "decode"),
+                    (MEMBER, member),
+                    ("leaderworkerset.sigs.k8s.io/group-index", group),
+                ],
+                size,
+            )
+        };
+        let leader = labels.revision_of(&pod("0", "0", Some("2"))).unwrap();
+        let worker = labels.revision_of(&pod("1", "0", Some("2"))).unwrap();
+        assert_eq!(leader.to_string(), "serving/qwen@decode+0/6f9b7c");
+        assert_eq!(worker.to_string(), "serving/qwen@decode+1/6f9b7c");
+        assert_eq!(worker.workload().member(), Some(1));
+        assert_eq!(
+            labels.revision_of(&pod("1", "5", Some("2"))).unwrap(),
+            worker,
+            "groups are copies of one template and share their members' checkpoints"
+        );
+        for single in [Some("1"), None] {
+            let whole = labels.revision_of(&pod("0", "0", single)).unwrap();
+            assert_eq!(whole.to_string(), "serving/qwen@decode/6f9b7c");
+            assert_eq!(whole.workload().member(), None);
+        }
+        for (member, size, wanted) in [
+            (
+                "x",
+                "2",
+                "leaderworkerset.sigs.k8s.io/worker-index is \"x\", not a pod index",
+            ),
+            (
+                "1",
+                "two",
+                "leaderworkerset.sigs.k8s.io/size is \"two\", not a pod count",
+            ),
+        ] {
+            let error = labels
+                .revision_of(&pod(member, "0", Some(size)))
+                .unwrap_err();
+            assert_eq!(error.to_string(), wanted);
+        }
+        let lws = grouped(&[WORKLOAD, (LWS_REVISION, "5b6d"), (MEMBER, "3")], Some("4"));
+        assert_eq!(
+            labels.revision_of(&lws).unwrap().to_string(),
+            "serving/qwen+3/5b6d",
+            "a LeaderWorkerSet outside a DisaggregatedSet is keyed by its own revision"
+        );
+        let unlabelled = grouped(&[WORKLOAD, (DS_REVISION, "6f9b7c")], Some("4"));
+        assert_eq!(
+            labels.revision_of(&unlabelled).unwrap_err().to_string(),
+            "a pod of a group of 4 has no leaderworkerset.sigs.k8s.io/worker-index label"
+        );
+    }
+
+    #[test]
+    fn roles_are_ignored_when_no_role_label_is_set() {
+        let labels = Labels {
+            workload: WORKLOAD.0,
+            role: "",
+            member: "",
+            group_size: "",
+            revision: &[DS_REVISION.to_string()],
+        };
+        let pod = sandbox(&[WORKLOAD, (DS_REVISION, "6f9b7c"), (DS_ROLE, "prefill")]);
+        assert_eq!(
+            labels.revision_of(&pod).unwrap().to_string(),
+            "serving/qwen/6f9b7c"
+        );
+        assert_eq!(labels.workload_of(&pod), "qwen");
+    }
 
     #[test]
     fn a_pod_is_restored_captured_or_only_cold_booted() {

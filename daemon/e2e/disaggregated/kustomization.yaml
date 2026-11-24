@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../deploy/node
+  - workloads.yaml
+images:
+  - name: ghcr.io/wseaton/snapshotd/snapshotd
+    newName: localhost/snapshotd-e2e
+    newTag: dev
+  - name: ghcr.io/wseaton/snapshotd/snapshot-agent
+    newName: localhost/snapshotd-e2e
+    newTag: dev
+patches:
+  - path: daemonset.yaml

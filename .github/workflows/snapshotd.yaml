@@ -62,6 +62,16 @@ jobs:
       - uses: docker/setup-buildx-action@v4
       - run: daemon/e2e/run.sh
 
+  e2e-disaggregated:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - run: daemon/e2e/disaggregated.sh
+
   e2e-peers:
     needs: check
     runs-on: ubuntu-latest
