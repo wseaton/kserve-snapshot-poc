@@ -440,10 +440,8 @@ async fn bring_up(
     shim: &mut ShimClient,
 ) -> Result<Served> {
     let args = &node.args;
-    let revision = args.labels().revision_of(sandbox)?;
     info!(
         pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
-        %revision,
         address = %pod.address(),
         gpus = pod.gpus().len(),
         visible_gpus = pod.visible_gpus(),
@@ -451,6 +449,11 @@ async fn bring_up(
         "new pod"
     );
     pod.mount_tools().await?;
+    let revision = match args.labels().revision_of(sandbox) {
+        Ok(revision) => revision,
+        Err(error) => return cold_boot_only(node, pod, shim, format!("{error:#}")).await,
+    };
+    info!(%revision, "keyed the pod's revision");
     let named = sandbox.annotations.get(&args.class_annotation);
     let class = match node.classes.get(named.map(String::as_str)) {
         Ok(class) => class,

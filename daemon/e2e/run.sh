@@ -19,7 +19,7 @@ k() { kubectl --context "kind-$CLUSTER" "$@"; }
 fail() { echo "FAIL: $*" >&2; k -n snapshotd logs ds/snapshotd -c snapshotd --tail=40 >&2 || true; exit 1; }
 finish() { [ "${KEEP:-0}" = 1 ] || kind delete cluster --name "$CLUSTER"; }
 
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
+grep -qx "$CLUSTER" <<<"$(kind get clusters)" || kind create cluster --name "$CLUSTER" --wait 180s
 trap finish EXIT
 docker build --load -t "$IMAGE" --target e2e -f images/snapshotd/Dockerfile .
 kind load docker-image "$IMAGE" --name "$CLUSTER"
@@ -43,7 +43,7 @@ settle 1
 first=$(info "$(addresses)")
 echo "first replica: $first"
 [[ $first == *" Running" ]] || fail "the first replica is not running: $first"
-k -n snapshotd logs ds/snapshotd -c snapshotd | grep -q "restored .*from=.*/incoming-" \
+grep -q "restored .*from=.*/incoming-" <<<"$(k -n snapshotd logs ds/snapshotd -c snapshotd)" \
   || fail "the first replica was not checkpointed and restored"
 
 settle 3
@@ -112,9 +112,10 @@ metrics() {
   k get --raw "/api/v1/namespaces/snapshotd/pods/$(k -n snapshotd get pods -l app=snapshotd -o jsonpath='{.items[0].metadata.name}'):9090/proxy/metrics"
 }
 for _ in $(seq 20); do
-  metrics | grep -q 'snapshotd_store_revisions{class="scratch",namespace="default",workload="stand-in"} 1' && break
+  grep -qF 'snapshotd_store_revisions{class="scratch",namespace="default",workload="stand-in"} 1' <<<"$(metrics)" && break
   sleep 1
 done
+scraped=$(metrics) || fail "the daemon's metrics could not be read"
 for line in \
   'snapshotd_store_revisions{class="scratch",namespace="default",workload="stand-in"} 1' \
   'snapshotd_store_revisions{class="default",namespace="default",workload="stand-in"} 3' \
@@ -123,7 +124,7 @@ for line in \
   'snapshotd_pods_total{namespace="default",workload="stand-in",how="restore"} 6' \
   'snapshotd_step_seconds_count{step="checkpoint"} 4' \
   'snapshotd_store_free_bytes{class="scratch"}'; do
-  metrics | grep -qF "$line" || { metrics | grep -v '^#' >&2; fail "the daemon's metrics have no: $line"; }
+  grep -qF "$line" <<<"$scraped" || { grep -v '^#' <<<"$scraped" >&2; fail "the daemon's metrics have no: $line"; }
 done
 echo "the daemon's metrics count what it did and what each class holds"
 echo PASS

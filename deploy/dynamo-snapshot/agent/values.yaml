@@ -2,7 +2,7 @@ image:
   operator:
     tag: v0.0.0-gbc9d2161
   agent:
-    repository: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+    repository: ghcr.io/wseaton/snapshotd/snapshot-agent
     tag: main
 pageBroker:
   enabled: false

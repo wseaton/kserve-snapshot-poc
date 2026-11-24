@@ -24,7 +24,7 @@ log() { k -n snapshotd logs ds/snapshotd -c snapshotd; }
 fail() { echo "FAIL: $*" >&2; log --tail=40 >&2 || true; exit 1; }
 finish() { [ "${KEEP:-0}" = 1 ] || kind delete cluster --name "$CLUSTER"; }
 
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
+grep -qx "$CLUSTER" <<<"$(kind get clusters)" || kind create cluster --name "$CLUSTER" --wait 180s
 trap finish EXIT
 docker build --load -t "$IMAGE" --target e2e -f images/snapshotd/Dockerfile .
 kind load docker-image "$IMAGE" --name "$CLUSTER"

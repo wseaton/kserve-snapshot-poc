@@ -51,7 +51,7 @@ info_on() { # app node
 }
 pulled_from() { log "$1" | grep "pulled the checkpoint from a peer" | grep -c "peer=$2:8443" || true; }
 
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --config daemon/e2e/peers/kind.yaml --wait 180s
+grep -qx "$CLUSTER" <<<"$(kind get clusters)" || kind create cluster --name "$CLUSTER" --config daemon/e2e/peers/kind.yaml --wait 180s
 trap finish EXIT
 docker build --load -t "$IMAGE" --target e2e-peers -f images/snapshotd/Dockerfile .
 kind load docker-image "$IMAGE" --name "$CLUSTER"
@@ -76,7 +76,7 @@ k apply -k daemon/e2e/peers
 k apply -f daemon/e2e/peers/workloads.yaml
 k -n snapshotd rollout status ds/snapshotd --timeout=240s
 for n in "$FAR" "$NEAR" "$HOME_NODE"; do
-  log "$n" | grep -q "answering peers" || fail "the daemon on $n is not answering peers"
+  grep -q "answering peers" <<<"$(log "$n")" || fail "the daemon on $n is not answering peers"
 done
 
 # One replica at a time: the far rack, then each node of the near rack.
@@ -95,7 +95,7 @@ settle near-far 3
 [ "$(info_on near-far "$HOME_NODE")" = "$first" ] || fail "the replica on $HOME_NODE is not a restore of the first"
 [ "$(pulled_from "$HOME_NODE" "$(daemon_ip "$NEAR")")" = 1 ] \
   || fail "$HOME_NODE has holders on $NEAR, in its rack, and on $FAR, and did not pull from $NEAR"
-log "$HOME_NODE" | grep "asking a peer that has it" | grep -q "shared_levels=1 of=2" \
+grep -q "asking a peer that has it .*shared_levels=1 of=2" <<<"$(log "$HOME_NODE")" \
   || fail "$HOME_NODE did not see $NEAR as sharing its rack"
 echo "three replicas of one process, the third pulled from its own rack"
 
