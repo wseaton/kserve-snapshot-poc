@@ -1,4 +1,4 @@
-From 18bfcc24a915f9435db555fef0e59dc93632f426 Mon Sep 17 00:00:00 2001
+From 1fcec74816f380d531e046969363e6657bb6e8e7 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:57:04 -0500
 Subject: [PATCH 4/7] [Distributed] Recreate NCCL communicators across a
@@ -11,25 +11,30 @@ communicator with ncclCommSuspend only helps when the restore lands on the
 same GPUs: after a remap, ncclCommResume leaves peer mappings that fault,
 and a new cuMem communicator fails its first all-reduce.
 
-checkpoint_prepare now destroys the communicator and checkpoint_restore
-creates a new one from a fresh unique id broadcast over the CPU group.
-CUDA graphs replay the old communicator and ncclCommDestroy waits for them,
-so the worker releases its graphs before preparing
-and captures them again when the KV cache wakes, before scheduling resumes.
+checkpoint_prepare now destroys the communicator, and the per-stream
+communicators bound to it, and checkpoint_restore creates new ones from
+fresh unique ids broadcast over the CPU group. CUDA graphs replay the old
+communicators and ncclCommDestroy waits for them, so the worker releases
+its graphs, encoder graphs included, before preparing whenever any
+parallel group spans more than one rank, data parallel included. It
+captures them again, with EPLB suppressed as at startup, once both the
+weights and the KV cache are awake.
 
 With custom all-reduce off, FlashInfer all-reduce off and
 NCCL_CUMEM_ENABLE=0, a TP=2 CRIU dump and restore onto two other GPUs
 returns the same greedy completion, eager and with CUDA graphs. Recapturing
 the graphs adds about 7 s to the restore.
 
-(cherry picked from commit 409087b94cb32c01b1cbb4c5b9f6dc3a568a39fe)
+Signed-off-by: Will Eaton <weaton@redhat.com>
+Assisted-by: Claude
 ---
- tests/distributed/test_pynccl.py              | 24 ++++++++++++++
- .../device_communicators/cuda_communicator.py | 10 ++++--
- .../device_communicators/pynccl.py            | 33 ++++++++++++++++---
- vllm/v1/worker/gpu/model_runner.py            | 15 +++++++++
- vllm/v1/worker/gpu_worker.py                  | 21 +++++++++++-
- 5 files changed, 96 insertions(+), 7 deletions(-)
+ tests/distributed/test_pynccl.py              | 24 +++++++++++
+ .../worker/test_kv_cache_allocation_scope.py  | 40 +++++++++++++++++++
+ .../device_communicators/cuda_communicator.py | 10 ++++-
+ .../device_communicators/pynccl.py            | 40 +++++++++++++++++--
+ vllm/v1/worker/gpu/model_runner.py            | 17 ++++++++
+ vllm/v1/worker/gpu_worker.py                  | 29 +++++++++++++-
+ 6 files changed, 153 insertions(+), 7 deletions(-)
 
 diff --git a/tests/distributed/test_pynccl.py b/tests/distributed/test_pynccl.py
 index 7514035787..d41805ea31 100644
@@ -66,6 +71,61 @@ index 7514035787..d41805ea31 100644
  @worker_fn_wrapper
  def multiple_allreduce_worker_fn():
      device = torch.device(f"cuda:{torch.distributed.get_rank()}")
+diff --git a/tests/v1/worker/test_kv_cache_allocation_scope.py b/tests/v1/worker/test_kv_cache_allocation_scope.py
+index 38e98a1330..da1cf563c1 100644
+--- a/tests/v1/worker/test_kv_cache_allocation_scope.py
++++ b/tests/v1/worker/test_kv_cache_allocation_scope.py
+@@ -118,6 +118,8 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+             sleep_mode_backend=SimpleNamespace(resume=lambda tags: None),
+             model_runner=runner,
+             synchronize_device=lambda: None,
++            _sleeping_tags={"weights", "kv_cache"},
++            _checkpoint_graphs_released=False,
+             vllm_config=SimpleNamespace(
+                 model_config=SimpleNamespace(enable_nccl_comm_suspend=False)
+             ),
+@@ -136,3 +138,41 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+         for actual, expected in zip(runner.layout_tensors, layout_tensors, strict=True)
+     )
+     assert tuple(t.data_ptr() for t in runner.layout_tensors) == layout_ptrs
++
++
++@pytest.mark.parametrize(
++    "wakes",
++    [
++        [["kv_cache"], ["weights"]],
++        [["weights"], ["kv_cache"]],
++        [None],
++    ],
++)
++def test_released_graphs_are_captured_once_everything_is_awake(
++    wakes: list[list[str] | None],
++) -> None:
++    captures: list[set[str]] = []
++    worker = SimpleNamespace(
++        sleep_mode_backend=SimpleNamespace(resume=lambda tags: None),
++        model_runner=SimpleNamespace(),
++        synchronize_device=lambda: None,
++        _sleeping_tags={"weights", "kv_cache"},
++        _checkpoint_graphs_released=True,
++        vllm_config=SimpleNamespace(
++            model_config=SimpleNamespace(enable_nccl_comm_suspend=False)
++        ),
++    )
++
++    def capture() -> None:
++        captures.append(set(worker._sleeping_tags))
++        worker._checkpoint_graphs_released = False
++
++    worker._capture_released_graphs = capture
++
++    for tags in wakes[:-1]:
++        Worker.wake_up(cast(Worker, worker), tags=tags)
++        assert captures == []
++    Worker.wake_up(cast(Worker, worker), tags=wakes[-1])
++    assert captures == [set()]
++    Worker.wake_up(cast(Worker, worker), tags=None)
++    assert len(captures) == 1
 diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
 index 11c8de67d9..a25e70160c 100644
 --- a/vllm/distributed/device_communicators/cuda_communicator.py
@@ -97,7 +157,7 @@ index 11c8de67d9..a25e70160c 100644
          if self.all2all_manager is not None:
              self.all2all_manager.checkpoint_restore()
 diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
-index 8361b9c9cd..15d81a28cf 100644
+index 8361b9c9cd..6a4e8c704a 100644
 --- a/vllm/distributed/device_communicators/pynccl.py
 +++ b/vllm/distributed/device_communicators/pynccl.py
 @@ -140,14 +140,19 @@ class PyNcclCommunicator:
@@ -131,7 +191,7 @@ index 8361b9c9cd..15d81a28cf 100644
  
      def _init_comm(self, device: int | str | torch.device) -> None:
          """Create the communicator on `device` from the already-resolved
-@@ -658,6 +662,27 @@ class PyNcclCommunicator:
+@@ -658,6 +662,34 @@ class PyNcclCommunicator:
      def deregister_comm_window(self, window):
          return self.nccl.ncclCommWindowDeregister(self.comm, window)
  
@@ -141,9 +201,12 @@ index 8361b9c9cd..15d81a28cf 100644
 +        be released."""
 +        if self.disabled or self._released:
 +            return
++        for stream_comm in self._stream_comms.values():
++            stream_comm.checkpoint_release()
 +        with torch.accelerator.device_index(self.device.index):
 +            self.nccl.ncclCommDestroy(self.comm)
 +        self._released = True
++        self._suspended = False
 +
 +    def checkpoint_recreate(self) -> None:
 +        """Create a new communicator after a process checkpoint (collective,
@@ -152,15 +215,19 @@ index 8361b9c9cd..15d81a28cf 100644
 +        if self.disabled or not self._released:
 +            return
 +        assert self.group is not None
++        stream_comms = self._stream_comms
 +        self._share_unique_id(self.group)
 +        self._init_comm(self.device)
++        for stream_comm in stream_comms.values():
++            stream_comm.checkpoint_recreate()
++        self._stream_comms = stream_comms
 +        self._released = False
 +
      def suspend(self):
          """Release comm GPU memory (collective, idempotent); keeps topology."""
          if self.disabled or self._suspended:
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 46c3643880..221fd24aec 100644
+index 46c3643880..d11c6f5c59 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -120,6 +120,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
@@ -171,7 +238,7 @@ index 46c3643880..221fd24aec 100644
      ModelCudaGraphManager,
      has_compiled_submodule,
      make_cudagraph_stats,
-@@ -1168,6 +1169,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1168,6 +1169,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              and self.cudagraph_manager.needs_capture()
          )
  
@@ -180,6 +247,8 @@ index 46c3643880..221fd24aec 100644
 +        again, for example after the communicators they replay are replaced."""
 +        if self.cudagraph_manager is not None:
 +            self.cudagraph_manager.release_graphs()
++        if self.model_state.supports_mm_inputs:
++            self.model_state.encoder_runner.clear()
 +        for attr in vars(self.speculator).values() if self.speculator else ():
 +            if isinstance(attr, CudaGraphManager):
 +                attr.release_graphs()
@@ -193,7 +262,7 @@ index 46c3643880..221fd24aec 100644
      def capture_model(self, *, profile_only: bool = False) -> int:
          assert self.cudagraph_manager is not None
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 67c3e1714a..ec63157251 100644
+index 14f572c318..a6e6a5ce76 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -142,7 +142,7 @@ from vllm.v1.worker.startup_plan import (
@@ -205,25 +274,44 @@ index 67c3e1714a..ec63157251 100644
  
  from ...model_executor.model_loader import TensorizerLoader
  from .gpu.cudagraph_utils import has_compiled_submodule
-@@ -251,6 +251,7 @@ class Worker(WorkerBase):
+@@ -251,6 +251,8 @@ class Worker(WorkerBase):
      ):
          if not HAS_TRITON and not current_platform.uses_standalone_cpu_model_runner():
              raise ValueError("vLLM's model runner requires Triton.")
 +        self._checkpoint_graphs_released = False
++        self._sleeping_tags: set[str] = set()
  
          super().__init__(
              vllm_config=vllm_config,
-@@ -416,6 +417,9 @@ class Worker(WorkerBase):
+@@ -383,6 +385,7 @@ class Worker(WorkerBase):
+         if extensible_kv_cache is not None:
+             extensible_kv_cache.release_physical()
+         self.sleep_mode_backend.suspend(discardable)
++        self._sleeping_tags = {"weights", "kv_cache"}
+         if self.vllm_config.model_config.enable_nccl_comm_suspend:
+             suspend_device_comms()
+ 
+@@ -405,6 +408,7 @@ class Worker(WorkerBase):
+ 
+     def wake_up(self, tags: list[str] | None = None) -> None:
+         self.sleep_mode_backend.resume(tags)
++        self._sleeping_tags = set() if tags is None else self._sleeping_tags - set(tags)
+         wake_kv_cache = tags is None or "kv_cache" in tags
+         # Back the extensible KV cache before the connector re-registers it.
+         extensible_kv_cache = getattr(self.model_runner, "extensible_kv_cache", None)
+@@ -420,7 +424,11 @@ class Worker(WorkerBase):
          if loader := _bound_model_loader(self.model_runner):
              loader.on_wake_up(tags)
  
-+        if wake_kv_cache and self._checkpoint_graphs_released:
++        if self._checkpoint_graphs_released and not self._sleeping_tags:
 +            self._capture_released_graphs()
 +
      def discard(self, tags: tuple[str, ...]) -> None:
++        self._sleeping_tags.update(tags)
          if "weights" in tags:
              if loader := _bound_model_loader(self.model_runner):
-@@ -436,6 +440,9 @@ class Worker(WorkerBase):
+                 loader.on_sleep(2)
+@@ -440,6 +448,9 @@ class Worker(WorkerBase):
          self.sleep_mode_backend.discard(tags)
  
      def checkpoint_prepare(self) -> None:
@@ -233,20 +321,24 @@ index 67c3e1714a..ec63157251 100644
          # Connectors are created after the communicators, so release them first.
          if has_kv_transfer_group():
              get_kv_transfer_group().checkpoint_prepare()
-@@ -449,6 +456,18 @@ class Worker(WorkerBase):
+@@ -453,6 +464,22 @@ class Worker(WorkerBase):
          if has_kv_transfer_group():
              get_kv_transfer_group().checkpoint_restore()
  
 +    def _capture_released_graphs(self) -> None:
 +        """Capture the graphs `checkpoint_prepare` released."""
 +        unlock_workspace()
-+        with self._get_cudagraph_capture_context():
++        with (
++            self.model_runner.eplb.suppress(),
++            self._get_cudagraph_capture_context(),
++        ):
 +            self.model_runner.capture_model()
 +        self._checkpoint_graphs_released = False
 +
 +    def _checkpoint_graphs_captured(self) -> bool:
 +        return not (
-+            self.model_config.enforce_eager or self.parallel_config.world_size == 1
++            self.model_config.enforce_eager
++            or self.parallel_config.world_size_across_dp == 1
 +        )
 +
      def _weight_checksum_prefix(self) -> str:

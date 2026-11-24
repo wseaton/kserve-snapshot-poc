@@ -1,4 +1,4 @@
-From f0ec68c179846260ebcba6a075157a9e93710ff3 Mon Sep 17 00:00:00 2001
+From 4dab7f613bcaf1fd145e5764209f3237ccada3ce Mon Sep 17 00:00:00 2001
 From: Schwinn Saereesitthipitak <schwinns@nvidia.com>
 Date: Thu, 29 Oct 2026 16:44:12 +0000
 Subject: [PATCH 1/7] [KV Connector] Add checkpoint_prepare and
@@ -18,15 +18,15 @@ Signed-off-by: Schwinn Saereesitthipitak <schwinns@nvidia.com>
 
 Signed-off-by: Will Eaton <weaton@redhat.com>
 ---
- tests/v1/engine/test_engine_core.py           | 33 +++++++++++++++++--
+ tests/v1/engine/test_engine_core.py           | 34 +++++++++++++++++--
  .../kv_transfer/kv_connector/v1/base.py       | 14 ++++++++
- .../kv_connector/v1/multi_connector.py        | 15 +++++++++
- vllm/v1/engine/core.py                        | 13 ++++++++
+ .../kv_connector/v1/multi_connector.py        | 15 ++++++++
+ vllm/v1/engine/core.py                        | 13 +++++++
  vllm/v1/worker/gpu_worker.py                  |  5 +++
- 5 files changed, 78 insertions(+), 2 deletions(-)
+ 5 files changed, 79 insertions(+), 2 deletions(-)
 
 diff --git a/tests/v1/engine/test_engine_core.py b/tests/v1/engine/test_engine_core.py
-index 7d9ba932f3..75355c90d5 100644
+index 7d9ba932f3..18288a3797 100644
 --- a/tests/v1/engine/test_engine_core.py
 +++ b/tests/v1/engine/test_engine_core.py
 @@ -938,15 +938,22 @@ def test_checkpoint_prepare_then_restore_run_in_order():
@@ -53,7 +53,7 @@ index 7d9ba932f3..75355c90d5 100644
          "checkpoint_prepare",
          "synchronize_device",
      ]
-@@ -955,11 +962,33 @@ def test_checkpoint_prepare_then_restore_run_in_order():
+@@ -955,11 +962,34 @@ def test_checkpoint_prepare_then_restore_run_in_order():
      core.checkpoint_restore()
      core.checkpoint_restore()
      assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
@@ -71,7 +71,8 @@ index 7d9ba932f3..75355c90d5 100644
 +def test_checkpoint_prepare_refuses_unsupported_kv_connector():
 +    """A KV connector whose process checkpoint cannot be restored makes the
 +    engine refuse to prepare, with nothing paused."""
-+    core, scheduler = _pausable_engine_core_proc()
++    core = _pausable_engine_core_proc()
++    scheduler = core.scheduler
 +    core.vllm_config = MagicMock()
 +    core.model_executor.is_sleeping = False
 +    kv_connector = MagicMock()

@@ -1,4 +1,4 @@
-From b712f6f4aaaee90b39a185c2339d17b1221f798d Mon Sep 17 00:00:00 2001
+From 7dba8b7850953968c7773489ecbea39261f48156 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 17:07:12 -0500
 Subject: [PATCH 7/7] [Core][KV Offload] Free the CPU offload region for a
@@ -19,8 +19,8 @@ workers meet at the barrier between unregistering and freeing. A
 per-rank region needs no barrier.
 
 Restoring repeats the setup the worker did at startup: in the
-background under async_init, with is_ready() false until it finishes,
-or else pre-faulting the same ranges and registering the region again,
+background under async_init, where the scheduler turns offloading off at
+prepare and back on once every worker reports ready again, or else pre-faulting the same ranges and registering the region again,
 failing if the registration does not come back, because the transfer
 kernels dereference the host pointers.
 
@@ -32,17 +32,20 @@ Signed-off-by: Will Eaton <weaton@redhat.com>
 Assisted-by: Claude
 ---
  docs/serving/online_serving/README.md         |   2 +-
+ .../offloading_connector/test_scheduler.py    |  33 ++++++
+ .../unit/offloading_connector/test_worker.py  |  31 ++++-
  tests/v1/kv_connector/unit/test_config.py     |  20 +++-
  tests/v1/kv_offload/cpu/test_gpu_worker.py    | 112 ++++++++++++++++++
  .../cpu/test_shared_offload_region.py         |  49 ++++++++
- .../kv_connector/v1/offloading/worker.py      |   8 ++
- .../kv_connector/v1/offloading_connector.py   |  14 +++
+ .../kv_connector/v1/offloading/scheduler.py   |  12 +-
+ .../kv_connector/v1/offloading/worker.py      |   9 ++
+ .../kv_connector/v1/offloading_connector.py   |  16 +++
  vllm/v1/kv_offload/base.py                    |  16 +++
  vllm/v1/kv_offload/cpu/gpu_worker.py          |  57 ++++++++-
  .../kv_offload/cpu/shared_offload_region.py   |  25 ++--
  vllm/v1/kv_offload/cpu/spec.py                |   6 +
  vllm/v1/kv_offload/tiering/spec.py            |   5 +
- 11 files changed, 301 insertions(+), 13 deletions(-)
+ 14 files changed, 378 insertions(+), 15 deletions(-)
 
 diff --git a/docs/serving/online_serving/README.md b/docs/serving/online_serving/README.md
 index 3d558b19c0..a9ff5364d6 100644
@@ -57,6 +60,106 @@ index 3d558b19c0..a9ff5364d6 100644
  
  - `/checkpoint/prepare` - Start preparing, draining with `?mode=wait` (default), `abort` or `keep`; 200 once started or already preparing, 400 if the engine cannot prepare now
  - `/checkpoint/status` - Return the state: 200 once prepared, 503 until then, 500 after a failure
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+index c7ebc4c817..dd40a1d894 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+@@ -2883,6 +2883,39 @@ def test_async_init_waits_for_every_worker(request_runner):
+         assert scheduler._offloading_enabled == enabled
+ 
+ 
++@pytest.mark.parametrize("async_init", [False, True])
++def test_checkpoint_prepare_waits_for_every_worker_again(request_runner, async_init):
++    """Under async_init a restore sets host memory up again in the background, so
++    offloading waits for every worker to report ready again. Without it the
++    restore is synchronous and offloading stays on."""
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++        worker_count=2,
++        extra_config_overrides={"async_init": async_init},
++    )
++    scheduler = runner.connector_scheduler
++
++    def report(rank: int) -> None:
++        scheduler.update_connector_output(
++            KVConnectorOutput(
++                kv_connector_worker_meta=OffloadingWorkerMetadata(ready_ranks={rank})
++            )
++        )
++
++    for rank in (0, 1):
++        report(rank)
++    assert scheduler._offloading_enabled
++
++    scheduler.checkpoint_prepare()
++    assert scheduler._offloading_enabled == (not async_init)
++    report(0)
++    assert scheduler._offloading_enabled == (not async_init)
++    report(1)
++    assert scheduler._offloading_enabled
++
++
+ def test_scheduler_reports_lookup_sync_delay(request_runner):
+     runner = request_runner(
+         block_size=4,
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
+index fd40f8d2fa..e75ae1ffe7 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_worker.py
+@@ -104,6 +104,7 @@ def _make_worker(
+     replicated_layout: bool = False,
+     rank: int = 0,
+     canonical_layout: bool = False,
++    async_init: bool = False,
+ ):
+     """Create an OffloadingConnectorWorker with mocked dependencies."""
+     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+@@ -112,7 +113,7 @@ def _make_worker(
+ 
+     spec = MagicMock(spec=OffloadingSpec)
+     spec.replicated_layout = replicated_layout
+-    spec.async_init = False
++    spec.async_init = async_init
+     spec.config = MagicMock()
+     spec.config.canonical_layout = canonical_layout
+     spec.config.parallel.rank = rank
+@@ -206,6 +207,34 @@ class BareExternalOffloadingSpec(OffloadingSpec):
+ # ---------------------------------------------------------------------------
+ 
+ 
++@pytest.mark.parametrize("async_init", [False, True])
++def test_checkpoint_restore_reports_ready_again_under_async_init(async_init):
++    worker, _ = _make_worker(
++        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),
++        rank=1,
++        async_init=async_init,
++    )
++    assert worker.worker is not None
++    worker.worker.is_ready.return_value = True
++
++    def reported_ready() -> bool:
++        meta = worker.build_connector_worker_meta()
++        return meta is not None and meta.ready_ranks == {1}
++
++    assert reported_ready() == async_init
++    assert not reported_ready()
++
++    worker.checkpoint_prepare()
++    worker.checkpoint_restore()
++    worker.worker.checkpoint_prepare.assert_called_once()
++    worker.worker.checkpoint_restore.assert_called_once()
++    worker.worker.is_ready.return_value = False
++    assert not reported_ready()
++    worker.worker.is_ready.return_value = True
++    assert reported_ready() == async_init
++    assert not reported_ready()
++
++
+ def test_prepare_store_kv_non_writer_marks_completed_without_submit():
+     worker, _ = _make_worker(
+         KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),
 diff --git a/tests/v1/kv_connector/unit/test_config.py b/tests/v1/kv_connector/unit/test_config.py
 index e1b13d78ba..51967b9799 100644
 --- a/tests/v1/kv_connector/unit/test_config.py
@@ -289,11 +392,41 @@ index 4442c2e6da..a82fdf6c87 100644
 +    finally:
 +        joiner.cleanup()
 +        creator.cleanup()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 067d4757b0..249bef35e4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -253,7 +253,8 @@ class OffloadingConnectorScheduler:
+         self.manager: OffloadingManager = spec.get_manager()
+         # Under async_init the engine serves without offloading until every
+         # worker has reported ready.
+-        self._offloading_enabled = not spec.async_init
++        self._async_init = spec.async_init
++        self._offloading_enabled = not self._async_init
+         self._ready_ranks: set[int] = set()
+         if not self._offloading_enabled:
+             logger.info("KV offloading is off until every worker is ready")
+@@ -1697,6 +1698,15 @@ class OffloadingConnectorScheduler:
+         # seeing a non-empty object the way they do today.
+         yield from self._events_tracker.take_events(manager_events)
+ 
++    def checkpoint_prepare(self) -> None:
++        """Under async_init, a restore sets the workers' host memory up again in
++        the background, so offloading waits for every worker to be ready again."""
++        if not self._async_init:
++            return
++        with self._manager_locked():
++            self._offloading_enabled = False
++            self._ready_ranks.clear()
++
+     def reset_cache(self) -> None:
+         """Reset the offloading manager cache, evicting all stored chunks."""
+         # reset_cache cannot be called in the middle of a schedule step.
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
-index 426c91e3c2..cc0d2fdc10 100644
+index 426c91e3c2..5d21332412 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
-@@ -362,6 +362,14 @@ class OffloadingConnectorWorker:
+@@ -362,6 +362,15 @@ class OffloadingConnectorWorker:
          self._connector_worker_meta = OffloadingWorkerMetadata()
          return meta
  
@@ -304,15 +437,16 @@ index 426c91e3c2..cc0d2fdc10 100644
 +    def checkpoint_restore(self) -> None:
 +        if self.worker is not None:
 +            self.worker.checkpoint_restore()
++        self._report_ready = self.spec.async_init
 +
      def shutdown(self) -> None:
          self._unsubmitted_store_jobs.clear()
          self._load_jobs.clear()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-index 202a44262d..f6fb081f71 100644
+index 202a44262d..d86c91a906 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-@@ -102,6 +102,20 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+@@ -102,6 +102,22 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                  spec, vllm_config, kv_cache_config
              )
  
@@ -323,6 +457,8 @@ index 202a44262d..f6fb081f71 100644
 +        return OffloadingSpecFactory.get_spec_cls(extra_config).supports_checkpoint()
 +
 +    def checkpoint_prepare(self) -> None:
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.checkpoint_prepare()
 +        if self.connector_worker is not None:
 +            self.connector_worker.checkpoint_prepare()
 +

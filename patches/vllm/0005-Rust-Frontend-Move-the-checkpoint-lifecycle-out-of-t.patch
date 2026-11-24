@@ -1,4 +1,4 @@
-From cf69fc4a20e4acdc2f617a11145421967986049e Mon Sep 17 00:00:00 2001
+From 02033c6fb793a10a6d09c2418a9247ee9c58008b Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:33:40 -0500
 Subject: [PATCH 5/7] [Rust Frontend] Move the checkpoint lifecycle out of the
