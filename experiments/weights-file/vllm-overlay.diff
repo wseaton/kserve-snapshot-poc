@@ -1,0 +1,189 @@
+--- a/vllm/device_allocator/cumem.py	2026-11-24 12:48:40
++++ b/vllm/device_allocator/cumem.py	2026-11-24 12:54:19
+@@ -9,8 +9,12 @@
+ # not sure why, they are created from a different context.
+ # the only successful approach is to call cuda driver API in C.
+ import atexit
++import ctypes
++from concurrent.futures import ThreadPoolExecutor
+ import gc
+ import mmap
++import os
++import time
+ from collections.abc import Callable, Iterator
+ from contextlib import contextmanager
+ from typing import Any
+@@ -78,6 +82,86 @@
+     return backup
+ 
+ 
++WEIGHTS_DIR = os.environ.get("VLLM_CHECKPOINT_WEIGHTS_DIR")
++
++
++def create_file_backup(size_in_bytes: int, name: str) -> torch.Tensor:
++    fd = os.open(os.path.join(WEIGHTS_DIR, name), os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        os.ftruncate(fd, size_in_bytes)
++        mapping = mmap.mmap(fd, size_in_bytes, flags=mmap.MAP_SHARED)
++    finally:
++        os.close(fd)
++    return torch.frombuffer(mapping, dtype=torch.uint8)
++
++
++def copy_pinned(dst: int, src: int, host: int, size_in_bytes: int) -> None:
++    pinned = libcudart.cudaHostRegister(host, size_in_bytes) == 0
++    if not pinned:
++        libcudart.cudaGetLastError()
++    libcudart.cudaMemcpy(dst, src, size_in_bytes)
++    if pinned and libcudart.cudaHostUnregister(host):
++        libcudart.cudaGetLastError()
++
++
++STAGE_BYTES = 1 << 30
++STAGE_THREADS = 8
++_stage: list = []
++
++
++def stage():
++    if not _stage:
++        mapping = mmap.mmap(-1, STAGE_BYTES, flags=mmap.MAP_PRIVATE)
++        buffer = torch.frombuffer(mapping, dtype=torch.uint8)
++        if libcudart.cudaHostRegister(buffer.data_ptr(), STAGE_BYTES):
++            libcudart.cudaGetLastError()
++        _stage[:] = [buffer, ThreadPoolExecutor(STAGE_THREADS), memoryview(mapping)]
++    return _stage
++
++
++def copy_staged(device_ptr: int, host_ptr: int, size_in_bytes: int) -> None:
++    """Host to device through one pinned buffer, filled by several threads."""
++    buffer, pool, _ = stage()
++    stage_ptr = buffer.data_ptr()
++    done = 0
++    while done < size_in_bytes:
++        chunk = min(STAGE_BYTES, size_in_bytes - done)
++        part = -(-chunk // STAGE_THREADS)
++        list(
++            pool.map(
++                lambda at: ctypes.memmove(
++                    stage_ptr + at, host_ptr + done + at, min(part, chunk - at)
++                ),
++                range(0, chunk, part),
++            )
++        )
++        libcudart.cudaMemcpy(device_ptr + done, stage_ptr, chunk)
++        done += chunk
++
++
++def copy_from_file(device_ptr: int, name: str, size_in_bytes: int) -> None:
++    """File to device through the pinned buffer, read by several threads."""
++    buffer, pool, view = stage()
++    fd = os.open(os.path.join(WEIGHTS_DIR, name), os.O_RDONLY)
++    try:
++        done = 0
++        while done < size_in_bytes:
++            chunk = min(STAGE_BYTES, size_in_bytes - done)
++            part = -(-chunk // STAGE_THREADS)
++            list(
++                pool.map(
++                    lambda at: os.preadv(
++                        fd, [view[at : min(at + part, chunk)]], done + at
++                    ),
++                    range(0, chunk, part),
++                )
++            )
++            libcudart.cudaMemcpy(device_ptr + done, buffer.data_ptr(), chunk)
++            done += chunk
++    finally:
++        os.close(fd)
++
++
+ def release_cpu_backup(backup: torch.Tensor) -> None:
+     if backup.is_pinned() and libcudart.cudaHostUnregister(backup.data_ptr()):
+         libcudart.cudaGetLastError()
+@@ -336,13 +420,31 @@
+                     has_policy_conflict = True
+                 continue
+             torch.accelerator.synchronize(data.handle[0])
+-            self._put_to_sleep(ptr, data, offload=False)
++            if WEIGHTS_DIR and data.tag == "weights":
++                started = time.monotonic()
++                size = data.handle[1]
++                data.cpu_backup_tensor = create_file_backup(
++                    size, f"{os.getpid()}-{ptr:x}.bin"
++                )
++                host = data.cpu_backup_tensor.data_ptr()
++                copy_pinned(host, ptr, host, size)
++                try:
++                    unmap_and_release(data.handle)
++                finally:
++                    data.is_asleep = True
++                self.file_seconds = getattr(self, "file_seconds", 0.0) + (
++                    time.monotonic() - started
++                )
++            else:
++                self._put_to_sleep(ptr, data, offload=False)
+             discarded_bytes += data.handle[1]
+ 
+         logger.info(
+-            "CuMemAllocator: discarded %.2f GiB for tags %s.",
++            "CuMemAllocator: discarded %.2f GiB for tags %s (%.2f s copying to %s).",
+             discarded_bytes / 1024**3,
+             tags,
++            getattr(self, "file_seconds", 0.0),
++            WEIGHTS_DIR,
+         )
+ 
+         if has_policy_conflict:
+@@ -374,12 +476,39 @@
+                 data.is_asleep = False
+                 if data.cpu_backup_tensor is not None:
+                     cpu_ptr = data.cpu_backup_tensor.data_ptr()
+-                    libcudart.cudaMemcpy(ptr, cpu_ptr, handle[1])
++                    if WEIGHTS_DIR and data.tag == "weights":
++                        started = time.monotonic()
++                        how = os.environ.get("VLLM_CHECKPOINT_WEIGHTS_PIN", "read")
++                        if how == "read":
++                            copy_from_file(
++                                ptr, f"{os.getpid()}-{ptr:x}.bin", handle[1]
++                            )
++                        elif how == "stage":
++                            copy_staged(ptr, cpu_ptr, handle[1])
++                        elif how == "1":
++                            copy_pinned(ptr, cpu_ptr, cpu_ptr, handle[1])
++                        else:
++                            libcudart.cudaMemcpy(ptr, cpu_ptr, handle[1])
++                        self.wake_seconds = getattr(self, "wake_seconds", 0.0) + (
++                            time.monotonic() - started
++                        )
++                        self.wake_bytes = getattr(self, "wake_bytes", 0) + handle[1]
++                    else:
++                        libcudart.cudaMemcpy(ptr, cpu_ptr, handle[1])
+                 elif current_platform.is_rocm():
+                     # amdgpu <6.14 may return stale VRAM (#44972); drop with its support
+                     libcudart.cudaMemset(ptr, 0, handle[1])
+                     torch.accelerator.synchronize()
+ 
++        if getattr(self, "wake_bytes", 0):
++            logger.info(
++                "CuMemAllocator: copied %.2f GiB of weights back from %s in %.2f s.",
++                self.wake_bytes / 1024**3,
++                WEIGHTS_DIR,
++                self.wake_seconds,
++            )
++            self.wake_bytes, self.wake_seconds = 0, 0.0
++
+     @contextmanager
+     def use_memory_pool(self, tag: str | None = None):
+         """A context manager to use the memory pool.
+--- a/vllm/v1/engine/core.py	2026-11-24 12:48:41
++++ b/vllm/v1/engine/core.py	2026-11-24 12:48:41
+@@ -2485,7 +2485,8 @@
+             self.collective_rpc("checkpoint_restore", args=args)
+             if self.vllm_config.model_config.checkpoint_release_weights:
+                 self.wake_up(["weights"])
+-                self.collective_rpc("reload_weights")
++                if not os.environ.get("VLLM_CHECKPOINT_WEIGHTS_DIR"):
++                    self.collective_rpc("reload_weights")
+             if (kv_connector := self.scheduler.get_kv_connector()) is not None:
+                 kv_connector.checkpoint_restore()
+             self.wake_up(["kv_cache"])

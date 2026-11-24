@@ -7,7 +7,13 @@
 #   MODEL        model directory (required)
 #   TP           tensor parallel size (default 8)
 #   MODE         plain: cuda-checkpoint only; cuinterpose: preload cuInterpose and run its
-#                prepare and restore phases around the CUDA checkpoint (default plain)
+#                prepare and restore phases around the CUDA checkpoint; gpucr: preload GPU-CR's
+#                vGPU library, which moves the device memory it tracks into a file before the
+#                CUDA checkpoint and back after the CUDA restore, so that memory is in neither
+#                the process nor the CRIU image (default plain)
+#   GPUCR        directory holding vGPU-NVIDIA.so and cr_client, from one build (default /gpu-cr)
+#   GPUCR_STORE  where GPU-CR keeps each process's dump (default /work/<tag>/gpucr)
+#   GPUCR_SHM_GB size of that dump for each process; it is allocated in full (default 24)
 #   CUDA_TOOL    snapshotd: one process drives the driver API, all PIDs in parallel; helper:
 #                Dynamo's cuda-checkpoint-helper, one run for each PID and action, in the order
 #                its agent uses (default snapshotd)
@@ -148,6 +154,12 @@ cuda_restore() {
   if [ "$CUDA_TOOL" != helper ]; then $SD cuda restore "${GPUS[@]}" $PIDS; return; fi
   helper restore ${DEVICE_MAP:+--device-map "$DEVICE_MAP"} && helper unlock
 }
+GC=${GPUCR:-/gpu-cr}; GSTORE=${GPUCR_STORE:-$W/gpucr}
+gpucr() { for p in $PIDS; do EXPORT_FILE_PATH=$GSTORE "$GC/cr_client" "$1" -b -p "$p" || return 1; done; }
+if [ "$MODE" = gpucr ]; then
+  mkdir -p "$GSTORE"
+  LAUNCH+=(env "LD_PRELOAD=$GC/vGPU-NVIDIA.so" GPU_VENDOR=NVIDIA "EXPORT_FILE_PATH=$GSTORE" "GPU_CR_SHM_GB=${GPUCR_SHM_GB:-24}")
+fi
 if [ "$MODE" = cuinterpose ]; then
   mkdir -p $BUNDLE && cp $B/snapshot-cuda/libcuinterpose.so $B/snapshot-cuda/libcuinterpose_core.so $B/cuinterpose-coordinator $BUNDLE/
   rm -f /tmp/cuinterpose-*.sock
@@ -192,6 +204,10 @@ if [ "$MODE" = cuinterpose ]; then
   T=$(now)
   $SD cuinterpose prepare --bundle-dir $BUNDLE --checkpoint-dir "$IMG" $PIDS | tee cuinterpose-prepare.log || fail CUINTERPOSE_PREPARE_FAILED
   lap cuinterpose_prepare "$T"
+fi
+if [ "$MODE" = gpucr ]; then
+  T=$(now); gpucr -c > gpucr-dump.log 2>&1 || { tail -5 gpucr-dump.log; fail GPUCR_DUMP_FAILED; }; lap gpucr_dump "$T"
+  R[gpu_mib_after_gpucr]=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s}')
 fi
 T=$(now); cuda_checkpoint || fail CUDA_CHECKPOINT_FAILED; lap cuda_checkpoint "$T"
 if [ "$STREAM" = external ]; then
@@ -256,6 +272,9 @@ elif [ "$REMAP" = rotate ]; then
   GPUS=(--source "$(IFS=,; echo "${SRC[*]}")" --target "$(IFS=,; echo "${TGT[*]}")" --visible "$(IFS=,; echo "${VISIBLE[*]}")")
 fi
 T=$(now); cuda_restore || fail CUDA_RESTORE_FAILED; lap cuda_restore "$T"
+if [ "$MODE" = gpucr ]; then
+  T=$(now); gpucr -r > gpucr-restore.log 2>&1 || { tail -5 gpucr-restore.log; fail GPUCR_RESTORE_FAILED; }; lap gpucr_restore "$T"
+fi
 if [ "$MODE" = cuinterpose ]; then
   T=$(now)
   $NETNS $SD cuinterpose restore --bundle-dir $BUNDLE --checkpoint-dir "$IMG" || fail CUINTERPOSE_RESTORE_FAILED
