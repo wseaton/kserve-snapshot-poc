@@ -1,7 +1,7 @@
 From 4f2c7213b08a886e085e9e5b0beb2f34f392a879 Mon Sep 17 00:00:00 2001
 From: Schwinn Saereesitthipitak <schwinns@nvidia.com>
 Date: Tue, 10 Nov 2026 20:24:02 +0000
-Subject: [PATCH 2/6] [KV Connector] Restore NIXL P/D workers independently
+Subject: [PATCH 2/7] [KV Connector] Restore NIXL P/D workers independently
  from process checkpoints
 
 Lets prefill and decode workers be checkpointed and restored independently,

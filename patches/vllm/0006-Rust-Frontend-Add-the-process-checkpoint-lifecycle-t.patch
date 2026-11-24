@@ -1,7 +1,7 @@
 From 6c9431395f3b8dc4e5d053c4ef7503f566199a7c Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:35:57 -0500
-Subject: [PATCH 6/6] [Rust Frontend] Add the process checkpoint lifecycle to
+Subject: [PATCH 6/7] [Rust Frontend] Add the process checkpoint lifecycle to
  gRPC Control
 
 The checkpoint lifecycle is reachable only over HTTP, on the inference

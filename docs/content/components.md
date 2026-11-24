@@ -18,9 +18,7 @@ extend it:
 - release the weights at prepare and reload them at restore (`0003`)
 - destroy and recreate the NCCL communicator, so no GPU memory is shared at checkpoint time (`0004`)
 - serve the lifecycle over the Rust frontend's gRPC `Control` service, which the daemon calls (`0005`, `0006`)
-
-Freeing the CPU KV offload region at prepare was measured on the earlier base and is not ported
-yet ([Open](@/open.md)).
+- free and refill the CPU KV offload region (`0007`)
 
 ## CUDA checkpoint driver API
 

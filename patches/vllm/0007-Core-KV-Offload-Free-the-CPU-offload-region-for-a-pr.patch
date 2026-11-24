@@ -1,0 +1,541 @@
+From b712f6f4aaaee90b39a185c2339d17b1221f798d Mon Sep 17 00:00:00 2001
+From: Will Eaton <weaton@redhat.com>
+Date: Tue, 24 Nov 2026 17:07:12 -0500
+Subject: [PATCH 7/7] [Core][KV Offload] Free the CPU offload region for a
+ process checkpoint
+
+/checkpoint/prepare resets the CPU offloading connector's index but
+leaves its region resident and registered with CUDA, so a process
+checkpoint carries --kv-offloading-size bytes of dead data. With a
+128 GiB region a CRIU image grew from 11.5 GB to 139 GB and restoring
+it took longer than a cold boot.
+
+Preparing now stops any background setup still running under
+async_init, unregisters the region and frees its pages with
+MADV_REMOVE, keeping the mappings so no pointer changes. In the
+replicated layout every worker maps one shared region, and pages
+another worker still has registered would stay allocated, so the
+workers meet at the barrier between unregistering and freeing. A
+per-rank region needs no barrier.
+
+Restoring repeats the setup the worker did at startup: in the
+background under async_init, with is_ready() false until it finishes,
+or else pre-faulting the same ranges and registering the region again,
+failing if the registration does not come back, because the transfer
+kernels dereference the host pointers.
+
+OffloadingConnector forwards the connector checkpoint hooks and
+supports process checkpoints with the CPU spec. The tiering spec keeps
+its memory and does not.
+
+Signed-off-by: Will Eaton <weaton@redhat.com>
+Assisted-by: Claude
+---
+ docs/serving/online_serving/README.md         |   2 +-
+ tests/v1/kv_connector/unit/test_config.py     |  20 +++-
+ tests/v1/kv_offload/cpu/test_gpu_worker.py    | 112 ++++++++++++++++++
+ .../cpu/test_shared_offload_region.py         |  49 ++++++++
+ .../kv_connector/v1/offloading/worker.py      |   8 ++
+ .../kv_connector/v1/offloading_connector.py   |  14 +++
+ vllm/v1/kv_offload/base.py                    |  16 +++
+ vllm/v1/kv_offload/cpu/gpu_worker.py          |  57 ++++++++-
+ .../kv_offload/cpu/shared_offload_region.py   |  25 ++--
+ vllm/v1/kv_offload/cpu/spec.py                |   6 +
+ vllm/v1/kv_offload/tiering/spec.py            |   5 +
+ 11 files changed, 301 insertions(+), 13 deletions(-)
+
+diff --git a/docs/serving/online_serving/README.md b/docs/serving/online_serving/README.md
+index 3d558b19c0..a9ff5364d6 100644
+--- a/docs/serving/online_serving/README.md
++++ b/docs/serving/online_serving/README.md
+@@ -176,7 +176,7 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
+ 
+ ## Process Checkpoint APIs
+ 
+-For external checkpoint/restore orchestrators, available with `--enable-sleep-mode`. Preparing drains the engine and releases its KV cache and other external state, any number of times. Until `/checkpoint/restore`, new requests get a retryable error and `/health` still returns 200, as while asleep. `--checkpoint-prepare-on-startup` prepares each engine once it starts. With a KV connector, the engine prepares only if the connector supports it. `NixlConnector` in pull mode needs `--checkpoint-prepare-on-startup`. Each restore appends a random suffix to the KV engine id, so restored replicas get distinct `remote_engine_id` values.
++For external checkpoint/restore orchestrators, available with `--enable-sleep-mode`. Preparing drains the engine and releases its KV cache and other external state, any number of times. Until `/checkpoint/restore`, new requests get a retryable error and `/health` still returns 200, as while asleep. `--checkpoint-prepare-on-startup` prepares each engine once it starts. With a KV connector, the engine prepares only if the connector supports it. `NixlConnector` in pull mode needs `--checkpoint-prepare-on-startup`. Each restore appends a random suffix to the KV engine id, so restored replicas get distinct `remote_engine_id` values. `OffloadingConnector` supports it with the CPU spec (`--kv-offloading-size`): preparing also frees the CPU offloading region, which restoring allocates again.
+ 
+ - `/checkpoint/prepare` - Start preparing, draining with `?mode=wait` (default), `abort` or `keep`; 200 once started or already preparing, 400 if the engine cannot prepare now
+ - `/checkpoint/status` - Return the state: 200 once prepared, 503 until then, 500 after a failure
+diff --git a/tests/v1/kv_connector/unit/test_config.py b/tests/v1/kv_connector/unit/test_config.py
+index e1b13d78ba..51967b9799 100644
+--- a/tests/v1/kv_connector/unit/test_config.py
++++ b/tests/v1/kv_connector/unit/test_config.py
+@@ -191,6 +191,7 @@ def test_sleep_mode_refuses_unsupported_kv_connector(
+ 
+ _NIXL = {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
+ _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
++_MOONCAKE = {"kv_connector": "MooncakeConnector", "kv_role": "kv_both"}
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -201,7 +202,8 @@ _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
+         ("NixlConnector", None, False, False),
+         ("MooncakeConnector", None, True, False),
+         ("MultiConnector", {"connectors": [_NIXL]}, True, True),
+-        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, False),
++        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, True),
++        ("MultiConnector", {"connectors": [_NIXL, _MOONCAKE]}, True, False),
+     ],
+ )
+ def test_kv_connectors_opt_in_to_process_checkpoints(
+@@ -219,6 +221,22 @@ def test_kv_connectors_opt_in_to_process_checkpoints(
+     assert connector_cls.supports_checkpoint(config) == supported
+ 
+ 
++@pytest.mark.parametrize(
++    "extra_config,supported",
++    [(None, True), ({"spec_name": "TieringOffloadingSpec"}, False)],
++)
++def test_offloading_connector_opts_in_to_process_checkpoints(extra_config, supported):
++    """The CPU spec's region is released for a process checkpoint; the tiering
++    spec's is not."""
++    config = _build_config(
++        kv_connector="OffloadingConnector",
++        kv_connector_extra_config=extra_config,
++        enable_sleep_mode=True,
++    )
++    connector_cls = KVConnectorFactory.get_connector_class(config.kv_transfer_config)
++    assert connector_cls.supports_checkpoint(config) == supported
++
++
+ def test_mooncake_store_supports_sleep_with_explicit_rdma(monkeypatch, tmp_path):
+     """Disabling auto-discovery keeps explicit RDMA despite NVLink overrides."""
+     monkeypatch.setitem(sys.modules, "mooncake", None)
+diff --git a/tests/v1/kv_offload/cpu/test_gpu_worker.py b/tests/v1/kv_offload/cpu/test_gpu_worker.py
+index 1289649f9f..1815c48fa4 100644
+--- a/tests/v1/kv_offload/cpu/test_gpu_worker.py
++++ b/tests/v1/kv_offload/cpu/test_gpu_worker.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
+ import logging
++import os
+ import random
+ import time
+ import uuid
+@@ -643,6 +644,117 @@ def test_transfer(
+     worker.shutdown()
+ 
+ 
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize("defer_host_setup", [False, True])
++@torch.inference_mode()
++def test_checkpoint_prepare_frees_region_and_restore_serves_transfers(
++    default_vllm_config, device: str, defer_host_setup: bool
++) -> None:
++    """Preparing stops any background setup, unregisters the region, waits for
++    the other ranks, then frees its pages. Restoring brings back zeroed,
++    registered memory at the same addresses, in the background under
++    async_init, and transfers work again. Repeating either is a no-op."""
++    num_gpu_blocks, num_cpu_chunks, page_size_bytes, num_tensors = 16, 8, 1024, 2
++    kv_caches = CanonicalKVCaches(
++        tensors=[
++            CanonicalKVCacheTensor(
++                tensor=torch.zeros(
++                    (num_gpu_blocks, page_size_bytes), dtype=torch.int8, device=device
++                ),
++                page_size_bytes=page_size_bytes,
++            )
++            for _ in range(num_tensors)
++        ],
++        group_data_refs=[
++            [
++                CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_size_bytes)
++                for i in range(num_tensors)
++            ]
++        ],
++    )
++    cpu_page_size = round_up(
++        page_size_bytes * num_tensors, SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
++    )
++    region = SharedOffloadRegion(
++        engine_id=str(uuid.uuid4()),
++        num_chunks=num_cpu_chunks,
++        rank=0,
++        kv_bytes_per_chunk=cpu_page_size,
++        cpu_page_size=cpu_page_size,
++        populate=not defer_host_setup,
++    )
++    region_fd = region.fd
++    assert region_fd is not None
++    at_barrier: list[tuple[bool, int]] = []
++    worker = CPUOffloadingWorker(
++        kv_caches=kv_caches,
++        blocks_per_chunk=1,
++        num_cpu_chunks=num_cpu_chunks,
++        mmap_region=region,
++        defer_host_setup=defer_host_setup,
++        barrier=lambda: at_barrier.append(
++            (region.is_pinned, os.fstat(region_fd).st_blocks * 512)
++        ),
++    )
++    cpu_tensors = worker._store_handler.cpu_tensors
++
++    def wait_ready() -> None:
++        deadline = time.time() + 30
++        while not worker.is_ready() and time.time() < deadline:
++            time.sleep(0.01)
++        assert worker.is_ready()
++
++    try:
++        worker.start_deferred_setup()
++        wait_ready()
++        was_pinned = region.is_pinned
++        addresses = [t.data_ptr() for t in cpu_tensors]
++        for i in range(num_tensors):
++            cpu_tensors[i].fill_(7)
++        assert os.fstat(region_fd).st_blocks * 512 == region.total_size_bytes
++
++        worker.checkpoint_prepare()
++        worker.checkpoint_prepare()
++        assert at_barrier == [(False, region.total_size_bytes)]
++        assert not region.is_pinned
++        assert not worker.is_ready()
++        assert os.fstat(region_fd).st_blocks == 0
++
++        worker.checkpoint_restore()
++        worker.checkpoint_restore()
++        wait_ready()
++        assert region.is_pinned == was_pinned
++        assert os.fstat(region_fd).st_blocks * 512 == region.total_size_bytes
++        assert [t.data_ptr() for t in cpu_tensors] == addresses
++        assert not any(bool(t.any()) for t in cpu_tensors)
++
++        gpu_blocks, cpu_chunks = [3, 9, 12], [5, 0, 6]
++        for i in range(num_tensors):
++            kv_caches.tensors[i].tensor.random_()
++        gpu_spec = GPULoadStoreSpec(
++            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(0,)
++        )
++        assert worker.submit_store(
++            1,
++            resolve_device_pointers(gpu_spec, kv_caches),
++            CPULoadStoreSpec(cpu_chunks),
++        )
++        finished: list[TransferResult] = []
++        deadline = time.time() + 10
++        while not finished and time.time() < deadline:
++            finished = worker.get_finished()
++            time.sleep(0.01)
++        assert [(r.job_id, r.success) for r in finished] == [(1, True)]
++        for i in range(num_tensors):
++            torch.testing.assert_close(
++                cpu_tensors[i][cpu_chunks],
++                kv_caches.tensors[i].tensor[gpu_blocks].cpu(),
++            )
++    finally:
++        del cpu_tensors
++        worker.shutdown()
++
++
+ @pytest.mark.parametrize("gpu_to_cpu", [True, False])
+ @pytest.mark.parametrize("num_mappings_per_group", NUM_MAPPINGS_PER_GROUP)
+ @pytest.mark.parametrize("gpu_page_size_bytes", GPU_PAGE_SIZES)
+diff --git a/tests/v1/kv_offload/cpu/test_shared_offload_region.py b/tests/v1/kv_offload/cpu/test_shared_offload_region.py
+index 4442c2e6da..a82fdf6c87 100644
+--- a/tests/v1/kv_offload/cpu/test_shared_offload_region.py
++++ b/tests/v1/kv_offload/cpu/test_shared_offload_region.py
+@@ -1676,3 +1676,52 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch, failure_
+ 
+     assert barrier.call_count == (2 if failure_phase == "population" else 1)
+     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
++
++
++def _shm_blocks(region: SharedOffloadRegion) -> int:
++    assert region.fd is not None
++    return os.fstat(region.fd).st_blocks
++
++
++def _prefault(region: SharedOffloadRegion) -> None:
++    for offset, length in region.prefault_ranges():
++        region.prefault(offset, length)
++
++
++def test_release_pages_frees_memory_and_prefault_brings_it_back(iid):
++    num_chunks = 8
++    region = _make_region(iid, num_chunks=num_chunks)
++    try:
++        view = region.create_next_worker_view(PAGE_SIZE)
++        view.fill_(7)
++        address = view.data_ptr()
++        assert _shm_blocks(region) * 512 == num_chunks * PAGE_SIZE
++
++        region.release_pages()
++        assert _shm_blocks(region) == 0
++
++        region.release_pages()
++        _prefault(region)
++        assert _shm_blocks(region) * 512 == num_chunks * PAGE_SIZE
++        assert view.data_ptr() == address
++        assert int(view.abs().sum()) == 0
++        view.fill_(3)
++        assert int(view.sum()) == 3 * num_chunks * PAGE_SIZE
++        del view
++    finally:
++        region.cleanup()
++
++
++def test_release_pages_is_shared_between_workers(iid):
++    creator = _make_region(iid, num_workers=2, rank=0)
++    joiner = _make_region(iid, num_workers=2, rank=1)
++    try:
++        assert _shm_blocks(creator) * 512 == creator.total_size_bytes
++        creator.release_pages()
++        assert _shm_blocks(joiner) == 0
++        _prefault(creator)
++        _prefault(joiner)
++        assert _shm_blocks(joiner) * 512 == joiner.total_size_bytes
++    finally:
++        joiner.cleanup()
++        creator.cleanup()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 426c91e3c2..cc0d2fdc10 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -362,6 +362,14 @@ class OffloadingConnectorWorker:
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+         return meta
+ 
++    def checkpoint_prepare(self) -> None:
++        if self.worker is not None:
++            self.worker.checkpoint_prepare()
++
++    def checkpoint_restore(self) -> None:
++        if self.worker is not None:
++            self.worker.checkpoint_restore()
++
+     def shutdown(self) -> None:
+         self._unsubmitted_store_jobs.clear()
+         self._load_jobs.clear()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index 202a44262d..f6fb081f71 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -102,6 +102,20 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+                 spec, vllm_config, kv_cache_config
+             )
+ 
++    @classmethod
++    def supports_checkpoint(cls, vllm_config: VllmConfig) -> bool:
++        assert vllm_config.kv_transfer_config is not None
++        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
++        return OffloadingSpecFactory.get_spec_cls(extra_config).supports_checkpoint()
++
++    def checkpoint_prepare(self) -> None:
++        if self.connector_worker is not None:
++            self.connector_worker.checkpoint_prepare()
++
++    def checkpoint_restore(self) -> None:
++        if self.connector_worker is not None:
++            self.connector_worker.checkpoint_restore()
++
+     def shutdown(self) -> None:
+         if self.connector_worker is not None:
+             self.connector_worker.shutdown()
+diff --git a/vllm/v1/kv_offload/base.py b/vllm/v1/kv_offload/base.py
+index b660001c5b..bfd4d0f1ff 100644
+--- a/vllm/v1/kv_offload/base.py
++++ b/vllm/v1/kv_offload/base.py
+@@ -780,6 +780,16 @@ class OffloadingWorker(ABC):
+         """Whether this worker can take transfers."""
+         return True
+ 
++    def checkpoint_prepare(self) -> None:
++        """Free host memory a process checkpoint should not contain. The
++        offloaded data is already dropped and transfers are drained. Every
++        worker rank calls this together. Idempotent."""
++        return
++
++    def checkpoint_restore(self) -> None:
++        """Bring back what `checkpoint_prepare` freed. Idempotent."""
++        return
++
+     def shutdown(self) -> None:
+         return
+ 
+@@ -806,6 +816,12 @@ class OffloadingSpec(ABC):
+         """
+         return ()
+ 
++    @classmethod
++    def supports_checkpoint(cls) -> bool:
++        """Whether a process checkpoint of an engine using this spec can be
++        restored."""
++        return False
++
+     def __init__(self, config: OffloadingConfig):
+         self.config = config
+         self.extra_config = config.extra_config
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index 9cca2fc7ac..00c1f1a82d 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -828,15 +828,20 @@ class CPUOffloadingWorker(OffloadingWorker):
+         defer_host_setup: bool = False,
+         prefault_shard: tuple[int, int] | None = None,
+         pin_pace: float = 2.0,
++        barrier: Callable[[], None] | None = None,
+     ):
+         """defer_host_setup leaves pre-faulting and pinning mmap_region to
+         start_deferred_setup(); prefault_shard is then the share this worker
+-        pre-faults first, and pin_pace paces its pinning (see pin_mmap_region)."""
++        pre-faults first, and pin_pace paces its pinning (see pin_mmap_region).
++        barrier waits for every worker that maps a shared mmap_region."""
+         assert not canonical_layout or mmap_region is not None
++        self._barrier = barrier
+         # The caller owns mmap_region until this constructor returns. After a
+         # successful construction, the worker is the sole owner and releases
+         # it after both transfer directions have stopped.
+         self._mmap_region = mmap_region
++        self._checkpoint_released = False
++        self._checkpoint_repin = False
+         pin_memory = PIN_MEMORY
+         self._pin_memory = pin_memory
+         self._worker_slot_only = not canonical_layout
+@@ -986,11 +991,55 @@ class CPUOffloadingWorker(OffloadingWorker):
+         self._load_handler.wait(job_ids)
+         self._expedited_load_handler.wait(job_ids)
+ 
++    def checkpoint_prepare(self) -> None:
++        region = self._mmap_region
++        if region is None or self._checkpoint_released:
++            return
++        self._stop_host_setup()
++        self._ready.clear()
++        self._checkpoint_repin = region.is_pinned
++        region.unpin()
++        if self._barrier is not None:
++            self._barrier()
++        region.release_pages()
++        self._checkpoint_released = True
++
++    def checkpoint_restore(self) -> None:
++        region = self._mmap_region
++        if region is None or not self._checkpoint_released:
++            return
++        self._checkpoint_released = False
++        if self._defer_host_setup:
++            self.start_deferred_setup()
++            return
++        start = time.monotonic()
++        for offset, length in region.prefault_ranges(self._prefault_shard):
++            region.prefault(offset, length)
++        if self._checkpoint_repin:
++            pin_mmap_region(region, worker_slot_only=self._worker_slot_only)
++            if not region.is_pinned:
++                raise RuntimeError(
++                    "Failed to register the CPU offload region again after a "
++                    "process checkpoint"
++                )
++        self._ready.set()
++        logger.info(
++            "Restored the %.2f GB CPU offload region in %.2f s",
++            region.total_size_bytes / 1e9,
++            time.monotonic() - start,
++        )
++
++    def _stop_host_setup(self) -> None:
++        if self._setup_thread is None:
++            return
++        self._setup_stop.set()
++        self._setup_thread.join()
++        self._setup_thread = None
++        self._setup_stop.clear()
++
+     def shutdown(self) -> None:
+         # The region must outlive the setup thread that touches it.
+-        if self._setup_thread is not None:
+-            self._setup_stop.set()
+-            self._setup_thread.join()
++        self._stop_host_setup()
+         handler_failed = False
+         try:
+             self._store_handler.shutdown()
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index 4f0a396840..78cf375f1e 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.cpu.host_register import host_unregister
+ logger = init_logger(__name__)
+ 
+ # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
++_MADV_REMOVE = getattr(mmap, "MADV_REMOVE", 9)
+ _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+ _MAP_FIXED = 0x10
+ # Page-cache inserts are serialized per shm file, capping pre-faulting of one
+@@ -513,14 +514,24 @@ class SharedOffloadRegion:
+         )
+         return memoryview(np_arr)
+ 
++    def unpin(self) -> None:
++        """Drop this worker's host registrations."""
++        if not self.is_pinned or self._base is None:
++            return
++        addresses = self.pinned_addresses or [self._base.data_ptr()]
++        for address in reversed(addresses):
++            host_unregister(address)
++        self.pinned_addresses.clear()
++        self.is_pinned = False
++
++    def release_pages(self) -> None:
++        """Free the region's memory and keep its mappings. The contents are
++        lost, and every worker that maps it must have unpinned first."""
++        assert self.mmap_obj is not None
++        self.mmap_obj.madvise(_MADV_REMOVE, 0, self.total_size_bytes)
++
+     def cleanup(self) -> None:
+-        if self.is_pinned and self._base is not None:
+-            base_ptr = self._base.data_ptr()
+-            addresses = self.pinned_addresses or [base_ptr]
+-            for address in reversed(addresses):
+-                host_unregister(address)
+-            self.pinned_addresses.clear()
+-            self.is_pinned = False
++        self.unpin()
+         # Release views before _base: each view holds a _base reference and a
+         # direct StorageImpl reference.  Freeing views first lets both refcounts
+         # drop so the storage (which holds the mmap_obj buffer export) is freed
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index a16330a8fe..68451d8d40 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -215,6 +215,11 @@ class CPUOffloadingSpec(OffloadingSpec):
+             current_platform.is_cuda_alike() and not current_platform.is_rocm()
+         ) or current_platform.is_xpu()
+ 
++    @classmethod
++    @override
++    def supports_checkpoint(cls) -> bool:
++        return True
++
+     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+         mmap_region: SharedOffloadRegion | None = None
+         prefault_shard: tuple[int, int] | None = None
+@@ -266,6 +271,7 @@ class CPUOffloadingSpec(OffloadingSpec):
+                 defer_host_setup=self.async_init,
+                 prefault_shard=prefault_shard,
+                 pin_pace=self.async_init_pin_pace,
++                barrier=_all_workers_barrier if self.replicated_layout else None,
+             )
+         except Exception:
+             if mmap_region is not None:
+diff --git a/vllm/v1/kv_offload/tiering/spec.py b/vllm/v1/kv_offload/tiering/spec.py
+index e6ed9fff90..9895515727 100644
+--- a/vllm/v1/kv_offload/tiering/spec.py
++++ b/vllm/v1/kv_offload/tiering/spec.py
+@@ -332,6 +332,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+ 
+         return metrics
+ 
++    @classmethod
++    @override
++    def supports_checkpoint(cls) -> bool:
++        return False
++
+     def __init__(self, config: OffloadingConfig):
+         super().__init__(config)
+         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
+-- 
+2.54.0 (Apple Git-157)
+

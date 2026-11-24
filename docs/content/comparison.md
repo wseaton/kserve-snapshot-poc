@@ -40,7 +40,7 @@ speedups. Both exclude image pull and container setup.
 | Change | Where | Before | After |
 | --- | --- | --- | --- |
 | Release weights at prepare | `patches/vllm/0003` | 647 GB image (published) | 74 GB |
-| Release CPU KV offload at prepare | vLLM patch, not yet ported | 139.4 GB image | 11.4 GB |
+| Release CPU KV offload at prepare | `patches/vllm/0007` | 139.4 GB image | 11.4 GB |
 | Weights from a serving peer | ModelExpress | 88.4 s reload, cold volume | 7.0 s |
 | Driver calls for all PIDs in parallel | `daemon/src/cuda.rs` | 14.4 s CUDA checkpoint | 3.8 s |
 | Stream CRIU into an RDMA sender | `daemon/src/transfer.rs` | 98.0 s dump then copy | 33.0 s |

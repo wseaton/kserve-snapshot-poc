@@ -1,7 +1,7 @@
 From 57b192c70ead59f2a8aa8b3134e70caa4eaec1ec Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:56:31 -0500
-Subject: [PATCH 3/6] [Core] Release weights for a process checkpoint with
+Subject: [PATCH 3/7] [Core] Release weights for a process checkpoint with
  --checkpoint-release-weights
 
 With --checkpoint-release-weights, /checkpoint/prepare also discards the

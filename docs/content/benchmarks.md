@@ -165,7 +165,7 @@ stay in one pod.
 
 ## CPU KV offload
 
-`--kv-offloading-size N` keeps an N GiB region in `/dev/shm`. "Released" is [the CPU offload patch](https://github.com/wseaton/vllm/commit/47906b39d1), not yet ported to the current base.
+`--kv-offloading-size N` keeps an N GiB region in `/dev/shm`. "Released" is the CPU offload patch, now `patches/vllm/0007`; these rows were measured on the earlier base.
 TP=2, no cuInterpose, one run each.
 
 | Offload | Region | Prepare | CRIU dump | Image | Restore total | Cold boot |

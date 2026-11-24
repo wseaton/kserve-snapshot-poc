@@ -1,7 +1,7 @@
 From 18bfcc24a915f9435db555fef0e59dc93632f426 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:57:04 -0500
-Subject: [PATCH 4/6] [Distributed] Recreate NCCL communicators across a
+Subject: [PATCH 4/7] [Distributed] Recreate NCCL communicators across a
  process checkpoint
 
 /checkpoint/prepare left the NCCL communicator alive, so each TP worker

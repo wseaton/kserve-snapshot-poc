@@ -1,7 +1,7 @@
 From f0ec68c179846260ebcba6a075157a9e93710ff3 Mon Sep 17 00:00:00 2001
 From: Schwinn Saereesitthipitak <schwinns@nvidia.com>
 Date: Thu, 29 Oct 2026 16:44:12 +0000
-Subject: [PATCH 1/6] [KV Connector] Add checkpoint_prepare and
+Subject: [PATCH 1/7] [KV Connector] Add checkpoint_prepare and
  checkpoint_restore connector hooks
 
 Let KV connectors release what a process checkpoint must not contain, such

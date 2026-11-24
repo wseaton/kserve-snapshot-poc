@@ -1,7 +1,7 @@
 From cf69fc4a20e4acdc2f617a11145421967986049e Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:33:40 -0500
-Subject: [PATCH 5/6] [Rust Frontend] Move the checkpoint lifecycle out of the
+Subject: [PATCH 5/7] [Rust Frontend] Move the checkpoint lifecycle out of the
  HTTP routes
 
 The prepare and restore state machines lived in the /checkpoint route

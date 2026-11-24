@@ -32,9 +32,11 @@ patches.
   (`CheckpointPrepare`, `CheckpointRestore`, `GetCheckpointState`), sharing one state machine with
   the `/checkpoint` HTTP routes. Upstream serves it only over HTTP, on the inference port.
 
-Freeing the CPU KV offload region at prepare
-([fork commit](https://github.com/wseaton/vllm/commit/47906b39d1)) is not ported to this base:
-main now gives each rank its own region and sets the tier up in the background.
+- `0007`: with the CPU KV offload connector (`--kv-offloading-size`), `/checkpoint/prepare` stops
+  any background setup, unregisters the offload region and frees its pages, and
+  `/checkpoint/restore` sets it up again, in the background under `async_init`. The checkpoint does
+  not grow by the region size. Workers sharing the replicated layout's one region meet at a
+  barrier before freeing it; per-rank regions do not. The tiering spec keeps its memory.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
