@@ -327,9 +327,15 @@ fn cuda_command(command: CudaCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
     use rustix::process::{Resource, getrlimit};
 
-    use crate::raise_open_file_limit;
+    use crate::{Cli, raise_open_file_limit};
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn open_file_limit_is_raised_to_the_hard_limit() {

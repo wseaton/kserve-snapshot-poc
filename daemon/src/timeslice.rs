@@ -40,6 +40,7 @@ use pb::snapshot_agent_service_server::{SnapshotAgentService, SnapshotAgentServi
 use pb::{JobState, OperationStatus};
 
 #[derive(Clone, clap::Args)]
+#[group(id = "timeslice")]
 pub struct Args {
     /// Address to serve the time-slicing snapshot agent API on. Not served
     /// when unset.

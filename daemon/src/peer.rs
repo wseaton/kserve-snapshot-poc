@@ -27,6 +27,7 @@ use crate::tunnel::{self, Holder, Identity, Refusal, Status, Tunnel, Work};
 const BUSY_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(clap::Args)]
+#[group(id = "peers")]
 pub struct Args {
     /// Name and port that resolve to the kube-rbac-proxy of every node's
     /// daemon. Without it, checkpoints stay on the node that took them.
