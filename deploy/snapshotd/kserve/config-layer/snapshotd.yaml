@@ -8,7 +8,7 @@ spec:
   template:
     initContainers:
       - name: snapshot-tools
-        image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+        image: ghcr.io/wseaton/snapshotd/snapshotd
         imagePullPolicy: IfNotPresent
         command:
           - cp
@@ -37,7 +37,7 @@ spec:
             mountPath: /snapshot-tools
     containers:
       - name: main
-        image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+        image: ghcr.io/wseaton/snapshotd/vllm-checkpoint
         command:
           - /snapshot-tools/snapshotd-shim
           - --

@@ -10,7 +10,7 @@ spec:
           mountPath: /mem
     # Copies /work/<tag> to or from another node.
     - name: xfer
-      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+      image: ghcr.io/wseaton/snapshotd/snapshotd
       command: [sleep, infinity]
       env:
         - name: HOME

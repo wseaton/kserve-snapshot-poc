@@ -4,10 +4,10 @@ resources:
   - ../deploy/node
   - workload.yaml
 images:
-  - name: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+  - name: ghcr.io/wseaton/snapshotd/snapshotd
     newName: localhost/snapshotd-e2e
     newTag: dev
-  - name: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+  - name: ghcr.io/wseaton/snapshotd/snapshot-agent
     newName: localhost/snapshotd-e2e
     newTag: dev
 configMapGenerator:

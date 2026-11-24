@@ -77,10 +77,10 @@ deploy/
 
 | Image | Used for | Built from |
 | --- | --- | --- |
-| `ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint` | vLLM in both paths | [`images/vllm-checkpoint`](../images/vllm-checkpoint): vLLM nightly `a2bcb565` with files from the patched fork, ModelExpress from its fork branch, and the CUDA 13.1 forward-compat `libcuda` at `/usr/local/cuda-13.1/compat`, off the library path |
-| `ghcr.io/wseaton/kserve-snapshot-poc/snapshotd` | the `xfer` container; an init container copies `snapshotd` and the bench scripts out of it | [`images/snapshotd`](../images/snapshotd): both builds of [`daemon/`](../daemon), with NIXL ([ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672)) and UCX |
+| `ghcr.io/wseaton/snapshotd/vllm-checkpoint` | vLLM in both paths | [`images/vllm-checkpoint`](../images/vllm-checkpoint): vLLM nightly `a2bcb565` with files from the patched fork, ModelExpress from its fork branch, and the CUDA 13.1 forward-compat `libcuda` at `/usr/local/cuda-13.1/compat`, off the library path |
+| `ghcr.io/wseaton/snapshotd/snapshotd` | the `xfer` container; an init container copies `snapshotd` and the bench scripts out of it | [`images/snapshotd`](../images/snapshotd): both builds of [`daemon/`](../daemon), with NIXL ([ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672)) and UCX |
 | `quay.io/wseaton/kserve-dynamo-snapshot@sha256:77c68762…` | companion, snapshot entrypoint | `kserve-dynamo-snapshot/Dockerfile` |
-| `ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent` | Dynamo agent; in the bench pod, an init container copies CRIU, its plugins and cuInterpose out of it | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot), from its own Dockerfile, CRIU pinned to `1a93585` |
+| `ghcr.io/wseaton/snapshotd/snapshot-agent` | Dynamo agent; in the bench pod, an init container copies CRIU, its plugins and cuInterpose out of it | Dynamo Snapshot `bc9d216` with [`patches/dynamo-snapshot/0001`](../patches/dynamo-snapshot), from its own Dockerfile, CRIU pinned to `1a93585` |
 | `ghcr.io/ai-dynamo/snapshot/operator:v0.0.0-gbc9d2161`, `…/agent:v0.0.0-gbc9d2161` | Dynamo operator; cuInterpose bundle the companion injects | upstream |
 | `nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.6.0` | ModelExpress server | upstream |
 

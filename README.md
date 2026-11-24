@@ -1,13 +1,18 @@
-# kserve-snapshot-poc
+# snapshotd
 
-Scale out KServe `LLMInferenceService` replicas by restoring vLLM from a CRIU checkpoint instead
-of cold-booting it. The weights are left out of the checkpoint and pulled on restore from a
-replica that is already serving, over InfiniBand through
-[ModelExpress](https://github.com/ai-dynamo/modelexpress). The checkpoint itself is streamed to the
+`snapshotd` is a node daemon that brings a vLLM replica up by restoring it from a CRIU checkpoint
+instead of cold booting it. A Deployment or a KServe `LLMInferenceService` opts in with a pod
+label; the first replica of a revision is checkpointed, later ones are restored on the same node
+or on one that pulls the checkpoint from a peer. It needs no controller, webhook or custom
+resource ([docs/orchestration.md](docs/orchestration.md)).
+
+The fastest path measured, below, leaves the weights out of the checkpoint and pulls them on
+restore from a replica that is already serving, over InfiniBand through
+[ModelExpress](https://github.com/ai-dynamo/modelexpress), with the checkpoint streamed to the
 target node's RAM while it is being taken.
 
-It starts from [NVIDIA Dynamo Snapshot](https://github.com/ai-dynamo/snapshot) and replaces its
-node agent with `snapshotd`, a Rust daemon written for vLLM.
+The work started from [NVIDIA Dynamo Snapshot](https://github.com/ai-dynamo/snapshot), whose node
+agent `snapshotd` replaces.
 
 ![Seconds until a DeepSeek-V4.1-Flash replica serves on 8 GPUs](docs/img/headline.svg)
 

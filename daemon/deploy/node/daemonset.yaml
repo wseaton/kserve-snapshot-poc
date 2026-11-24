@@ -26,7 +26,7 @@ spec:
           effect: NoSchedule
       initContainers:
         - name: tools
-          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+          image: ghcr.io/wseaton/snapshotd/snapshot-agent
           command:
             - sh
             - -c
@@ -44,7 +44,7 @@ spec:
               mountPath: /tools
       containers:
         - name: snapshotd
-          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          image: ghcr.io/wseaton/snapshotd/snapshotd
           command: [snapshotd, node]
           args:
             - --store-dir=/store

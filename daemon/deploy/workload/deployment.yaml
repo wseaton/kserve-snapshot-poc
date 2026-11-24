@@ -17,7 +17,7 @@ spec:
     spec:
       initContainers:
         - name: snapshot-tools
-          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          image: ghcr.io/wseaton/snapshotd/snapshotd
           command:
             - cp
             - /opt/snapshotd/bin/snapshotd-shim
@@ -32,7 +32,7 @@ spec:
               mountPath: /snapshot-tools
       containers:
         - name: main
-          image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+          image: ghcr.io/wseaton/snapshotd/vllm-checkpoint
           command:
             - /snapshot-tools/snapshotd-shim
             - --

@@ -17,7 +17,7 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
         - name: main
-          image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+          image: ghcr.io/wseaton/snapshotd/snapshotd
           imagePullPolicy: Never
           command: [snapshotd-shim, --, stand-in, serve]
           ports:

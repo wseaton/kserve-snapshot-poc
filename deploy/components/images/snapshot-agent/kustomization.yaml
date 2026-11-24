@@ -2,5 +2,5 @@ apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 images:
 - digest: sha256:78a51c6485e00fb66eb6941f65d0631722310eee90355c02d88f08330a8e700b
-  name: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+  name: ghcr.io/wseaton/snapshotd/snapshot-agent
   newName: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent

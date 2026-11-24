@@ -11,7 +11,7 @@ spec:
   restartPolicy: Never
   initContainers:
     - name: snapshotd
-      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+      image: ghcr.io/wseaton/snapshotd/snapshotd
       command:
         - sh
         - -c
@@ -26,7 +26,7 @@ spec:
         - name: exp
           mountPath: /exp
     - name: snapshot-binaries
-      image: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+      image: ghcr.io/wseaton/snapshotd/snapshot-agent
       command: [cp, -a, /snapshot-binaries, /out/]
       resources:
         requests:
@@ -37,7 +37,7 @@ spec:
           mountPath: /out
   containers:
     - name: main
-      image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+      image: ghcr.io/wseaton/snapshotd/vllm-checkpoint
       command: [python3, -c, "import os,time\nwhile True:\n  try: os.waitpid(-1,0)\n  except ChildProcessError: time.sleep(1)"]
       securityContext:
         privileged: true

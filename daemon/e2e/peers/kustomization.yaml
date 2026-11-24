@@ -6,10 +6,10 @@ resources:
 components:
   - ../../deploy/components/peers
 images:
-  - name: ghcr.io/wseaton/kserve-snapshot-poc/snapshotd
+  - name: ghcr.io/wseaton/snapshotd/snapshotd
     newName: localhost/snapshotd-e2e-peers
     newTag: dev
-  - name: ghcr.io/wseaton/kserve-snapshot-poc/snapshot-agent
+  - name: ghcr.io/wseaton/snapshotd/snapshot-agent
     newName: localhost/snapshotd-e2e-peers
     newTag: dev
 patches:
