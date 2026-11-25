@@ -44,10 +44,10 @@ use crate::node::pod::Pod;
 use crate::node::process::{HostPid, PodPid};
 use crate::node::report::{seconds, short_id};
 use crate::node::shim::ShimClient;
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 use crate::peer::{self, Peers};
 use crate::podresources;
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 use crate::store::directory_bytes;
 use crate::store::{
     Attestation, Class, Classes, Owner, Published, RevisionKey, RevisionStore, Workload,
@@ -189,7 +189,7 @@ pub struct Args {
     pod: pod::Options,
     #[command(flatten)]
     timeslice: timeslice::Args,
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     #[command(flatten)]
     peers: peer::Args,
 }
@@ -201,15 +201,15 @@ struct Node {
     /// cold boots.
     api: Option<kube::Client>,
     metrics: Arc<Metrics>,
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     peers: Option<Arc<Peers>>,
     /// A lock for each revision, held while its checkpoint is pulled, so
     /// pods of one revision that start together pull it once.
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     pulling: std::sync::Mutex<HashMap<RevisionKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 impl Node {
     fn pull_turn(&self, revision: &RevisionKey) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let mut pulling = self
@@ -497,7 +497,7 @@ fn refusal(
     }
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 async fn pull_from_peers(
     peers: &Arc<Peers>,
     revision: &RevisionKey,
@@ -624,7 +624,7 @@ async fn bring_up(
     }
     let ours = identity.attestation(&revision);
     let store = RevisionStore::open(&class.dir, &revision, &sandbox.uid)?;
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     if let Some(peers) = &node.peers {
         let turn = node.pull_turn(&revision)?;
         let _turn = turn.lock().await;
@@ -824,12 +824,12 @@ async fn serve(args: Args) -> Result<()> {
         }
     };
     let node = Arc::new(Node {
-        #[cfg(feature = "nixl")]
+        #[cfg(feature = "p2p")]
         peers: Peers::start(&args.peers, classes.clone(), api.clone()).await?,
         api,
         classes,
         metrics,
-        #[cfg(feature = "nixl")]
+        #[cfg(feature = "p2p")]
         pulling: std::sync::Mutex::default(),
         args,
     });

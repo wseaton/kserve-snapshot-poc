@@ -62,7 +62,7 @@ RUN grep -q "rev = \"${NIXL_REF}\"" /tmp/Cargo.toml \
     && ldconfig
 
 COPY daemon /src/daemon
-RUN cd /src/daemon && cargo build --release --locked --features nixl
+RUN cd /src/daemon && cargo build --release --locked --features p2p
 
 FROM rust AS criu
 RUN dnf install -y --setopt=install_weak_deps=False \

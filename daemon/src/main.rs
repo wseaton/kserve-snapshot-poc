@@ -6,28 +6,28 @@ mod access;
 mod cri;
 mod cuda;
 mod cuinterpose;
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 mod encrypt;
 mod image;
 mod inject;
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 mod lanes;
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 mod link;
 mod metrics;
 mod node;
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 mod peer;
 mod podresources;
 mod store;
 mod timeslice;
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 mod topology;
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 mod trace;
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 mod transfer;
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 mod tunnel;
 mod uds;
 mod vllm;
@@ -66,12 +66,12 @@ enum Command {
     #[command(subcommand)]
     Image(ImageCommand),
     /// Copy a checkpoint directory to another node over RDMA.
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     #[command(subcommand)]
     Transfer(TransferCommand),
     /// Write the certificates of the mutual TLS between a daemon and its
     /// kube-rbac-proxy.
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     PeerLink(link::Args),
 }
 
@@ -93,7 +93,7 @@ enum ImageCommand {
     },
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 #[derive(Subcommand)]
 enum TransferCommand {
     /// Wait for one sender and write what it sends under a directory.
@@ -227,15 +227,15 @@ impl Command {
                 segment_gib,
                 reserve_gib,
             }) => image::hold(&images_dir, segment_gib << 30, reserve_gib << 30),
-            #[cfg(feature = "nixl")]
+            #[cfg(feature = "p2p")]
             Self::Transfer(command) => command.run(),
-            #[cfg(feature = "nixl")]
+            #[cfg(feature = "p2p")]
             Self::PeerLink(args) => link::run(&args),
         }
     }
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 impl TransferCommand {
     fn run(self) -> Result<()> {
         match self {

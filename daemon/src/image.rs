@@ -73,7 +73,7 @@ impl HugeRegion {
 
     /// The same region without asking for huge pages. Asking makes every
     /// fault wait for the kernel to find or make one.
-    #[cfg(feature = "nixl")]
+    #[cfg(feature = "p2p")]
     pub fn of_small_pages(len: usize) -> Result<Self> {
         Self::map(len, false)
     }
@@ -535,12 +535,12 @@ pub fn serve_forever(store: &Store, restores: &UnixListener) -> Result<()> {
     }
 }
 
-#[cfg(any(test, feature = "nixl"))]
+#[cfg(any(test, feature = "p2p"))]
 pub fn serve_socket(images_dir: &Path) -> Result<UnixListener> {
     listen(images_dir, SERVE_SOCKET)
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 pub fn capture_socket(images_dir: &Path) -> Result<UnixListener> {
     listen(images_dir, CAPTURE_SOCKET)
 }

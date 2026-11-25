@@ -89,7 +89,7 @@ Without 0003, shared memory restores only onto GPUs with the same device minors
 ## Image transfer
 
 [`daemon/src/transfer.rs`](https://github.com/wseaton/snapshotd/blob/main/daemon/src/transfer.rs),
-`--features nixl`. Each side maps one 2 MiB-aligned `MADV_HUGEPAGE` region, registers it with NIXL
+`--features p2p`. Each side maps one 2 MiB-aligned `MADV_HUGEPAGE` region, registers it with NIXL
 once (~0.1 s for 4 GiB) and cuts it into slots. A slot is filled by the sender, written into the
 receiver's slot over RDMA, persisted, acknowledged and reused.
 

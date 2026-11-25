@@ -34,7 +34,7 @@ pub const PROXY_KEY: &str = "proxy.key";
 pub const DAEMON_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const VALID_DAYS: u32 = 3650;
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 #[derive(clap::Args)]
 pub struct Args {
     /// Directory to write the link's certificates to, shared by the daemon
@@ -46,7 +46,7 @@ pub struct Args {
     proxy_uid: u32,
 }
 
-#[cfg(feature = "nixl")]
+#[cfg(feature = "p2p")]
 pub fn run(args: &Args) -> Result<()> {
     generate(&args.dir, Some(args.proxy_uid))
 }

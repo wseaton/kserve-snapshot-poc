@@ -134,7 +134,7 @@ impl RevisionKey {
             .join(&self.hash)
     }
 
-    #[cfg(any(test, feature = "nixl"))]
+    #[cfg(any(test, feature = "p2p"))]
     pub fn image_dir(&self, store: &Path) -> PathBuf {
         self.dir(store).join("image")
     }
@@ -247,7 +247,7 @@ impl Attestation {
     /// Whether the image in `image` may be used by pods of `wanted`. An
     /// image captured before images were attested may be used by anyone; one
     /// whose attestation cannot be read by no one.
-    #[cfg(any(test, feature = "nixl"))]
+    #[cfg(any(test, feature = "p2p"))]
     pub fn allows(image: &Path, wanted: &Principal) -> bool {
         match Self::of_image(image) {
             Ok(Some(attestation)) => attestation.principal() == *wanted,
@@ -536,7 +536,7 @@ impl Classes {
     }
 
     /// In whichever class holds it.
-    #[cfg(any(test, feature = "nixl"))]
+    #[cfg(any(test, feature = "p2p"))]
     pub fn image_of(&self, revision: &RevisionKey) -> Option<PathBuf> {
         self.0
             .values()

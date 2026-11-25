@@ -20,7 +20,7 @@ pull a checkpoint takes it from the nearest node that holds it.
 
 Linux only. `snapshotd` loads `libcuda.so.1` at run time, so it builds without a GPU or the CUDA
 toolkit and uses whichever driver library is first on the library path where it runs. Moving
-checkpoints between nodes needs the `nixl` feature and NIXL installed.
+checkpoints between nodes needs the `p2p` feature and NIXL installed.
 
 ```bash
 cargo build --release --workspace
@@ -74,7 +74,7 @@ anonymous 2 MiB-aligned huge-page segments and answers restores from them until 
 
 ## Copy to another node
 
-Built with `--features nixl`, which needs NIXL and UCX installed and links
+Built with `--features p2p`, which needs NIXL and UCX installed and links
 [ai-dynamo/nixl#2672](https://github.com/ai-dynamo/nixl/pull/2672) for caller-provided buffers.
 
 ```bash

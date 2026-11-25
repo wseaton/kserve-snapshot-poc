@@ -68,7 +68,7 @@ label_values! {
         ColdBoot => "cold_boot",
         Checkpoint => "checkpoint",
         Restore => "restore",
-        #[cfg_attr(not(feature = "nixl"), allow(dead_code))]
+        #[cfg_attr(not(feature = "p2p"), allow(dead_code))]
         Pull => "pull",
     }
     Action {

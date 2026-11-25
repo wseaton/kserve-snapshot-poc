@@ -59,7 +59,7 @@ protox = "0.10"
 tonic-prost-build = "0.14"
 
 [features]
-nixl = ["dep:nixl-sys", "dep:tokio-openssl", "dep:walkdir"]
+p2p = ["dep:nixl-sys", "dep:tokio-openssl", "dep:walkdir"]
 
 [lints.clippy]
 all = "warn"
