@@ -3,6 +3,8 @@
 //! ```text
 //! snapshotd_pods_total{namespace, workload, how}       pods brought to serving
 //! snapshotd_pod_failures_total{namespace, workload}    attempts that ended in an error
+//! snapshotd_condemned_images_total{namespace, workload}   checkpoints removed after pods failed them in a row
+//! snapshotd_abandoned_revisions_total{namespace, workload} revisions whose captures stopped after a recapture was condemned
 //! snapshotd_step_seconds{step}                         cold_boot, checkpoint, restore, pull
 //! snapshotd_store_bytes{class, namespace, workload}    as of the last look at the stores
 //! snapshotd_store_revisions{class, namespace, workload}
@@ -133,6 +135,8 @@ pub struct Metrics {
     registry: Registry,
     pods: Family<Served, Counter>,
     pod_failures: Family<Workload, Counter>,
+    condemned_images: Family<Workload, Counter>,
+    abandoned_revisions: Family<Workload, Counter>,
     step_seconds: Seconds<Stepped>,
     store_bytes: Family<Stored, Gauge>,
     store_revisions: Family<Stored, Gauge>,
@@ -153,6 +157,8 @@ impl Default for Metrics {
             registry: Registry::with_prefix("snapshotd"),
             pods: Family::default(),
             pod_failures: Family::default(),
+            condemned_images: Family::default(),
+            abandoned_revisions: Family::default(),
             step_seconds: Family::new_with_constructor(seconds),
             store_bytes: Family::default(),
             store_revisions: Family::default(),
@@ -172,6 +178,16 @@ impl Default for Metrics {
             "pod_failures",
             "Attempts to bring a pod to serving that ended in an error",
             metrics.pod_failures.clone(),
+        );
+        registry.register(
+            "condemned_images",
+            "Checkpoints removed after pods failed to restore them in a row",
+            metrics.condemned_images.clone(),
+        );
+        registry.register(
+            "abandoned_revisions",
+            "Revisions whose captures stopped on this node after a recapture was condemned",
+            metrics.abandoned_revisions.clone(),
         );
         registry.register(
             "step_seconds",
@@ -230,6 +246,24 @@ impl Metrics {
 
     pub fn failed(&self, namespace: &str, workload: &str) {
         self.pod_failures
+            .get_or_create(&Workload {
+                namespace: namespace.to_string(),
+                workload: workload.to_string(),
+            })
+            .inc();
+    }
+
+    pub fn condemned(&self, namespace: &str, workload: &str) {
+        self.condemned_images
+            .get_or_create(&Workload {
+                namespace: namespace.to_string(),
+                workload: workload.to_string(),
+            })
+            .inc();
+    }
+
+    pub fn abandoned(&self, namespace: &str, workload: &str) {
+        self.abandoned_revisions
             .get_or_create(&Workload {
                 namespace: namespace.to_string(),
                 workload: workload.to_string(),
@@ -369,6 +403,9 @@ mod tests {
         metrics.served("serving", "qwen", How::Restore);
         metrics.served("serving", "qwen", How::ColdBoot);
         metrics.failed("serving", "qwen");
+        metrics.condemned("serving", "qwen");
+        metrics.condemned("serving", "qwen");
+        metrics.abandoned("serving", "qwen");
         metrics.stepped(Step::Restore, Duration::from_secs(3));
         metrics.swept("default", 2, 4096);
         metrics.operated(Action::Snapshot, Outcome::Failed, Duration::from_secs(20));
@@ -377,6 +414,8 @@ mod tests {
             r#"snapshotd_pods_total{namespace="serving",workload="qwen",how="restore"} 2"#,
             r#"snapshotd_pods_total{namespace="serving",workload="qwen",how="cold_boot"} 1"#,
             r#"snapshotd_pod_failures_total{namespace="serving",workload="qwen"} 1"#,
+            r#"snapshotd_condemned_images_total{namespace="serving",workload="qwen"} 2"#,
+            r#"snapshotd_abandoned_revisions_total{namespace="serving",workload="qwen"} 1"#,
             r#"snapshotd_step_seconds_bucket{le="4.0",step="restore"} 1"#,
             r#"snapshotd_step_seconds_bucket{le="2.0",step="restore"} 0"#,
             r#"snapshotd_swept_revisions_total{class="default"} 2"#,

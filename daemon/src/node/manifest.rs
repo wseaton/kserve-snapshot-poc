@@ -1,18 +1,67 @@
+#[cfg(any(test, feature = "nixl"))]
+use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::cuda::Gpu;
 use crate::cuinterpose;
 use crate::node::environment::Environment;
 use crate::node::process::PodPid;
 
+/// Names one checkpoint, drawn when it is taken. A recapture of the same
+/// revision gets a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImageId(Uuid);
+
+impl ImageId {
+    pub fn draw() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl FromStr for ImageId {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        Ok(Self(
+            Uuid::parse_str(text).with_context(|| format!("{text:?} is not an image id"))?,
+        ))
+    }
+}
+
+impl fmt::Display for ImageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.hyphenated())
+    }
+}
+
+impl Serialize for ImageId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// `None` in a manifest written before images were named.
+    #[serde(default)]
+    pub image: Option<ImageId>,
     pub root: PodPid,
     /// The pod's GPUs, in the driver's order.
     pub gpus: Vec<Gpu>,
@@ -22,6 +71,8 @@ pub struct Manifest {
     #[serde(default)]
     pub environment: Option<Environment>,
 }
+
+pub const NO_IMAGE_ID: &str = "it records no image id";
 
 /// Why a checkpoint cannot be restored into a pod.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,7 +84,7 @@ pub enum Refusal {
 }
 
 impl Manifest {
-    fn path(image: &Path) -> PathBuf {
+    pub fn path(image: &Path) -> PathBuf {
         image.join("manifest.json")
     }
 
@@ -49,6 +100,17 @@ impl Manifest {
             .with_context(|| format!("write {}", path.display()))
     }
 
+    /// Why a node in `node` that condemned `condemned` should not take
+    /// this checkpoint from a peer, or `None` if it may.
+    #[cfg(any(test, feature = "nixl"))]
+    pub fn pull_refusal(
+        &self,
+        node: &Environment,
+        condemned: &BTreeSet<ImageId>,
+    ) -> Option<String> {
+        pull_refusal(self.environment.as_ref(), self.image, node, condemned)
+    }
+
     pub fn refusal(
         &self,
         image: &Path,
@@ -57,6 +119,9 @@ impl Manifest {
     ) -> Result<Option<Refusal>> {
         if let Some(reason) = node.incompatibility(self.environment.as_ref()) {
             return Ok(Some(Refusal::Node(reason)));
+        }
+        if self.image.is_none() {
+            return Ok(Some(Refusal::Node(NO_IMAGE_ID.to_string())));
         }
         if self.gpus.len() != gpus.len() {
             return Ok(Some(Refusal::Pod(format!(
@@ -85,6 +150,28 @@ impl Manifest {
     }
 }
 
+/// Why a checkpoint taken in `environment` and named `image` is not worth
+/// pulling to a node in `node` that condemned `condemned`. A peer's
+/// answer is judged by it before a pull, the pulled manifest after.
+#[cfg(any(test, feature = "nixl"))]
+pub fn pull_refusal(
+    environment: Option<&Environment>,
+    image: Option<ImageId>,
+    node: &Environment,
+    condemned: &BTreeSet<ImageId>,
+) -> Option<String> {
+    if let Some(reason) = node.incompatibility(environment) {
+        return Some(reason);
+    }
+    match image {
+        None => Some(NO_IMAGE_ID.to_string()),
+        Some(image) if condemned.contains(&image) => {
+            Some(format!("this node condemned image {image}"))
+        }
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -93,7 +180,7 @@ mod tests {
     use crate::cuda::Gpu;
     use crate::cuinterpose;
     use crate::node::environment::tests::{environment, with_driver, with_kernel};
-    use crate::node::manifest::{Manifest, Refusal};
+    use crate::node::manifest::{ImageId, Manifest, NO_IMAGE_ID, Refusal};
     use crate::node::process::PodPid;
 
     fn gpus(minors: &[u32]) -> Vec<Gpu> {
@@ -116,8 +203,11 @@ mod tests {
         dir
     }
 
+    const ID: &str = "4f1c7d1e-2b54-4c8e-9a51-0e7b1f0c2d3a";
+
     fn manifest(minors: &[u32]) -> Manifest {
         Manifest {
+            image: Some(ID.parse().unwrap()),
             root: PodPid(57),
             gpus: gpus(minors),
             address: "10.0.2.165".parse().unwrap(),
@@ -164,14 +254,59 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_round_trips_with_its_environment() {
+    fn a_manifest_round_trips_with_its_environment_and_image_id() {
         let dir = scratch("round-trip");
         let manifest = manifest(&[0, 1]);
         manifest.save(&dir).unwrap();
         let text = fs::read_to_string(dir.join("manifest.json")).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["environment"]["nvidia"]["driver"], "580.65.06");
+        assert_eq!(json["image"], ID);
         assert_eq!(Manifest::load(&dir).unwrap(), manifest);
+
+        let drawn = Manifest {
+            image: Some(ImageId::draw()),
+            ..manifest
+        };
+        drawn.save(&dir).unwrap();
+        assert_eq!(Manifest::load(&dir).unwrap(), drawn);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn image_ids_are_drawn_apart_and_parse_back() {
+        let (a, b) = (ImageId::draw(), ImageId::draw());
+        assert_ne!(a, b);
+        assert_eq!(a.to_string().parse::<ImageId>().unwrap(), a);
+        let id: ImageId = ID.parse().unwrap();
+        assert_eq!(id.to_string(), ID);
+        for text in ["", "image", "GPU-4f1c7d1e-2b54-4c8e-9a51-0e7b1f0c2d3a"] {
+            assert!(text.parse::<ImageId>().is_err(), "{text:?}");
+        }
+        assert!(serde_json::from_str::<ImageId>(r#""not-an-id""#).is_err());
+    }
+
+    #[test]
+    fn a_manifest_with_an_environment_and_no_image_id_is_refused_for_the_node() {
+        let dir = scratch("no-id");
+        let unnamed = Manifest {
+            image: None,
+            ..manifest(&[4])
+        };
+        unnamed.save(&dir).unwrap();
+        let loaded = Manifest::load(&dir).unwrap();
+        assert_eq!(loaded.image, None);
+        assert_eq!(
+            loaded.refusal(&dir, &gpus(&[4]), &environment()).unwrap(),
+            Some(Refusal::Node(NO_IMAGE_ID.to_string()))
+        );
+        assert_eq!(
+            loaded
+                .refusal(&dir, &gpus(&[4, 5]), &environment())
+                .unwrap(),
+            Some(Refusal::Node(NO_IMAGE_ID.to_string())),
+            "it is refused for the node before it is refused for the pod"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -189,6 +324,7 @@ mod tests {
         .unwrap();
         let legacy = Manifest::load(&dir).unwrap();
         assert_eq!(legacy.environment, None);
+        assert_eq!(legacy.image, None);
         assert_eq!(legacy.gpus, gpus(&[4]));
         assert_eq!(
             legacy.refusal(&dir, &gpus(&[4]), &environment()).unwrap(),

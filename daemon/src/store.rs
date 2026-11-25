@@ -6,28 +6,43 @@
 //! <class>/<namespace>/<workload>/<hash>/incoming-<pod>/  a capture or a pull in progress
 //! <class>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
 //! <class>/<namespace>/<workload>/<hash>/stale-<pod>/     an image taken in another environment, being removed
+//! <class>/<namespace>/<workload>/<hash>/condemning-<pod>/ an image too many pods failed to restore, being removed
+//! <class>/<namespace>/<workload>/<hash>/condemned/<id>/  what those pods recorded, and the end of CRIU's log
+//! <class>/<namespace>/<workload>/<hash>/restores         one line per restore of the image since one last worked: which, by which pod, how it ended
+//! <class>/<namespace>/<workload>/<hash>/restores.lock    held while `restores` is appended to or rewritten
 //! <class>/<namespace>/<workload>/<hash>/recaptured       the environment the image was last recaptured for
+//! <class>/<namespace>/<workload>/<hash>/abandoned        the environment no more captures are taken in
 //! <class>/<namespace>/<workload>/<hash>/used             touched when a pod of the revision starts
 //! ```
 //!
 //! `<workload>` names a role and a group member too when the pod has them; see
 //! [`Workload`].
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::node::environment::Environment;
+use crate::node::manifest::{ImageId, Manifest};
+use crate::node::step::Step;
 
 pub const DEFAULT_CLASS: &str = "default";
 const USED: &str = "used";
 const RECAPTURED: &str = "recaptured";
+const ABANDONED: &str = "abandoned";
+const RESTORES: &str = "restores";
+const RESTORES_LOCK: &str = "restores.lock";
+const RESTORES_REWRITE: &str = "restores.new";
+const CONDEMNED: &str = "condemned";
+/// Bytes of CRIU's restore log kept with a condemned image.
+pub const RESTORE_LOG_TAIL: usize = 4096;
 
 /// Separates a workload's name from its role, and the role from the member.
 /// Label values contain neither.
@@ -115,6 +130,10 @@ impl RevisionKey {
             workload,
             hash: hash.to_string(),
         })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     pub fn workload(&self) -> &Workload {
@@ -385,11 +404,88 @@ fn remove_tree(dir: &Path) -> Result<()> {
     }
 }
 
+/// How many pods must fail to restore an image in a row, with no restore
+/// of it working in between, before it is condemned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CondemnAfter(NonZeroUsize);
+
+impl CondemnAfter {
+    pub fn reached_by(self, pods: usize) -> bool {
+        pods >= self.0.get()
+    }
+}
+
+impl FromStr for CondemnAfter {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        text.parse()
+            .map(Self)
+            .with_context(|| format!("{text:?} is not a pod count of at least 1"))
+    }
+}
+
+impl fmt::Display for CondemnAfter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One restore of an image into a pod.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub image: ImageId,
+    pub pod: String,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Outcome {
+    Restored,
+    /// `step` is `None` when the restore failed outside a step.
+    Failed {
+        step: Option<Step>,
+        error: String,
+    },
+}
+
+/// The pods that failed to restore `image` in a step that implicates it,
+/// since a restore of it last worked.
+fn failing_pods<'a>(attempts: &'a [Attempt], image: &ImageId) -> BTreeSet<&'a str> {
+    let mut failing = BTreeSet::new();
+    for attempt in attempts.iter().filter(|attempt| attempt.image == *image) {
+        match &attempt.outcome {
+            Outcome::Restored => failing.clear(),
+            Outcome::Failed {
+                step: Some(step), ..
+            } if step.implicates_image() => {
+                failing.insert(attempt.pod.as_str());
+            }
+            Outcome::Failed { .. } => {}
+        }
+    }
+    failing
+}
+
+fn json_lines(attempts: &[&Attempt]) -> Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    for attempt in attempts {
+        serde_json::to_writer(&mut lines, attempt)?;
+        lines.push(b'\n');
+    }
+    Ok(lines)
+}
+
 pub struct RevisionStore {
     dir: PathBuf,
+    revision: RevisionKey,
+    pod: String,
     staging: PathBuf,
     failure: PathBuf,
     stale: PathBuf,
+    condemning: PathBuf,
 }
 
 impl RevisionStore {
@@ -404,8 +500,15 @@ impl RevisionStore {
             staging: dir.join(format!("incoming-{pod_uid}")),
             failure: dir.join(format!("failed-{pod_uid}")),
             stale: dir.join(format!("stale-{pod_uid}")),
+            condemning: dir.join(format!("condemning-{pod_uid}")),
+            pod: pod_uid.to_string(),
+            revision: revision.clone(),
             dir,
         })
+    }
+
+    pub fn revision(&self) -> &RevisionKey {
+        &self.revision
     }
 
     pub fn image_dir(&self) -> PathBuf {
@@ -435,9 +538,8 @@ impl RevisionStore {
         }
     }
 
-    /// The environment the image was last recaptured for, if it was.
-    pub fn recaptured_for(&self) -> Result<Option<Environment>> {
-        let path = self.dir.join(RECAPTURED);
+    fn environment_in(&self, marker: &str) -> Result<Option<Environment>> {
+        let path = self.dir.join(marker);
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
@@ -447,10 +549,200 @@ impl RevisionStore {
         }
     }
 
-    pub fn record_recapture(&self, environment: &Environment) -> Result<()> {
-        let path = self.dir.join(RECAPTURED);
+    fn mark(&self, marker: &str, environment: &Environment) -> Result<()> {
+        let path = self.dir.join(marker);
         fs::write(&path, serde_json::to_vec_pretty(environment)?)
             .with_context(|| format!("write {}", path.display()))
+    }
+
+    /// The environment the image was last recaptured for, if it was.
+    pub fn recaptured_for(&self) -> Result<Option<Environment>> {
+        self.environment_in(RECAPTURED)
+    }
+
+    pub fn record_recapture(&self, environment: &Environment) -> Result<()> {
+        self.mark(RECAPTURED, environment)
+    }
+
+    /// The environment in which captures of the revision stopped, if they did.
+    pub fn abandoned_for(&self) -> Result<Option<Environment>> {
+        self.environment_in(ABANDONED)
+    }
+
+    pub fn record_abandon(&self, environment: &Environment) -> Result<()> {
+        self.mark(ABANDONED, environment)
+    }
+
+    /// Run `work` holding the revision's lock on `restores`, so no append
+    /// lands in a file a rewrite is about to replace.
+    fn locked_restores<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path = self.dir.join(RESTORES_LOCK);
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+            .with_context(|| format!("lock {}", path.display()))?;
+        work()
+    }
+
+    fn append(&self, attempt: &Attempt) -> Result<()> {
+        let path = self.dir.join(RESTORES);
+        let line = json_lines(&[attempt])?;
+        File::options()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut restores| restores.write_all(&line))
+            .with_context(|| format!("append to {}", path.display()))
+    }
+
+    /// Replace `restores` with `attempts` by one rename of a synced file.
+    fn rewrite(&self, attempts: &[&Attempt]) -> Result<()> {
+        let (path, new) = (self.dir.join(RESTORES), self.dir.join(RESTORES_REWRITE));
+        let mut file = File::create(&new).with_context(|| format!("create {}", new.display()))?;
+        file.write_all(&json_lines(attempts)?)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("write {}", new.display()))?;
+        fs::rename(&new, &path).with_context(|| format!("replace {}", path.display()))?;
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("sync {}", self.dir.display()))
+    }
+
+    fn read_attempts(&self) -> Result<Vec<Attempt>> {
+        let path = self.dir.join(RESTORES);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    }
+
+    /// A restore that works makes every earlier attempt moot, so the log is
+    /// cut down to it.
+    pub fn record_restored(&self, image: ImageId) -> Result<()> {
+        let restored = Attempt {
+            image,
+            pod: self.pod.clone(),
+            outcome: Outcome::Restored,
+        };
+        self.locked_restores(|| self.rewrite(&[&restored]))
+    }
+
+    pub fn record_restore_failure(
+        &self,
+        image: ImageId,
+        step: Option<Step>,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let failed = Attempt {
+            image,
+            pod: self.pod.clone(),
+            outcome: Outcome::Failed {
+                step,
+                error: format!("{error:#}"),
+            },
+        };
+        self.locked_restores(|| self.append(&failed))
+    }
+
+    /// Every restore recorded, oldest first. A line that does not parse,
+    /// such as one cut short, is skipped.
+    pub fn attempts(&self) -> Result<Vec<Attempt>> {
+        self.locked_restores(|| self.read_attempts())
+    }
+
+    /// How many pods failed to restore `image` in a row, counting each pod
+    /// once and only failures in steps that implicate the image.
+    pub fn failing_pods(&self, image: &ImageId) -> Result<usize> {
+        Ok(failing_pods(&self.attempts()?, image).len())
+    }
+
+    /// Take `image` out of use by one rename, if it is still the
+    /// revision's image, then delete it. What its restores recorded, its
+    /// manifest and the end of `restore_log` are kept under `condemned/`.
+    /// Returns whether this call removed it.
+    pub fn condemn(&self, image: &ImageId, restore_log: &[u8]) -> Result<bool> {
+        match Manifest::load(&self.image_dir()) {
+            Ok(manifest) if manifest.image.as_ref() == Some(image) => {}
+            Ok(_) => return Ok(false),
+            Err(_) if !self.image_ready() => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        remove_tree(&self.condemning)?;
+        match fs::rename(self.image_dir(), &self.condemning) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("move the condemned image aside"),
+        }
+        let kept = self.locked_restores(|| {
+            let attempts = self.read_attempts()?;
+            let (of_image, others): (Vec<&Attempt>, Vec<&Attempt>) =
+                attempts.iter().partition(|attempt| attempt.image == *image);
+            self.keep_evidence(image, &of_image, restore_log)?;
+            self.rewrite(&others)
+        });
+        remove_tree(&self.condemning).context("remove the condemned image")?;
+        kept?;
+        Ok(true)
+    }
+
+    fn keep_evidence(
+        &self,
+        image: &ImageId,
+        of_image: &[&Attempt],
+        restore_log: &[u8],
+    ) -> Result<()> {
+        let evidence = self.dir.join(CONDEMNED).join(image.to_string());
+        fs::create_dir_all(&evidence).with_context(|| format!("create {}", evidence.display()))?;
+        fs::write(evidence.join(RESTORES), json_lines(of_image)?)
+            .context("keep the condemned image's restores")?;
+        let tail = &restore_log[restore_log.len().saturating_sub(RESTORE_LOG_TAIL)..];
+        fs::write(evidence.join("restore.log"), tail).context("keep CRIU's restore log")?;
+        fs::copy(Manifest::path(&self.condemning), Manifest::path(&evidence))
+            .context("keep the condemned image's manifest")?;
+        Ok(())
+    }
+
+    /// The images of the revision condemned on this node.
+    #[cfg(any(test, feature = "nixl"))]
+    pub fn condemned(&self) -> Result<BTreeSet<ImageId>> {
+        let dir = self.dir.join(CONDEMNED);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
+        };
+        Ok(entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect())
+    }
+
+    /// Publish a checkpoint pulled into staging, unless this node condemned
+    /// it or cannot restore it, in which case it is dropped and the reason
+    /// returned.
+    #[cfg(any(test, feature = "nixl"))]
+    pub fn publish_pulled(
+        &self,
+        node: &Environment,
+        condemned: &BTreeSet<ImageId>,
+    ) -> Result<Option<String>> {
+        let refusal = match Manifest::load(&self.staging) {
+            Ok(manifest) => manifest.pull_refusal(node, condemned),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        match refusal {
+            None => self.publish().map(|()| None),
+            Some(reason) => self.clear_staging().map(|()| Some(reason)),
+        }
     }
 
     /// If another pod published first, that image stays and this one is dropped.
@@ -480,9 +772,12 @@ mod tests {
     use anyhow::anyhow;
 
     use crate::node::environment::tests::{environment, with_driver};
+    use crate::node::manifest::{ImageId, Manifest};
+    use crate::node::step::Step;
     use crate::store::{
-        Class, Classes, RevisionKey, RevisionStore, USED, Usage, Workload, directory_bytes,
-        ensure_room, revisions,
+        Attempt, Class, Classes, CondemnAfter, Outcome, RESTORE_LOG_TAIL, RevisionKey,
+        RevisionStore, USED, Usage, Workload, directory_bytes, ensure_room, failing_pods,
+        revisions,
     };
 
     fn scratch(name: &str) -> PathBuf {
@@ -928,6 +1223,395 @@ mod tests {
         );
         fs::write(dir.join("serving/qwen3-8b/7b9f694bf8/recaptured"), "{").unwrap();
         assert!(theirs.recaptured_for().is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn attempt(image: ImageId, pod: &str, step: Option<Step>) -> Attempt {
+        Attempt {
+            image,
+            pod: pod.to_string(),
+            outcome: match step {
+                Some(step) => Outcome::Failed {
+                    step: Some(step),
+                    error: format!("{step} failed"),
+                },
+                None => Outcome::Restored,
+            },
+        }
+    }
+
+    #[test]
+    fn distinct_pods_failing_in_image_steps_since_the_last_restore_count() {
+        let (image, older) = (ImageId::draw(), ImageId::draw());
+        let failed = |pod, step| attempt(image, pod, Some(step));
+        let count = |attempts: &[Attempt]| failing_pods(attempts, &image).len();
+        assert_eq!(count(&[]), 0);
+        assert_eq!(
+            count(&[
+                failed("a", Step::CriuRestore),
+                failed("b", Step::CudaRestore)
+            ]),
+            2
+        );
+        assert_eq!(
+            count(&[
+                failed("a", Step::CriuRestore),
+                failed("a", Step::CriuRestore)
+            ]),
+            1,
+            "the same pod counts once"
+        );
+        assert_eq!(
+            count(&[
+                failed("a", Step::CriuRestore),
+                attempt(image, "c", None),
+                failed("b", Step::CriuRestore),
+            ]),
+            1,
+            "a restore that worked resets the count"
+        );
+        assert_eq!(
+            count(&[
+                attempt(older, "a", Some(Step::CriuRestore)),
+                attempt(older, "b", Some(Step::CriuRestore)),
+                failed("c", Step::CriuRestore),
+            ]),
+            1,
+            "failures of an older image do not count"
+        );
+        assert_eq!(
+            count(&[
+                failed("a", Step::CriuRestore),
+                attempt(older, "c", None),
+                failed("b", Step::CuinterposeRestore),
+            ]),
+            2,
+            "a restore of an older image does not reset the count"
+        );
+        assert_eq!(
+            count(&[
+                failed("a", Step::VllmRestore),
+                failed("b", Step::VllmRestore),
+                failed("c", Step::CopySharedMemoryIn),
+            ]),
+            1,
+            "vLLM restore failures do not count"
+        );
+        let outside = Attempt {
+            outcome: Outcome::Failed {
+                step: None,
+                error: "mount the image".to_string(),
+            },
+            ..attempt(image, "a", None)
+        };
+        assert_eq!(count(&[outside, failed("b", Step::CriuRestore)]), 1);
+    }
+
+    #[test]
+    fn restores_are_recorded_one_line_each_and_cut_down_when_one_works() {
+        let dir = scratch("attempts");
+        let (ours, theirs, third) = (open(&dir, "a"), open(&dir, "b"), open(&dir, "c"));
+        let image = ImageId::draw();
+        assert!(ours.attempts().unwrap().is_empty());
+        ours.record_restore_failure(
+            image,
+            Some(Step::CriuRestore),
+            &anyhow!("exit status 1").context("criu restore"),
+        )
+        .unwrap();
+        third
+            .record_restore_failure(image, Some(Step::CudaRestore), &anyhow!("CUDA restore"))
+            .unwrap();
+        let log = dir.join("serving/qwen3-8b/7b9f694bf8/restores");
+        let text = fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            first,
+            serde_json::json!({
+                "image": image.to_string(),
+                "pod": "a",
+                "outcome": "failed",
+                "step": "criu_restore",
+                "error": "criu restore: exit status 1"
+            })
+        );
+        let before = ours.attempts().unwrap();
+        assert_eq!(ours.failing_pods(&image).unwrap(), 2);
+
+        theirs.record_restored(image).unwrap();
+        let mut uncut = before.clone();
+        uncut.push(attempt(image, "b", None));
+        assert_eq!(ours.attempts().unwrap(), [attempt(image, "b", None)]);
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "a restore that works cuts the log down to itself"
+        );
+        assert_eq!(
+            ours.failing_pods(&image).unwrap(),
+            failing_pods(&uncut, &image).len(),
+            "cutting the log down changes no count"
+        );
+
+        ours.record_restore_failure(image, None, &anyhow!("mount the image"))
+            .unwrap();
+        third
+            .record_restore_failure(image, Some(Step::CriuRestore), &anyhow!("short read"))
+            .unwrap();
+        let wanted = [
+            attempt(image, "b", None),
+            Attempt {
+                image,
+                pod: "a".to_string(),
+                outcome: Outcome::Failed {
+                    step: None,
+                    error: "mount the image".to_string(),
+                },
+            },
+            Attempt {
+                image,
+                pod: "c".to_string(),
+                outcome: Outcome::Failed {
+                    step: Some(Step::CriuRestore),
+                    error: "short read".to_string(),
+                },
+            },
+        ];
+        assert_eq!(theirs.attempts().unwrap(), wanted);
+        assert_eq!(ours.failing_pods(&image).unwrap(), 1);
+        let text = fs::read_to_string(&log).unwrap();
+        fs::write(&log, format!("{text}{{\"image\": \"cut")).unwrap();
+        assert_eq!(
+            ours.attempts().unwrap(),
+            wanted,
+            "a line cut short is skipped"
+        );
+        assert!(
+            !dir.join("serving/qwen3-8b/7b9f694bf8/restores.new")
+                .exists(),
+            "no rewrite is left behind"
+        );
+        assert_eq!(
+            revisions(&dir).len(),
+            1,
+            "the log is not mistaken for a revision"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn appends_from_many_threads_survive_rewrites() {
+        let dir = scratch("racing");
+        let image = ImageId::draw();
+        let other = ImageId::draw();
+        std::thread::scope(|threads| {
+            for pod in 0..8 {
+                let dir = &dir;
+                threads.spawn(move || {
+                    let store = open(dir, &format!("pod-{pod}"));
+                    for _ in 0..25 {
+                        store
+                            .record_restore_failure(other, Some(Step::CriuRestore), &anyhow!("x"))
+                            .unwrap();
+                    }
+                });
+            }
+            let dir = &dir;
+            threads.spawn(move || {
+                let store = open(dir, "winner");
+                for _ in 0..25 {
+                    store.record_restored(image).unwrap();
+                }
+            });
+        });
+        let store = open(&dir, "reader");
+        let text = fs::read_to_string(dir.join("serving/qwen3-8b/7b9f694bf8/restores")).unwrap();
+        let attempts = store.attempts().unwrap();
+        assert_eq!(
+            attempts.len(),
+            text.lines().count(),
+            "every line is whole:\n{text}"
+        );
+        assert!(attempts.len() <= 8 * 25 + 1);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.image == other || attempt.outcome == Outcome::Restored),
+            "{attempts:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn take(store: &RevisionStore, image: ImageId) {
+        fs::create_dir_all(store.image_dir().join("img")).unwrap();
+        fs::write(store.image_dir().join("img/pages-1.img"), "pages").unwrap();
+        fs::write(
+            Manifest::path(&store.image_dir()),
+            format!(r#"{{"image": "{image}", "root": 57, "gpus": [], "address": "10.0.2.165"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_condemned_image_is_gone_and_its_evidence_stays() {
+        let dir = scratch("condemn");
+        let (ours, theirs) = (open(&dir, "a"), open(&dir, "b"));
+        let image = ImageId::draw();
+        take(&ours, image);
+        ours.record_restore_failure(image, Some(Step::CriuRestore), &anyhow!("short read"))
+            .unwrap();
+        ours.record_restore_failure(ImageId::draw(), Some(Step::CriuRestore), &anyhow!("other"))
+            .unwrap();
+        let mut log = vec![b'x'; 10_000];
+        log.extend_from_slice(b"Error (criu/pagemap.c:1): short read");
+        assert!(ours.condemn(&image, &log).unwrap());
+        assert!(!ours.image_ready() && !theirs.image_ready());
+        let classes = Classes::load(class(&dir), None).unwrap();
+        assert_eq!(
+            classes.image_of(&"serving/qwen3-8b/7b9f694bf8".parse().unwrap()),
+            None,
+            "a condemned image is not offered to peers"
+        );
+        assert_eq!(theirs.condemned().unwrap(), [image].into());
+        let evidence = dir.join(format!("serving/qwen3-8b/7b9f694bf8/condemned/{image}"));
+        let kept = fs::read(evidence.join("restore.log")).unwrap();
+        assert_eq!(kept.len(), RESTORE_LOG_TAIL);
+        assert!(kept.ends_with(b"short read"));
+        let restores = fs::read_to_string(evidence.join("restores")).unwrap();
+        assert_eq!(
+            restores.lines().count(),
+            1,
+            "only this image's restores are kept"
+        );
+        assert!(restores.contains("short read"), "{restores}");
+        let left = theirs.attempts().unwrap();
+        assert_eq!(left.len(), 1, "the condemned image's lines leave the log");
+        assert_ne!(left[0].image, image);
+        assert_eq!(
+            theirs.failing_pods(&left[0].image).unwrap(),
+            1,
+            "another image's count is unchanged"
+        );
+        assert_eq!(Manifest::load(&evidence).unwrap().image, Some(image));
+        assert!(
+            !dir.join("serving/qwen3-8b/7b9f694bf8/condemning-a")
+                .exists()
+        );
+        assert!(
+            !theirs.condemn(&image, b"").unwrap(),
+            "a second condemn of the same image finds it gone"
+        );
+
+        let fresh = ImageId::draw();
+        take(&theirs, fresh);
+        assert!(
+            !ours.condemn(&image, b"").unwrap(),
+            "a condemn that lost the race leaves the new image alone"
+        );
+        assert!(ours.image_ready());
+        assert_eq!(theirs.condemned().unwrap(), [image].into());
+        fs::create_dir_all(dir.join("serving/qwen3-8b/7b9f694bf8/condemned/not-an-id")).unwrap();
+        assert_eq!(theirs.condemned().unwrap(), [image].into());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn captures_are_abandoned_for_one_environment() {
+        let dir = scratch("abandon");
+        let (ours, theirs) = (open(&dir, "a"), open(&dir, "b"));
+        assert_eq!(ours.abandoned_for().unwrap(), None);
+        ours.record_abandon(&environment()).unwrap();
+        assert_eq!(theirs.abandoned_for().unwrap(), Some(environment()));
+        assert_eq!(
+            theirs.recaptured_for().unwrap(),
+            None,
+            "a marker of its own"
+        );
+        ours.record_abandon(&with_driver("590.1")).unwrap();
+        assert_eq!(theirs.abandoned_for().unwrap(), Some(with_driver("590.1")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_pods_that_condemn_an_image_are_at_least_one() {
+        let two: CondemnAfter = "2".parse().unwrap();
+        assert!(!two.reached_by(0) && !two.reached_by(1));
+        assert!(two.reached_by(2) && two.reached_by(3));
+        assert_eq!(two.to_string(), "2");
+        let one: CondemnAfter = "1".parse().unwrap();
+        assert!(one.reached_by(1));
+        for text in ["0", "-2", "two", ""] {
+            assert!(text.parse::<CondemnAfter>().is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_pulled_checkpoint_is_published_only_if_it_fits_and_was_not_condemned() {
+        let dir = scratch("pulled");
+        let store = open(&dir, "a");
+        let node = environment();
+        let pulled = |image: Option<ImageId>, environment: Option<serde_json::Value>| {
+            fs::create_dir_all(store.staging_dir().join("img")).unwrap();
+            let mut manifest = serde_json::json!({
+                "root": 57, "gpus": [], "address": "10.0.2.165",
+            });
+            if let Some(image) = image {
+                manifest["image"] = image.to_string().into();
+            }
+            if let Some(environment) = environment {
+                manifest["environment"] = environment;
+            }
+            fs::write(
+                Manifest::path(store.staging_dir()),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        };
+        let here = || Some(serde_json::to_value(environment()).unwrap());
+        let (bad, good) = (ImageId::draw(), ImageId::draw());
+        let condemned = [bad].into();
+
+        pulled(Some(bad), here());
+        assert_eq!(
+            store.publish_pulled(&node, &condemned).unwrap(),
+            Some(format!("this node condemned image {bad}"))
+        );
+        assert!(!store.image_ready() && !store.staging_dir().exists());
+
+        pulled(
+            Some(good),
+            Some(serde_json::to_value(with_driver("590.1")).unwrap()),
+        );
+        let refused = store.publish_pulled(&node, &condemned).unwrap();
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("NVIDIA driver 590.1")),
+            "{refused:?}"
+        );
+        assert!(!store.image_ready() && !store.staging_dir().exists());
+
+        pulled(None, here());
+        assert_eq!(
+            store.publish_pulled(&node, &condemned).unwrap().as_deref(),
+            Some("it records no image id")
+        );
+
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        assert!(
+            store.publish_pulled(&node, &condemned).unwrap().is_some(),
+            "a pull without a manifest is dropped"
+        );
+        assert!(!store.staging_dir().exists());
+
+        pulled(Some(good), here());
+        assert_eq!(store.publish_pulled(&node, &condemned).unwrap(), None);
+        assert!(store.image_ready());
+        assert_eq!(
+            Manifest::load(&store.image_dir()).unwrap().image,
+            Some(good)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

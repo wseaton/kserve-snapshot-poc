@@ -13,11 +13,12 @@ use crate::cuinterpose::{self, SharedMemory};
 use crate::node::criu;
 use crate::node::environment::Environment;
 use crate::node::layout::{CUINTERPOSE, IMAGE, TOOLS, WORK};
-use crate::node::manifest::Manifest;
+use crate::node::manifest::{ImageId, Manifest};
 use crate::node::process::{self, HostPid, PodPid, blocking, copy_tree};
-use crate::node::report::{gib, plain, seconds, step};
+use crate::node::report::{self, gib, plain, seconds};
 use crate::node::shim::ShimClient;
-use crate::store::directory_bytes;
+use crate::node::step::{self, Step};
+use crate::store::{RESTORE_LOG_TAIL, directory_bytes};
 use crate::vllm::{Control, Endpoint, PauseMode};
 use snapshotd_shim::SERVER_LOG;
 
@@ -144,6 +145,15 @@ impl Pod {
         }
     }
 
+    fn restore_log(&self) -> PathBuf {
+        self.init.root(&format!("{WORK}/restore.log"))
+    }
+
+    /// The end of CRIU's log of the last restore into this pod.
+    pub fn restore_log_tail(&self) -> Vec<u8> {
+        report::tail(&self.restore_log(), RESTORE_LOG_TAIL)
+    }
+
     fn cuinterpose(&self) -> cuinterpose::Config {
         cuinterpose::Config {
             bundle_dir: self.options.tools_dir.join(CUINTERPOSE),
@@ -177,8 +187,8 @@ impl Pod {
         let started = Instant::now();
         fs::create_dir_all(image.join("img"))
             .with_context(|| format!("create {}", image.display()))?;
-        step(
-            "vLLM prepare",
+        step::run(
+            Step::VllmPrepare,
             control.prepare(self.options.prepare_mode, self.options.lifecycle_timeout()),
         )
         .await?;
@@ -188,8 +198,8 @@ impl Pod {
         shim.release().await?;
         if !processes.is_empty() {
             let (config, img, sharing) = (self.cuinterpose(), image.join("img"), processes.clone());
-            step(
-                "cuInterpose prepare",
+            step::run(
+                Step::CuinterposePrepare,
                 blocking(move || {
                     match cuinterpose::prepare_checkpoint(&config, &img, &sharing)? {
                         SharedMemory::NotShared => {
@@ -204,8 +214,8 @@ impl Pod {
             )
             .await?;
             let lock = Duration::from_secs(self.options.cuda_lock_timeout_s);
-            step(
-                "CUDA checkpoint",
+            step::run(
+                Step::CudaCheckpoint,
                 blocking(move || cuda::checkpoint_job(&Driver::load()?, &processes, lock)),
             )
             .await?;
@@ -213,7 +223,7 @@ impl Pod {
         self.mount(image, IMAGE).await?;
         fs::create_dir_all(self.init.root(WORK)).context("create the work directory")?;
         let log = self.init.root(&format!("{WORK}/dump.log"));
-        step("CRIU dump", async {
+        step::run(Step::CriuDump, async {
             criu::run(
                 criu::command(self.init, "dump")
                     .args(["-t", &root.to_string()])
@@ -228,7 +238,7 @@ impl Pod {
                 .await
         })
         .await?;
-        step("copy shared memory out", async {
+        step::run(Step::CopySharedMemoryOut, async {
             copy_tree(&self.init.root("/dev/shm"), &image.join("shm")).await?;
             fs::copy(self.init.root(SERVER_LOG), image.join("server.log"))
                 .context("copy the server's log")?;
@@ -237,6 +247,7 @@ impl Pod {
         })
         .await?;
         Manifest {
+            image: Some(ImageId::draw()),
             root,
             gpus: self.gpus.clone(),
             address: self.address(),
@@ -253,8 +264,8 @@ impl Pod {
 
     /// Put a server that prepared itself at startup into service.
     pub async fn resume(&self, mut control: Control) -> Result<()> {
-        step(
-            "vLLM restore",
+        step::run(
+            Step::VllmRestore,
             control.restore(self.options.lifecycle_timeout()),
         )
         .await
@@ -263,7 +274,7 @@ impl Pod {
     pub async fn restore(&self, image: &Path) -> Result<PodPid> {
         let started = Instant::now();
         let manifest = Manifest::load(image)?;
-        step("copy shared memory in", async {
+        step::run(Step::CopySharedMemoryIn, async {
             let shm = image.join("shm");
             if shm.is_dir() {
                 copy_tree(&shm, &self.init.root("/dev/shm")).await?;
@@ -302,14 +313,14 @@ impl Pod {
         )
         .await?;
         self.mount(image, IMAGE).await?;
-        step(
-            "CRIU restore",
+        step::run(
+            Step::CriuRestore,
             criu::run(
                 restore
                     .args(["-D", &format!("{IMAGE}/img"), "-W", WORK])
                     .args(["--restore-detached", "-o", "restore.log"]),
                 "criu restore",
-                &self.init.root(&format!("{WORK}/restore.log")),
+                &self.restore_log(),
             ),
         )
         .await?;
@@ -326,14 +337,14 @@ impl Pod {
                     "GPUs remapped, by device minor"
                 );
             }
-            step(
-                "CUDA restore",
+            step::run(
+                Step::CudaRestore,
                 blocking(move || cuda::restore_job(&Driver::load()?, &processes, &map)),
             )
             .await?;
             let (config, img) = (self.cuinterpose(), image.join("img"));
-            step(
-                "cuInterpose restore",
+            step::run(
+                Step::CuinterposeRestore,
                 blocking(move || match cuinterpose::Manifest::load(&img)? {
                     Some(manifest) => {
                         manifest.verify_libraries(&config)?;
@@ -344,7 +355,7 @@ impl Pod {
             )
             .await?;
         }
-        step("vLLM restore", async {
+        step::run(Step::VllmRestore, async {
             Control::connect(self.control)
                 .await?
                 .restore(self.options.lifecycle_timeout())
