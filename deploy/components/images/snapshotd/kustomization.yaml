@@ -1,6 +1,6 @@
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 images:
-- digest: sha256:13fbbd0424df8874a8771d399bbfa730b6b386a0ceb5d6c84be724b60d5457d9
+- digest: sha256:0e32a9bd51529e81f63dd624bc030aae166419d0fdaad940d3dc66b881422449
   name: ghcr.io/wseaton/snapshotd/snapshotd
   newName: ghcr.io/wseaton/snapshotd/snapshotd
