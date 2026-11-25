@@ -3,5 +3,6 @@ kind: Component
 resources:
   - service.yaml
   - rbac.yaml
+  - authorization.yaml
 patches:
   - path: daemonset.yaml

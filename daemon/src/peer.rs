@@ -5,6 +5,7 @@
 //! pull:  resolve the peers ─► ask each what it holds, at once ─► nearest holder first
 //!        ─► take a lane ─► upgrade and receive ─► publish
 //! ```
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,8 +19,10 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
+use crate::access::{self, AccessError, Subject, Verdict};
 use crate::lanes::Lanes;
-use crate::store::{Classes, RevisionKey, RevisionStore, directory_bytes};
+use crate::link;
+use crate::store::{Attestation, Classes, Principal, RevisionKey, RevisionStore, directory_bytes};
 use crate::topology::{Candidate, Place, nearest_first};
 use crate::transfer::{self, Endpoint, Pool};
 use crate::tunnel::{self, Holder, Identity, Refusal, Status, Tunnel, Work};
@@ -36,6 +39,14 @@ pub struct Args {
     /// Where this daemon answers its own kube-rbac-proxy.
     #[arg(long, env = "SNAPSHOTD_PEER_LISTEN", default_value = "127.0.0.1:7700")]
     peer_listen: SocketAddr,
+    /// The certificates of the mutual TLS between this daemon and its
+    /// kube-rbac-proxy, written by `snapshotd peer-link`.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_PEER_LINK_DIR",
+        default_value = "/run/snapshotd/link"
+    )]
+    peer_link_dir: PathBuf,
     /// This daemon's address, left out of the peers.
     #[arg(long, env = "SNAPSHOTD_OWN_IP")]
     own_ip: Option<IpAddr>,
@@ -102,6 +113,8 @@ pub struct Peers {
     busy_timeout: Duration,
     place: Place,
     classes: Classes,
+    /// Asks whether a peer may read a revision. `None` refuses every peer.
+    api: Option<kube::Client>,
     /// One lane for each transfer this daemon can take part in at once,
     /// sending or receiving, each with its share of the registered pool.
     transfers: Lanes<Endpoint>,
@@ -111,11 +124,26 @@ pub struct Peers {
 }
 
 impl Peers {
-    pub async fn start(args: &Args, classes: Classes) -> Result<Option<Arc<Self>>> {
+    pub async fn start(
+        args: &Args,
+        classes: Classes,
+        api: Option<kube::Client>,
+    ) -> Result<Option<Arc<Self>>> {
         let (Some(name), Some(own_ip), Some(ca_file)) =
             (&args.peers, args.own_ip, &args.peer_ca_file)
         else {
             return Ok(None);
+        };
+        let link = match link::acceptor(&args.peer_link_dir) {
+            Ok(link) => Arc::new(link),
+            Err(error) => {
+                warn!(
+                    dir = %args.peer_link_dir.display(),
+                    error = %format_args!("{error:#}"),
+                    "no link to the proxy; checkpoints stay on the node that took them"
+                );
+                return Ok(None);
+            }
         };
         let lanes = args.transfer_lanes;
         ensure!(lanes > 0, "--transfer-lanes must be at least 1");
@@ -143,6 +171,7 @@ impl Peers {
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             place,
             classes,
+            api,
             transfers: Lanes::start(lanes, move |lane| {
                 Endpoint::new(&format!("{agent}-{lane}"), pool, false)
             })?,
@@ -157,22 +186,51 @@ impl Peers {
             place = %peers.place,
             "answering peers"
         );
-        tokio::spawn(tunnel::serve(listener, Arc::clone(&peers)));
+        tokio::spawn(tunnel::serve(listener, link, Arc::clone(&peers)));
         Ok(Some(peers))
     }
 }
 
+impl Peers {
+    /// The image of `revision` that pods of `wanted` may use, if this node
+    /// holds one.
+    fn image_for(&self, revision: &RevisionKey, wanted: &Principal) -> Option<PathBuf> {
+        let image = self.classes.image_of(revision)?;
+        if Attestation::allows(&image, wanted) {
+            return Some(image);
+        }
+        info!(
+            %revision,
+            %wanted,
+            "this node's checkpoint of the revision was captured by another principal"
+        );
+        None
+    }
+}
+
 impl Holder for Peers {
-    fn status(&self, revision: &RevisionKey) -> Status {
+    fn status(&self, revision: &RevisionKey, wanted: &Principal) -> Status {
         Status {
-            held: self.classes.image_of(revision).is_some(),
+            held: self.image_for(revision, wanted).is_some(),
             free_lanes: self.turns.available_permits(),
             place: self.place.clone(),
         }
     }
 
-    fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
-        let image = self.classes.image_of(revision).ok_or(Refusal::NoImage)?;
+    fn may_read(
+        &self,
+        caller: &Subject,
+        revision: &RevisionKey,
+    ) -> impl Future<Output = Result<Verdict, AccessError>> + Send {
+        let (api, caller, revision) = (self.api.clone(), caller.clone(), revision.clone());
+        async move {
+            let api = api.ok_or(AccessError::NoClient)?;
+            access::may_read(&api, &caller, &revision).await
+        }
+    }
+
+    fn admit(&self, revision: &RevisionKey, wanted: &Principal) -> Result<Work, Refusal> {
+        let image = self.image_for(revision, wanted).ok_or(Refusal::NoImage)?;
         let turn = Arc::clone(&self.turns)
             .try_acquire_owned()
             .map_err(|_| Refusal::Busy)?;
@@ -216,15 +274,19 @@ impl Peers {
     }
 
     /// The peers that hold `revision`, the nearest first.
-    async fn holders(self: &Arc<Self>, revision: &RevisionKey) -> Vec<Candidate> {
+    async fn holders(
+        self: &Arc<Self>,
+        revision: &RevisionKey,
+        wanted: &Principal,
+    ) -> Vec<Candidate> {
         let addresses = self.addresses().await;
         let mut asked = JoinSet::new();
         for peer in addresses.iter().copied() {
-            let (peers, revision) = (Arc::clone(self), revision.clone());
+            let (peers, revision, wanted) = (Arc::clone(self), revision.clone(), wanted.clone());
             asked.spawn(async move {
                 (
                     peer,
-                    tunnel::inquire(peer, &peers.identity, &revision).await,
+                    tunnel::inquire(peer, &peers.identity, &revision, &wanted).await,
                 )
             });
         }
@@ -247,15 +309,17 @@ impl Peers {
         nearest_first(&self.place, holding)
     }
 
-    /// Returns the peer the checkpoint came from, if any had it.
+    /// Returns the peer the checkpoint came from, if any had one that pods
+    /// of `wanted` may use.
     pub async fn pull(
         self: &Arc<Self>,
         revision: &RevisionKey,
+        wanted: &Principal,
         store: &RevisionStore,
     ) -> Result<Option<SocketAddr>> {
         let deadline = Instant::now() + self.busy_timeout;
         loop {
-            let holders = self.holders(revision).await;
+            let holders = self.holders(revision, wanted).await;
             let mut busy = None;
             {
                 let _turn = self
@@ -286,7 +350,7 @@ impl Peers {
                         of = self.place.levels(),
                         "asking a peer that has it"
                     );
-                    match tunnel::ask(peer, &self.identity, revision, receive).await {
+                    match tunnel::ask(peer, &self.identity, revision, wanted, receive).await {
                         Ok(Ok(())) => {
                             store.publish()?;
                             return Ok(Some(peer));

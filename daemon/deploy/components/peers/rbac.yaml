@@ -3,8 +3,6 @@ kind: ClusterRole
 metadata:
   name: snapshotd-peers
 rules:
-  - nonResourceURLs: ["/v1/checkpoints/*"]
-    verbs: ["get"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get"]

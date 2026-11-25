@@ -5,9 +5,26 @@ metadata:
 spec:
   template:
     spec:
+      initContainers:
+        - name: peer-link
+          image: ghcr.io/wseaton/snapshotd/snapshotd
+          command:
+            - snapshotd
+            - peer-link
+            - --dir=/run/snapshotd/link
+            - --proxy-uid=65532
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: peer-link
+              mountPath: /run/snapshotd/link
       containers:
         - name: snapshotd
           env:
+            - name: SNAPSHOTD_PEER_LINK_DIR
+              value: /run/snapshotd/link
             - name: SNAPSHOTD_PEERS
               value: snapshotd-peers:8443
             - name: SNAPSHOTD_OWN_IP
@@ -35,11 +52,19 @@ spec:
             - name: peer-ca
               mountPath: /etc/snapshotd/peers
               readOnly: true
+            - name: peer-link
+              mountPath: /run/snapshotd/link
+              readOnly: true
         - name: kube-rbac-proxy
           image: quay.io/brancz/kube-rbac-proxy:v0.23.1
           args:
             - --secure-listen-address=0.0.0.0:8443
-            - --upstream=http://127.0.0.1:7700/
+            - --upstream=https://127.0.0.1:7700/
+            - --upstream-ca-file=/etc/snapshotd/link/ca.crt
+            - --upstream-client-cert-file=/etc/snapshotd/link/proxy.crt
+            - --upstream-client-key-file=/etc/snapshotd/link/proxy.key
+            - --auth-header-fields-enabled=true
+            - --config-file=/etc/kube-rbac-proxy/config.yaml
             - --auth-token-audiences=snapshotd-peers
             - --tls-cert-file=/etc/tls/tls.crt
             - --tls-private-key-file=/etc/tls/tls.key
@@ -61,7 +86,20 @@ spec:
             - name: peer-tls
               mountPath: /etc/tls
               readOnly: true
+            - name: peer-link
+              mountPath: /etc/snapshotd/link
+              readOnly: true
+            - name: proxy-config
+              mountPath: /etc/kube-rbac-proxy
+              readOnly: true
       volumes:
+        - name: peer-link
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: proxy-config
+          configMap:
+            name: snapshotd-peers-authorization
         - name: peer-token
           projected:
             sources:

@@ -12,6 +12,8 @@ mod image;
 mod inject;
 #[cfg(any(test, feature = "nixl"))]
 mod lanes;
+#[cfg(any(test, feature = "nixl"))]
+mod link;
 mod metrics;
 mod node;
 #[cfg(feature = "nixl")]
@@ -67,6 +69,10 @@ enum Command {
     #[cfg(feature = "nixl")]
     #[command(subcommand)]
     Transfer(TransferCommand),
+    /// Write the certificates of the mutual TLS between a daemon and its
+    /// kube-rbac-proxy.
+    #[cfg(feature = "nixl")]
+    PeerLink(link::Args),
 }
 
 #[derive(Subcommand)]
@@ -223,6 +229,8 @@ impl Command {
             }) => image::hold(&images_dir, segment_gib << 30, reserve_gib << 30),
             #[cfg(feature = "nixl")]
             Self::Transfer(command) => command.run(),
+            #[cfg(feature = "nixl")]
+            Self::PeerLink(args) => link::run(&args),
         }
     }
 }

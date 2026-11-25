@@ -175,6 +175,8 @@ pub enum StoreError {
     NotARevision { name: String },
     #[error("this node has no store class {name:?}")]
     NoClass { name: String },
+    #[error("{text:?} is not controller:<uid> or serviceaccount:<name>")]
+    NotAPrincipal { text: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -227,12 +229,31 @@ impl Attestation {
     /// image: they have the same controller, or no controller and the same
     /// ServiceAccount.
     pub fn same_principal(&self, other: &Self) -> bool {
-        self.namespace == other.namespace
-            && match (&self.owner, &other.owner) {
-                (Some(ours), Some(theirs)) => ours == theirs,
-                (None, None) => self.service_account == other.service_account,
-                _ => false,
-            }
+        self.namespace == other.namespace && self.principal() == other.principal()
+    }
+
+    /// Who a pod must share with the capturing pod to use its image.
+    pub fn principal(&self) -> Principal {
+        match &self.owner {
+            Some(owner) => Principal::Controller {
+                uid: owner.uid.clone(),
+            },
+            None => Principal::ServiceAccount {
+                name: self.service_account.clone(),
+            },
+        }
+    }
+
+    /// Whether the image in `image` may be used by pods of `wanted`. An
+    /// image captured before images were attested may be used by anyone; one
+    /// whose attestation cannot be read by no one.
+    #[cfg(any(test, feature = "nixl"))]
+    pub fn allows(image: &Path, wanted: &Principal) -> bool {
+        match Self::of_image(image) {
+            Ok(Some(attestation)) => attestation.principal() == *wanted,
+            Ok(None) => true,
+            Err(_) => false,
+        }
     }
 
     /// `None` for an image captured before images were attested.
@@ -264,6 +285,53 @@ impl fmt::Display for Attestation {
                 "{pod}, owned by no controller, as ServiceAccount {}",
                 self.service_account
             ),
+        }
+    }
+}
+
+/// What pods of one namespace share an image by: the UID of their
+/// controller, or for pods no controller owns, their ServiceAccount.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Principal {
+    Controller { uid: String },
+    ServiceAccount { name: String },
+}
+
+const CONTROLLER_PRINCIPAL: &str = "controller:";
+const SERVICE_ACCOUNT_PRINCIPAL: &str = "serviceaccount:";
+
+impl fmt::Display for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Controller { uid } => write!(f, "{CONTROLLER_PRINCIPAL}{uid}"),
+            Self::ServiceAccount { name } => write!(f, "{SERVICE_ACCOUNT_PRINCIPAL}{name}"),
+        }
+    }
+}
+
+impl FromStr for Principal {
+    type Err = StoreError;
+
+    fn from_str(text: &str) -> Result<Self, StoreError> {
+        let not_one = || StoreError::NotAPrincipal {
+            text: text.to_string(),
+        };
+        let principal = if let Some(uid) = text.strip_prefix(CONTROLLER_PRINCIPAL) {
+            Self::Controller {
+                uid: uid.to_string(),
+            }
+        } else if let Some(name) = text.strip_prefix(SERVICE_ACCOUNT_PRINCIPAL) {
+            Self::ServiceAccount {
+                name: name.to_string(),
+            }
+        } else {
+            return Err(not_one());
+        };
+        let (Self::Controller { uid: part } | Self::ServiceAccount { name: part }) = &principal;
+        if valid_part(part) {
+            Ok(principal)
+        } else {
+            Err(not_one())
         }
     }
 }
@@ -606,7 +674,7 @@ mod tests {
     use anyhow::anyhow;
 
     use crate::store::{
-        Attestation, Class, Classes, Collision, MANIFEST, Owner, Published, RevisionKey,
+        Attestation, Class, Classes, Collision, MANIFEST, Owner, Principal, Published, RevisionKey,
         RevisionStore, USED, Usage, Workload, directory_bytes, ensure_room, revisions,
     };
 
@@ -1125,7 +1193,6 @@ mod tests {
         }
         let different = [
             attested("b", Some(deployment("qwen3-8b", "d-2")), "default"),
-            attested("b", Some(deployment("glm", "d-1")), "default"),
             attested("b", None, "default"),
             Attestation {
                 namespace: "batch".to_string(),
@@ -1149,6 +1216,69 @@ mod tests {
             base.to_string(),
             "Deployment qwen3-8b (d-1) through pod serving/a (a-uid)"
         );
+    }
+
+    #[test]
+    fn a_principal_is_named_in_a_request_and_parsed_back() {
+        let controller = attested("a", Some(deployment("qwen3-8b", "d-1")), "default").principal();
+        let unowned = attested("a", None, "qwen").principal();
+        assert_eq!(
+            controller,
+            Principal::Controller {
+                uid: "d-1".to_string()
+            }
+        );
+        assert_eq!(controller.to_string(), "controller:d-1");
+        assert_eq!(unowned.to_string(), "serviceaccount:qwen");
+        for principal in [&controller, &unowned] {
+            assert_eq!(
+                &principal.to_string().parse::<Principal>().unwrap(),
+                principal
+            );
+        }
+        for text in [
+            "",
+            "d-1",
+            "controller:",
+            "serviceaccount:",
+            "controller:../d-1",
+            "controller:d 1",
+            "serviceaccount:a/b",
+            "owner:d-1",
+            "controller:.hidden",
+        ] {
+            assert!(text.parse::<Principal>().is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_allows_the_principal_that_captured_it() {
+        let dir = scratch("allows");
+        let store = open(&dir, "a");
+        let qwen = attested("a", Some(deployment("qwen3-8b", "d-1")), "default");
+        let controller = qwen.principal();
+        let other = Principal::Controller {
+            uid: "d-2".to_string(),
+        };
+        stage(&store, "ours", Some(&qwen));
+        store.publish().unwrap();
+        assert!(Attestation::allows(&store.image_dir(), &controller));
+        assert!(!Attestation::allows(&store.image_dir(), &other));
+        assert!(!Attestation::allows(
+            &store.image_dir(),
+            &Principal::ServiceAccount {
+                name: "default".to_string()
+            }
+        ));
+
+        fs::write(store.image_dir().join(MANIFEST), "{}").unwrap();
+        assert!(
+            Attestation::allows(&store.image_dir(), &other),
+            "an image captured before attestation is anyone's"
+        );
+        fs::write(store.image_dir().join(MANIFEST), "{").unwrap();
+        assert!(!Attestation::allows(&store.image_dir(), &controller));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

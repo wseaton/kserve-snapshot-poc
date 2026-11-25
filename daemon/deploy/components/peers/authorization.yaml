@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: snapshotd-peers-authorization
+data:
+  config.yaml: |
+    authorization:
+      rewrites:
+        byQueryParameter:
+          name: namespace
+      resourceAttributes:
+        apiGroup: snapshot.llm-d.ai
+        resource: checkpoints
+        namespace: "{{ .Value }}"

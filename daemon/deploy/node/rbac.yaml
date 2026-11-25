@@ -29,7 +29,9 @@ subjects:
     name: snapshotd
 ---
 # Bind in a namespace to let its pods restore checkpoints, for example to
-# the group system:serviceaccounts:<namespace>. Nothing is bound by default.
+# the group system:serviceaccounts:<namespace>, and to the ServiceAccount
+# snapshotd/snapshotd to let the daemons move them between nodes. Nothing is
+# bound by default.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

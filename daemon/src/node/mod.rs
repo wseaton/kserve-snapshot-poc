@@ -501,11 +501,12 @@ fn refusal(
 async fn pull_from_peers(
     peers: &Arc<Peers>,
     revision: &RevisionKey,
+    ours: &Attestation,
     store: &RevisionStore,
 ) -> Result<()> {
     info!("this node has no checkpoint of the revision; asking the other nodes");
     let asked = Instant::now();
-    match peers.pull(revision, store).await? {
+    match peers.pull(revision, &ours.principal(), store).await? {
         Some(peer) => info!(
             %peer,
             seconds = %seconds(asked),
@@ -629,7 +630,7 @@ async fn bring_up(
         let _turn = turn.lock().await;
         if !store.image_ready() && !store.failed_before() {
             let asked = Instant::now();
-            pull_from_peers(peers, &revision, &store).await?;
+            pull_from_peers(peers, &revision, &ours, &store).await?;
             if store.image_ready() {
                 node.metrics.stepped(Step::Pull, asked.elapsed());
             }
@@ -823,9 +824,9 @@ async fn serve(args: Args) -> Result<()> {
         }
     };
     let node = Arc::new(Node {
-        api,
         #[cfg(feature = "nixl")]
-        peers: Peers::start(&args.peers, classes.clone()).await?,
+        peers: Peers::start(&args.peers, classes.clone(), api.clone()).await?,
+        api,
         classes,
         metrics,
         #[cfg(feature = "nixl")]

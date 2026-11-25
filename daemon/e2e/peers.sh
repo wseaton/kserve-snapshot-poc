@@ -99,20 +99,39 @@ grep -q "asking a peer that has it .*shared_levels=1 of=2" <<<"$(log "$HOME_NODE
   || fail "$HOME_NODE did not see $NEAR as sharing its rack"
 echo "three replicas of one process, the third pulled from its own rack"
 
-# Only a daemon gets an answer from a daemon's proxy.
+# Only a daemon gets an answer from a daemon's proxy, only for a namespace that lets daemons read
+# its checkpoints, and only through the proxy.
 hash=$(k get pods -l app=near-far -o jsonpath='{.items[0].metadata.labels.pod-template-hash}')
-url="https://$(daemon_ip "$FAR"):8443/v1/checkpoints/default/near-far/$hash"
+owner=$(k get deploy near-far -o jsonpath='{.metadata.uid}')
+base="https://$(daemon_ip "$FAR"):8443/v1/checkpoints"
+url="$base/default/near-far/$hash?namespace=default&principal=controller:$owner"
 caller=$(k get pods -l app=near-far -o jsonpath='{.items[0].metadata.name}')
 code() { k exec "$caller" -c main -- curl -sk -o /dev/null -w '%{http_code}' "$@" "$url"; }
 bearer() { echo "Authorization: Bearer $(k -n "$1" create token "$2" --audience "$3" --duration 10m)"; }
+daemon_token=$(bearer snapshotd snapshotd snapshotd-peers)
 [ "$(code)" = 401 ] || fail "a caller with no token got $(code)"
 got=$(code -H "$(bearer default default snapshotd-peers)")
 [ "$got" = 403 ] || fail "another ServiceAccount got $got"
 got=$(code -H "$(bearer snapshotd snapshotd https://kubernetes.default.svc.cluster.local)")
 [ "$got" = 401 ] || fail "a daemon's token for another audience got $got"
-got=$(code -H "$(bearer snapshotd snapshotd snapshotd-peers)")
+got=$(code -H "$daemon_token")
 [ "$got" = 200 ] || fail "a daemon's token got $got"
-echo "the proxy answers a daemon and nobody else"
+url="$base/kube-system/near-far/$hash?namespace=kube-system&principal=controller:$owner"
+got=$(code -H "$daemon_token")
+[ "$got" = 403 ] || fail "a daemon got $got for a namespace that grants it nothing"
+url="$base/kube-system/near-far/$hash?namespace=default&principal=controller:$owner"
+got=$(code -H "$daemon_token")
+[ "$got" = 403 ] || fail "a query naming another namespace than the path got $got"
+url="$base/default/near-far/$hash"
+got=$(code -H "$daemon_token")
+[ "$got" = 400 ] || fail "a request naming no namespace got $got"
+direct=$(k -n snapshotd exec "$(daemon "$FAR")" -c snapshotd -- bash -c \
+  'exec 3<>/dev/tcp/127.0.0.1/7700; printf "GET / HTTP/1.1\r\nHost: peer\r\n\r\n" >&3; timeout 5 cat <&3' \
+  2>&1 || true)
+! grep -q "HTTP/1.1" <<<"$direct" || fail "the daemon answered a request that bypassed the proxy: $direct"
+grep -q 'security="peer-link-refused"' <<<"$(log "$FAR")" \
+  || fail "a request to the daemon that bypassed the proxy was not logged"
+echo "the proxy answers a daemon, for a namespace that grants it, and nothing bypasses it"
 
 # Two revisions that start on different nodes and then each need the other's node: the two
 # daemons pull from each other at the same time. One server starts prepared for its checkpoint.

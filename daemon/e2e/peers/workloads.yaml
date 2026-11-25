@@ -133,3 +133,17 @@ subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: Group
     name: system:serviceaccounts:default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: snapshotd-peers
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: snapshotd-checkpoint-reader
+subjects:
+  - kind: ServiceAccount
+    name: snapshotd
+    namespace: snapshotd

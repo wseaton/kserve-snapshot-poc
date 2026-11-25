@@ -1,10 +1,25 @@
 //! An authenticated connection between the daemons of two nodes.
 //!
 //! ```text
-//! asking daemon ══ TLS ══► kube-rbac-proxy ── HTTP, inside the pod ──► holding daemon
+//! asking daemon ══ TLS ══► kube-rbac-proxy ══ mutual TLS, inside the pod ══► holding daemon
 //! ```
+//!
+//! A request names its revision in the path and the revision's namespace
+//! and the asker's principal in the query:
+//!
+//! ```text
+//! GET /v1/checkpoints/<namespace>/<workload>/<hash>?namespace=<namespace>&principal=controller:<uid>
+//! ```
+//!
+//! The proxy authenticates the asker, checks that it may `get`
+//! `checkpoints.snapshot.llm-d.ai` in the `namespace` of the query, and
+//! passes the asker's user and groups on in headers. The daemon checks the
+//! query names the path's namespace and asks the API server the same
+//! question itself (see [`crate::access`]).
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -19,7 +34,7 @@ use hyper::header::{AUTHORIZATION, CONNECTION, HOST, HeaderMap, HeaderValue, UPG
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use openssl::ssl::{SslConnector, SslMethod, SslVersion};
+use openssl::ssl::{Ssl, SslAcceptor, SslConnector, SslMethod, SslVersion};
 use openssl::x509::X509;
 use openssl::x509::store::X509StoreBuilder;
 use serde::{Deserialize, Serialize};
@@ -29,13 +44,21 @@ use tokio::time::{sleep, timeout};
 use tokio_openssl::SslStream;
 use tracing::{Instrument, debug, warn};
 
+use crate::access::{AccessError, Subject, Verdict};
 use crate::encrypt::TransferKey;
-use crate::store::RevisionKey;
+use crate::store::{Principal, RevisionKey};
 use crate::topology::Place;
 
 const PROTOCOL: &str = "snapshotd-transfer/1";
 const ROUTE: &str = "/v1/checkpoints/";
 const LAST_WORDS: Duration = Duration::from_secs(5);
+const HANDSHAKE: Duration = Duration::from_secs(10);
+const NAMESPACE_PARAMETER: &str = "namespace";
+const PRINCIPAL_PARAMETER: &str = "principal";
+/// kube-rbac-proxy's `--auth-header-*` defaults.
+const USER_HEADER: &str = "x-remote-user";
+const GROUPS_HEADER: &str = "x-remote-groups";
+const GROUP_SEPARATOR: char = '|';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -60,10 +83,119 @@ pub struct Status {
 }
 
 pub trait Holder: Send + Sync + 'static {
-    fn status(&self, revision: &RevisionKey) -> Status;
-    /// Decide whether to hand `revision` over, and what to do with the
-    /// connection if so.
-    fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal>;
+    /// What this daemon holds of `revision` that pods of `wanted` may use.
+    fn status(&self, revision: &RevisionKey, wanted: &Principal) -> Status;
+    /// Decide whether to hand `revision` over for pods of `wanted`, and
+    /// what to do with the connection if so.
+    fn admit(&self, revision: &RevisionKey, wanted: &Principal) -> Result<Work, Refusal>;
+    fn may_read(
+        &self,
+        caller: &Subject,
+        revision: &RevisionKey,
+    ) -> impl Future<Output = Result<Verdict, AccessError>> + Send;
+}
+
+/// Why a request is not answered.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum Unanswered {
+    #[error("not a GET of a checkpoint")]
+    NotFound,
+    #[error("the query is not namespace=<namespace>&principal=<principal>: {0}")]
+    BadQuery(String),
+    #[error("it came without the proxy's {USER_HEADER} header")]
+    NoCaller,
+    #[error("the query names namespace {query:?} and the revision is in {revision:?}")]
+    OtherNamespace { query: String, revision: String },
+}
+
+impl Unanswered {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::BadQuery(_) => StatusCode::BAD_REQUEST,
+            Self::NoCaller | Self::OtherNamespace { .. } => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+/// What a peer asks for, as the proxy passed it on.
+#[derive(Debug, PartialEq, Eq)]
+struct Asked {
+    revision: RevisionKey,
+    wanted: Principal,
+    caller: Subject,
+}
+
+/// Each parameter once, its value as sent: nothing in a namespace or a
+/// principal needs escaping.
+fn parameters(query: Option<&str>) -> Result<HashMap<&str, &str>, Unanswered> {
+    let mut found = HashMap::new();
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| Unanswered::BadQuery(format!("{pair:?} has no value")))?;
+        if value.contains(['%', '+']) {
+            return Err(Unanswered::BadQuery(format!("{name} is escaped")));
+        }
+        if found.insert(name, value).is_some() {
+            return Err(Unanswered::BadQuery(format!("{name} is given twice")));
+        }
+    }
+    Ok(found)
+}
+
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn asked<B>(request: &Request<B>) -> Result<Asked, Unanswered> {
+    let revision = request
+        .uri()
+        .path()
+        .strip_prefix(ROUTE)
+        .and_then(|name| name.parse::<RevisionKey>().ok())
+        .filter(|_| request.method() == Method::GET)
+        .ok_or(Unanswered::NotFound)?;
+    let parameters = parameters(request.uri().query())?;
+    let namespace = parameters
+        .get(NAMESPACE_PARAMETER)
+        .ok_or_else(|| Unanswered::BadQuery(format!("no {NAMESPACE_PARAMETER}")))?;
+    let wanted = parameters
+        .get(PRINCIPAL_PARAMETER)
+        .ok_or_else(|| Unanswered::BadQuery(format!("no {PRINCIPAL_PARAMETER}")))?
+        .parse::<Principal>()
+        .map_err(|error| Unanswered::BadQuery(error.to_string()))?;
+    let user = header(request.headers(), USER_HEADER).ok_or(Unanswered::NoCaller)?;
+    if *namespace != revision.namespace() {
+        return Err(Unanswered::OtherNamespace {
+            query: namespace.to_string(),
+            revision: revision.namespace().to_string(),
+        });
+    }
+    let groups = header(request.headers(), GROUPS_HEADER)
+        .map(|groups| {
+            groups
+                .split(GROUP_SEPARATOR)
+                .filter(|group| !group.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Asked {
+        revision,
+        wanted,
+        caller: Subject {
+            user: user.to_string(),
+            groups,
+        },
+    })
 }
 
 pub struct Identity {
@@ -146,27 +278,59 @@ fn asks_to_upgrade(headers: &HeaderMap) -> bool {
     })
 }
 
-fn answer(mut request: Request<Incoming>, holder: &impl Holder) -> Response<Full<Bytes>> {
+async fn answer(mut request: Request<Incoming>, holder: &impl Holder) -> Response<Full<Bytes>> {
     let status = |status| {
         let mut response = Response::new(Full::default());
         *response.status_mut() = status;
         response
     };
-    let revision = request
-        .uri()
-        .path()
-        .strip_prefix(ROUTE)
-        .and_then(|name| name.parse::<RevisionKey>().ok());
-    let Some(revision) = revision.filter(|_| request.method() == Method::GET) else {
-        return status(StatusCode::NOT_FOUND);
+    let Asked {
+        revision,
+        wanted,
+        caller,
+    } = match asked(&request) {
+        Ok(asked) => asked,
+        Err(why) => {
+            if why.status() == StatusCode::FORBIDDEN {
+                warn!(
+                    security = "peer-request-refused",
+                    path = %request.uri(),
+                    %why,
+                    "refused a request on the peer port"
+                );
+            }
+            return status(why.status());
+        }
     };
+    match holder.may_read(&caller, &revision).await {
+        Ok(Verdict::Allowed) => {}
+        Ok(Verdict::Denied(why)) => {
+            warn!(
+                security = "peer-access-denied",
+                %revision,
+                caller = %caller.user,
+                why,
+                "a peer may not read the revision's checkpoint"
+            );
+            return status(StatusCode::FORBIDDEN);
+        }
+        Err(error) => {
+            warn!(
+                %revision,
+                caller = %caller.user,
+                error = %format_args!("{:#}", anyhow::Error::from(error)),
+                "could not ask whether a peer may read the revision's checkpoint"
+            );
+            return status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
     if !asks_to_upgrade(request.headers()) {
-        return match serde_json::to_vec(&holder.status(&revision)) {
+        return match serde_json::to_vec(&holder.status(&revision, &wanted)) {
             Ok(body) => Response::new(Full::from(body)),
             Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
         };
     }
-    let work = match holder.admit(&revision) {
+    let work = match holder.admit(&revision, &wanted) {
         Ok(work) => work,
         Err(Refusal::NoImage) => return status(StatusCode::NOT_FOUND),
         Err(Refusal::Busy) => return status(StatusCode::SERVICE_UNAVAILABLE),
@@ -198,10 +362,17 @@ fn answer(mut request: Request<Incoming>, holder: &impl Holder) -> Response<Full
     response
 }
 
-pub async fn serve(listener: TcpListener, holder: Arc<impl Holder>) {
+async fn accept_link(link: &SslAcceptor, stream: TcpStream) -> Result<SslStream<TcpStream>> {
+    let mut tls = SslStream::new(Ssl::new(link.context())?, stream)?;
+    Pin::new(&mut tls).accept().await?;
+    Ok(tls)
+}
+
+/// Answer the proxy on `listener`, over the mutual TLS of `link`.
+pub async fn serve(listener: TcpListener, link: Arc<SslAcceptor>, holder: Arc<impl Holder>) {
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) if stream.set_nodelay(true).is_ok() => stream,
+        let (stream, from) = match listener.accept().await {
+            Ok((stream, from)) if stream.set_nodelay(true).is_ok() => (stream, from),
             Ok(_) => continue,
             Err(error) => {
                 warn!(%error, "could not accept a peer");
@@ -209,19 +380,42 @@ pub async fn serve(listener: TcpListener, holder: Arc<impl Holder>) {
                 continue;
             }
         };
-        let holder = Arc::clone(&holder);
-        tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let holder = Arc::clone(&holder);
-                async move { Ok::<_, Infallible>(answer(request, holder.as_ref())) }
-            });
-            let served = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            if let Err(error) = served.await {
-                debug!(%error, "a peer connection ended badly");
+        let (link, holder) = (Arc::clone(&link), Arc::clone(&holder));
+        tokio::spawn(
+            async move {
+                let tls = match timeout(HANDSHAKE, accept_link(&link, stream)).await {
+                    Ok(Ok(tls)) => tls,
+                    Ok(Err(error)) => {
+                        warn!(
+                            security = "peer-link-refused",
+                            %from,
+                            error = %format_args!("{error:#}"),
+                            "a connection to the peer port did not come from this pod's proxy"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(
+                            security = "peer-link-refused",
+                            %from,
+                            "a connection to the peer port did not finish its handshake"
+                        );
+                        return;
+                    }
+                };
+                let service = service_fn(move |request| {
+                    let holder = Arc::clone(&holder);
+                    async move { Ok::<_, Infallible>(answer(request, holder.as_ref()).await) }
+                });
+                let served = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), service)
+                    .with_upgrades();
+                if let Err(error) = served.await {
+                    debug!(%error, "a peer connection ended badly");
+                }
             }
-        });
+            .in_current_span(),
+        );
     }
 }
 
@@ -250,10 +444,17 @@ async fn open(peer: SocketAddr, identity: &Identity) -> Result<Sender> {
     Ok(sender)
 }
 
-fn request(identity: &Identity, revision: &RevisionKey) -> Result<hyper::http::request::Builder> {
-    Ok(Request::get(format!("{ROUTE}{revision}"))
-        .header(HOST, &identity.server_name)
-        .header(AUTHORIZATION, format!("Bearer {}", identity.token()?)))
+fn request(
+    identity: &Identity,
+    revision: &RevisionKey,
+    wanted: &Principal,
+) -> Result<hyper::http::request::Builder> {
+    let namespace = revision.namespace();
+    Ok(Request::get(format!(
+        "{ROUTE}{revision}?{NAMESPACE_PARAMETER}={namespace}&{PRINCIPAL_PARAMETER}={wanted}"
+    ))
+    .header(HOST, &identity.server_name)
+    .header(AUTHORIZATION, format!("Bearer {}", identity.token()?)))
 }
 
 fn refused(status: StatusCode) -> anyhow::Error {
@@ -269,10 +470,11 @@ pub async fn inquire(
     peer: SocketAddr,
     identity: &Identity,
     revision: &RevisionKey,
+    wanted: &Principal,
 ) -> Result<Status> {
     let exchange = async {
         let mut sender = open(peer, identity).await?;
-        let request = request(identity, revision)?.body(Empty::<Bytes>::new())?;
+        let request = request(identity, revision, wanted)?.body(Empty::<Bytes>::new())?;
         let response = sender.send_request(request).await.context("ask")?;
         if response.status() != StatusCode::OK {
             return Err(refused(response.status()));
@@ -294,11 +496,12 @@ pub async fn ask<T: Send + 'static>(
     peer: SocketAddr,
     identity: &Identity,
     revision: &RevisionKey,
+    wanted: &Principal,
     work: impl FnOnce(Tunnel) -> Result<T> + Send + 'static,
 ) -> Result<Result<T, Refusal>> {
     let exchange = async {
         let mut sender = open(peer, identity).await?;
-        let request = request(identity, revision)?
+        let request = request(identity, revision, wanted)?
             .header(CONNECTION, "upgrade")
             .header(UPGRADE, PROTOCOL)
             .body(Empty::<Bytes>::new())?;
@@ -357,13 +560,13 @@ pub fn host(name: &str) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::future::Future;
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
@@ -374,16 +577,29 @@ mod tests {
     use openssl::ssl::{SslAcceptor, SslMethod};
     use openssl::x509::extension::{BasicConstraints, SubjectAlternativeName};
     use openssl::x509::{X509, X509NameBuilder};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_openssl::SslStream;
+    use tracing_subscriber::fmt::MakeWriter;
 
-    use crate::store::RevisionKey;
+    use crate::access::{AccessError, Subject, Verdict};
+    use crate::link;
+    use crate::store::{Principal, RevisionKey};
     use crate::topology::Place;
     use crate::tunnel::{
         Holder, Identity, Refusal, Status, Tunnel, Work, ask, ask_order, host, inquire, serve,
     };
 
     const NAME: &str = "snapshotd-peers.snapshotd.svc";
+    const DAEMON: &str = "system:serviceaccount:snapshotd:snapshotd";
+    const GROUPS: &str =
+        "system:serviceaccounts|system:serviceaccounts:snapshotd|system:authenticated";
+
+    fn qwen() -> Principal {
+        Principal::Controller {
+            uid: "d-1".to_string(),
+        }
+    }
 
     struct Authority {
         key: PKey<Private>,
@@ -437,25 +653,68 @@ mod tests {
         Authority { key, certificate }
     }
 
-    async fn tls_front(authority: &Authority, name: &str, upstream: SocketAddr) -> SocketAddr {
+    /// The request head `stream` sends, with the proxy's identity headers
+    /// for `caller` in place of any it sent.
+    async fn head(stream: &mut (impl AsyncReadExt + Unpin), caller: Option<&str>) -> Vec<u8> {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                return Vec::new();
+            }
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8(head).unwrap();
+        let mut lines: Vec<&str> = text
+            .trim_end()
+            .split("\r\n")
+            .filter(|line| {
+                let line = line.to_ascii_lowercase();
+                !line.starts_with("x-remote-")
+            })
+            .collect();
+        let added;
+        if let Some(caller) = caller {
+            added = format!("x-remote-user: {caller}\r\nx-remote-groups: {GROUPS}");
+            lines.push(&added);
+        }
+        format!("{}\r\n\r\n", lines.join("\r\n")).into_bytes()
+    }
+
+    /// What kube-rbac-proxy does in front of `daemon`: answer TLS as `name`
+    /// signed by `authority`, pass each request on with the identity of
+    /// `caller`, over the daemon's link.
+    async fn tls_front_as(
+        authority: &Authority,
+        name: &str,
+        daemon: &Daemon,
+        caller: Option<&'static str>,
+    ) -> SocketAddr {
         let (key, certificate) = certificate(name, 2, Some(authority));
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
         acceptor.set_private_key(&key).unwrap();
         acceptor.set_certificate(&certificate).unwrap();
         let acceptor = Arc::new(acceptor.build());
+        let connector = Arc::new(link::tests::connector(&daemon.link, &daemon.link));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let upstream = daemon.address;
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                let acceptor = Arc::clone(&acceptor);
+                let (acceptor, connector) = (Arc::clone(&acceptor), Arc::clone(&connector));
                 tokio::spawn(async move {
                     let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
                     let mut tls = SslStream::new(ssl, stream).unwrap();
                     if Pin::new(&mut tls).accept().await.is_err() {
                         return;
                     }
-                    let mut upstream = TcpStream::connect(upstream).await.unwrap();
+                    let head = head(&mut tls, caller).await;
+                    if head.is_empty() {
+                        return;
+                    }
+                    let mut upstream = linked(&connector, upstream).await.unwrap();
+                    upstream.write_all(&head).await.unwrap();
                     let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
                 });
             }
@@ -463,13 +722,29 @@ mod tests {
         address
     }
 
+    async fn tls_front(authority: &Authority, name: &str, daemon: &Daemon) -> SocketAddr {
+        tls_front_as(authority, name, daemon, Some(DAEMON)).await
+    }
+
+    async fn linked(
+        connector: &openssl::ssl::SslConnector,
+        daemon: SocketAddr,
+    ) -> Result<SslStream<TcpStream>> {
+        let ssl = connector.configure()?.into_ssl("127.0.0.1")?;
+        let mut tls = SslStream::new(ssl, TcpStream::connect(daemon).await?)?;
+        Pin::new(&mut tls).connect().await?;
+        Ok(tls)
+    }
+
     struct Daemon {
         address: SocketAddr,
         admitted: Arc<AtomicUsize>,
+        link: PathBuf,
     }
 
-    /// Holds `serving/qwen/held`, is busy with `serving/qwen/busy`, and does
-    /// `work` with whoever it admits.
+    /// Holds `serving/qwen/held` for the controller `d-1`, is busy with
+    /// `serving/qwen/busy`, lets only the daemons' ServiceAccount read
+    /// `serving`, and does `work` with whoever it admits.
     struct Fixture {
         work: fn(Tunnel) -> Result<()>,
         admitted: Arc<AtomicUsize>,
@@ -481,16 +756,32 @@ mod tests {
     }
 
     impl Holder for Fixture {
-        fn status(&self, revision: &RevisionKey) -> Status {
+        fn status(&self, revision: &RevisionKey, wanted: &Principal) -> Status {
             let name = revision.to_string();
             Status {
-                held: name != "serving/qwen/other",
+                held: name != "serving/qwen/other" && *wanted == qwen(),
                 free_lanes: usize::from(name == "serving/qwen/held"),
                 place: place(),
             }
         }
 
-        fn admit(&self, revision: &RevisionKey) -> Result<Work, Refusal> {
+        fn may_read(
+            &self,
+            caller: &Subject,
+            revision: &RevisionKey,
+        ) -> impl Future<Output = Result<Verdict, AccessError>> + Send {
+            let verdict = if caller.user == DAEMON && revision.namespace() == "serving" {
+                Verdict::Allowed
+            } else {
+                Verdict::Denied(format!("{} has no RoleBinding here", caller.user))
+            };
+            async move { Ok(verdict) }
+        }
+
+        fn admit(&self, revision: &RevisionKey, wanted: &Principal) -> Result<Work, Refusal> {
+            if *wanted != qwen() {
+                return Err(Refusal::NoImage);
+            }
             match revision.to_string().as_str() {
                 "serving/qwen/held" => {
                     self.admitted.fetch_add(1, Ordering::SeqCst);
@@ -503,6 +794,9 @@ mod tests {
     }
 
     async fn holder(work: fn(Tunnel) -> Result<()>) -> Daemon {
+        static LINKS: AtomicUsize = AtomicUsize::new(0);
+        let link =
+            link::tests::scratch(&format!("tunnel-{}", LINKS.fetch_add(1, Ordering::SeqCst)));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let admitted = Arc::new(AtomicUsize::new(0));
@@ -510,8 +804,13 @@ mod tests {
             work,
             admitted: Arc::clone(&admitted),
         };
-        tokio::spawn(serve(listener, Arc::new(fixture)));
-        Daemon { address, admitted }
+        let acceptor = Arc::new(link::acceptor(&link).unwrap());
+        tokio::spawn(serve(listener, acceptor, Arc::new(fixture)));
+        Daemon {
+            address,
+            admitted,
+            link,
+        }
     }
 
     fn files(test: &str, authority: &Authority) -> Identity {
@@ -554,11 +853,12 @@ mod tests {
             Ok(())
         })
         .await;
-        let front = tls_front(&ca, NAME, daemon.address).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
         let key = ask(
             front,
             &files("talk", &ca),
             &revision("serving/qwen/held"),
+            &qwen(),
             |mut tunnel| {
                 assert_eq!(line(&mut tunnel.socket), "here it comes\n");
                 tunnel.socket.write_all(b"got it\n")?;
@@ -577,15 +877,19 @@ mod tests {
     async fn a_refusal_reaches_the_asker_and_no_work_runs() {
         let ca = authority("peers");
         let daemon = holder(|_| Ok(())).await;
-        let front = tls_front(&ca, NAME, daemon.address).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
         let identity = files("refusal", &ca);
         for (name, wanted) in [
             ("serving/qwen/busy", Refusal::Busy),
             ("serving/qwen/other", Refusal::NoImage),
         ] {
-            let answer = ask(front, &identity, &revision(name), |_| -> Result<()> {
-                panic!("work ran after a refusal")
-            })
+            let answer = ask(
+                front,
+                &identity,
+                &revision(name),
+                &qwen(),
+                |_| -> Result<()> { panic!("work ran after a refusal") },
+            )
             .await
             .unwrap();
             assert_eq!(answer, Err(wanted), "{name}");
@@ -600,26 +904,34 @@ mod tests {
         let work = |_: Tunnel| -> Result<()> { panic!("work ran with an unverified peer") };
         let held = revision("serving/qwen/held");
 
-        let unknown_signer = tls_front(&other, NAME, daemon.address).await;
+        let unknown_signer = tls_front(&other, NAME, &daemon).await;
         assert!(
-            ask(unknown_signer, &files("signer", &ca), &held, work)
+            ask(unknown_signer, &files("signer", &ca), &held, &qwen(), work)
                 .await
                 .is_err()
         );
 
-        let another_name = tls_front(&ca, "metrics.snapshotd.svc", daemon.address).await;
+        let another_name = tls_front(&ca, "metrics.snapshotd.svc", &daemon).await;
         assert!(
-            ask(another_name, &files("name", &ca), &held, work)
+            ask(another_name, &files("name", &ca), &held, &qwen(), work)
                 .await
                 .is_err()
         );
 
         let mut no_authority = files("empty", &ca);
         std::fs::write(&no_authority.ca_file, "").unwrap();
-        let front = tls_front(&ca, NAME, daemon.address).await;
-        assert!(ask(front, &no_authority, &held, work).await.is_err());
+        let front = tls_front(&ca, NAME, &daemon).await;
+        assert!(
+            ask(front, &no_authority, &held, &qwen(), work)
+                .await
+                .is_err()
+        );
         no_authority.ca_file = no_authority.token_file.with_file_name("missing");
-        assert!(ask(front, &no_authority, &held, work).await.is_err());
+        assert!(
+            ask(front, &no_authority, &held, &qwen(), work)
+                .await
+                .is_err()
+        );
 
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
     }
@@ -628,10 +940,17 @@ mod tests {
     async fn a_daemon_without_a_token_does_not_ask() {
         let ca = authority("peers");
         let daemon = holder(|_| Ok(())).await;
-        let front = tls_front(&ca, NAME, daemon.address).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
         let identity = files("token", &ca);
         std::fs::write(&identity.token_file, "\n").unwrap();
-        let asked = ask(front, &identity, &revision("serving/qwen/held"), |_| Ok(())).await;
+        let asked = ask(
+            front,
+            &identity,
+            &revision("serving/qwen/held"),
+            &qwen(),
+            |_| Ok(()),
+        )
+        .await;
         assert!(asked.is_err());
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
     }
@@ -649,11 +968,12 @@ mod tests {
             Ok(())
         })
         .await;
-        let front = tls_front(&ca, NAME, daemon.address).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
         let failed = ask(
             front,
             &files("stop", &ca),
             &revision("serving/qwen/held"),
+            &qwen(),
             |_| -> Result<()> { Err(anyhow!("out of room")) },
         )
         .await;
@@ -661,33 +981,232 @@ mod tests {
         assert_eq!(closed.recv_timeout(Duration::from_secs(10)).unwrap(), 0);
     }
 
+    /// The status line the daemon answers `request` with, sent over its
+    /// link with `headers`.
+    async fn raw(daemon: &Daemon, request: &str, headers: &str) -> String {
+        let connector = link::tests::connector(&daemon.link, &daemon.link);
+        let mut tls = linked(&connector, daemon.address).await.unwrap();
+        let sent = format!("{request}\r\nHost: peer\r\n{headers}Connection: close\r\n\r\n");
+        tls.write_all(sent.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        let _ = tls.read_to_end(&mut answer).await;
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn only_a_get_of_a_checkpoint_path_is_answered() {
+    async fn only_a_get_of_a_checkpoint_path_from_an_allowed_caller_is_answered() {
         let daemon = holder(|_| Ok(())).await;
-        for (request, wanted) in [
+        let caller = format!("x-remote-user: {DAEMON}\r\nx-remote-groups: {GROUPS}\r\n");
+        let stranger = "x-remote-user: system:serviceaccount:default:default\r\n";
+        let query = "?namespace=serving&principal=controller:d-1";
+        let held = format!("GET /v1/checkpoints/serving/qwen/held{query} HTTP/1.1");
+        for (request, headers, wanted) in [
+            (held.clone(), caller.as_str(), "HTTP/1.1 200"),
             (
-                "GET /v1/checkpoints/serving/qwen/held HTTP/1.1",
-                "HTTP/1.1 200",
-            ),
-            (
-                "POST /v1/checkpoints/serving/qwen/held HTTP/1.1",
+                format!("POST /v1/checkpoints/serving/qwen/held{query} HTTP/1.1"),
+                &caller,
                 "HTTP/1.1 404",
             ),
             (
-                "GET /v1/checkpoints/serving/../held HTTP/1.1",
+                format!("GET /v1/checkpoints/serving/../held{query} HTTP/1.1"),
+                &caller,
                 "HTTP/1.1 404",
             ),
-            ("GET /metrics HTTP/1.1", "HTTP/1.1 404"),
+            ("GET /metrics HTTP/1.1".to_string(), &caller, "HTTP/1.1 404"),
+            (held.clone(), "", "HTTP/1.1 403"),
+            (held.clone(), stranger, "HTTP/1.1 403"),
+            (
+                "GET /v1/checkpoints/serving/qwen/held HTTP/1.1".to_string(),
+                &caller,
+                "HTTP/1.1 400",
+            ),
+            (
+                "GET /v1/checkpoints/serving/qwen/held?namespace=serving HTTP/1.1".to_string(),
+                &caller,
+                "HTTP/1.1 400",
+            ),
+            (
+                "GET /v1/checkpoints/serving/qwen/held?namespace=batch&principal=controller:d-1 HTTP/1.1"
+                    .to_string(),
+                &caller,
+                "HTTP/1.1 403",
+            ),
+            (
+                "GET /v1/checkpoints/batch/qwen/held?namespace=batch&principal=controller:d-1 HTTP/1.1"
+                    .to_string(),
+                &caller,
+                "HTTP/1.1 403",
+            ),
+            (
+                format!("GET /v1/checkpoints/serving/qwen/held{query}&namespace=serving HTTP/1.1"),
+                &caller,
+                "HTTP/1.1 400",
+            ),
+            (
+                "GET /v1/checkpoints/serving/qwen/held?namespace=serv%69ng&principal=controller:d-1 HTTP/1.1"
+                    .to_string(),
+                &caller,
+                "HTTP/1.1 400",
+            ),
+            (
+                "GET /v1/checkpoints/serving/qwen/held?namespace=serving&principal=owner:d-1 HTTP/1.1"
+                    .to_string(),
+                &caller,
+                "HTTP/1.1 400",
+            ),
         ] {
-            let mut stream = std::net::TcpStream::connect(daemon.address).unwrap();
-            write!(
-                stream,
-                "{request}\r\nHost: peer\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            let status = line(&mut stream);
-            assert!(status.starts_with(wanted), "{request}: {status}");
+            let status = raw(&daemon, &request, headers).await;
+            assert!(status.starts_with(wanted), "{request} {headers:?}: {status}");
         }
+        assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Logged {
+        type Writer = Logged;
+
+        fn make_writer(&'a self) -> Logged {
+            self.clone()
+        }
+    }
+
+    /// Whatever comes back on `stream` after `request`, if anything.
+    async fn answered(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> String {
+        let request = "GET /v1/checkpoints/serving/qwen/held?namespace=serving&principal=controller:d-1 HTTP/1.1\r\n\
+                       Host: peer\r\nx-remote-user: system:serviceaccount:snapshotd:snapshotd\r\n\
+                       Connection: close\r\n\r\n";
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            return String::new();
+        }
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer).await;
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_connection_without_the_proxys_certificate_is_refused_and_logged() {
+        let logged = Logged::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let daemon = holder(|_| panic!("work ran without the proxy")).await;
+
+        let plain = TcpStream::connect(daemon.address).await.unwrap();
+        assert!(!answered(plain).await.contains("HTTP/1.1"), "plain HTTP");
+
+        let mut anonymous = openssl::ssl::SslConnector::builder(SslMethod::tls_client()).unwrap();
+        anonymous
+            .set_ca_file(daemon.link.join(link::AUTHORITY))
+            .unwrap();
+        if let Ok(tls) = linked(&anonymous.build(), daemon.address).await {
+            assert!(!answered(tls).await.contains("HTTP/1.1"), "no certificate");
+        }
+
+        let elsewhere = link::tests::scratch("another-pod");
+        let stranger = link::tests::connector(&daemon.link, &elsewhere);
+        if let Ok(tls) = linked(&stranger, daemon.address).await {
+            assert!(
+                !answered(tls).await.contains("HTTP/1.1"),
+                "another pod's proxy"
+            );
+        }
+
+        let ours = link::tests::connector(&daemon.link, &daemon.link);
+        let tls = linked(&ours, daemon.address).await.unwrap();
+        assert!(
+            answered(tls).await.starts_with("HTTP/1.1 200"),
+            "this pod's proxy"
+        );
+
+        let text = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+        let refused = text
+            .lines()
+            .filter(|line| line.contains("security=\"peer-link-refused\""))
+            .count();
+        assert_eq!(refused, 3, "{text}");
+        assert!(
+            text.contains("a connection to the peer port did not come from this pod's proxy"),
+            "{text}"
+        );
+        assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(elsewhere).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_caller_the_api_server_turns_down_gets_nothing() {
+        let ca = authority("peers");
+        let daemon = holder(|_| panic!("work ran for a refused caller")).await;
+        let identity = files("denied", &ca);
+        let held = revision("serving/qwen/held");
+        let stranger = tls_front_as(
+            &ca,
+            NAME,
+            &daemon,
+            Some("system:serviceaccount:default:default"),
+        )
+        .await;
+        assert!(inquire(stranger, &identity, &held, &qwen()).await.is_err());
+        let failed = ask(stranger, &identity, &held, &qwen(), |_| Ok(())).await;
+        assert!(
+            format!("{:#}", failed.unwrap_err()).contains("403"),
+            "a refused caller is told so"
+        );
+        let anonymous = tls_front_as(&ca, NAME, &daemon, None).await;
+        assert!(inquire(anonymous, &identity, &held, &qwen()).await.is_err());
+
+        let front = tls_front(&ca, NAME, &daemon).await;
+        let elsewhere = revision("batch/qwen/held");
+        assert!(
+            inquire(front, &identity, &elsewhere, &qwen())
+                .await
+                .is_err()
+        );
+        assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_of_another_principal_is_neither_offered_nor_sent() {
+        let ca = authority("peers");
+        let daemon = holder(|_| panic!("work ran for another principal")).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
+        let identity = files("principal", &ca);
+        let held = revision("serving/qwen/held");
+        let other = Principal::Controller {
+            uid: "d-2".to_string(),
+        };
+        let status = inquire(front, &identity, &held, &other).await.unwrap();
+        assert!(!status.held);
+        let answer = ask(front, &identity, &held, &other, |_| -> Result<()> {
+            panic!("work ran for another principal")
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer, Err(Refusal::NoImage));
+        assert!(
+            inquire(front, &identity, &held, &qwen())
+                .await
+                .unwrap()
+                .held
+        );
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
     }
 
@@ -695,14 +1214,16 @@ mod tests {
     async fn a_daemon_says_what_it_holds_and_where_it_is_without_starting_work() {
         let (ca, other) = (authority("peers"), authority("someone else"));
         let daemon = holder(|_| panic!("work ran for a question")).await;
-        let front = tls_front(&ca, NAME, daemon.address).await;
+        let front = tls_front(&ca, NAME, &daemon).await;
         let identity = files("inquire", &ca);
         for (name, held, free_lanes) in [
             ("serving/qwen/held", true, 1),
             ("serving/qwen/busy", true, 0),
             ("serving/qwen/other", false, 0),
         ] {
-            let status = inquire(front, &identity, &revision(name)).await.unwrap();
+            let status = inquire(front, &identity, &revision(name), &qwen())
+                .await
+                .unwrap();
             let wanted = Status {
                 held,
                 free_lanes,
@@ -710,9 +1231,9 @@ mod tests {
             };
             assert_eq!(status, wanted, "{name}");
         }
-        let untrusted = tls_front(&other, NAME, daemon.address).await;
+        let untrusted = tls_front(&other, NAME, &daemon).await;
         let held = revision("serving/qwen/held");
-        assert!(inquire(untrusted, &identity, &held).await.is_err());
+        assert!(inquire(untrusted, &identity, &held, &qwen()).await.is_err());
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
     }
 
