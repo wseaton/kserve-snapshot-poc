@@ -6,7 +6,7 @@ weight = 70
 nav = "Open"
 +++
 
-Checked against the code and upstream on 2026-11-24.
+Checked against the code and upstream on 2026-11-25.
 
 ## Daemon
 
@@ -35,6 +35,11 @@ Checked against the code and upstream on 2026-11-24.
   and cuInterpose restore, then ran out of memory re-committing the KV cache.
 - **CUDA graph recapture** is most of the vLLM restore without cuInterpose (~7 s at TP=2, ~25 s
   for gpt-oss-120b TP=4). Capturing the batch sizes traffic needs first would hide most of it.
+- **Engram CPU offload.** DeepSeek-V4.1-Flash with Engram's tables in pinned host memory
+  checkpointed and got through CRIU and CUDA restore, then failed recapturing CUDA graphs:
+  `CachingHostAllocator` asserted `use_count > 0` in `capture_begin`. A pinned block captured into
+  the graph pool outlived the released graphs, and recapture reused that pool. `0004` now
+  recaptures into a fresh pool, as elastic EP does; not yet rerun on DeepSeek.
 - **Streaming over TCP** restored but failed its first request once on an H100 cluster. Dump then
   copy works there. Cause unknown.
 
@@ -50,6 +55,10 @@ Checked against the code and upstream on 2026-11-24.
   files to tmpfs instead. `vmsplice` was not tried.
 - **Target RAM.** On the bench RAM path the image holds its size in the target's memory until
   restore, charged to the pod.
+- **Host memory with Tiering offload.** The fleet's 512 GiB Tiering region lives in `/dev/shm`.
+  With DeepSeek's host memory and the dump's page cache, a bench pod limited to 1.5 TiB ran out of
+  memory, and the H200 node went NotReady. Capture needs a memory budget for the region, the server
+  and the dump, or a dump that bypasses the page cache.
 
 ## Platform
 
@@ -71,6 +80,7 @@ Checked against the code and upstream on 2026-11-24.
 | Recreate the NCCL communicator around a checkpoint | `patches/vllm/0004` | carried |
 | Connector checkpoint hooks, NIXL prefill/decode | [vllm#64371](https://github.com/vllm-project/vllm/pull/64371), `0001`, `0002` | open |
 | Free and refill the CPU KV offload region | `patches/vllm/0007`, wanted by [vllm#69237](https://github.com/vllm-project/vllm/issues/69237) | carried, no upstream PR yet |
+| Free and refill the Tiering offload region, without secondary tiers | local vLLM commit, not pushed or in `patches/vllm` | unit-tested, not run on GPUs |
 | Checkpoint lifecycle on the Rust frontend's gRPC service | `patches/vllm/0005`, `0006`; branch `rust-checkpoint-grpc` | carried, no upstream PR yet |
 | Refill the offload region after serving resumes | vLLM | not started |
 | Release custom all-reduce IPC buffers at prepare | vLLM | not started |

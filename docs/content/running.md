@@ -76,8 +76,8 @@ The daemon drives vLLM's checkpoint lifecycle over one of two transports:
 `--control-transport` (`SNAPSHOTD_CONTROL_TRANSPORT`, default `grpc`) sets it for the node. A pod
 overrides it with the annotation `snapshot.llm-d.ai/control: http` or `grpc`
 (`--control-annotation`), so one daemon serves pods of both frontends. A pod running vLLM's
-default Python frontend has no gRPC port and needs `http`. A pod that names another value is not
-started; the daemon logs why and tries again every `--retry-s`.
+default Python frontend has no gRPC port and needs `http`. A pod that names another value gets the
+node's transport, with a warning in the daemon's log.
 
 `--prepare-mode` (`wait`, `abort` or `keep`; default `wait`) is how vLLM drains in-flight requests
 before a checkpoint, on either transport.
