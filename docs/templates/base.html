@@ -4,8 +4,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{{ config.title }}{% endblock title %}</title>
-  <meta name="description" content="{% block description %}{{ config.description }}{% endblock description %}">
+  {% if page %}
+  {% set heading = page.title %}
+  {% set title = page.title ~ " | " ~ config.title %}
+  {% set summary = page.description | default(value=config.description) %}
+  {% else %}
+  {% set heading = config.title %}
+  {% set title = config.title %}
+  {% set summary = config.description %}
+  {% endif %}
+  {% set card = get_url(path="img/og.png") %}
+  <title>{{ title }}</title>
+  <meta name="description" content="{{ summary }}">
+  <link rel="canonical" href="{{ current_url | safe }}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.title }}">
+  <meta property="og:title" content="{{ heading }}">
+  <meta property="og:description" content="{{ summary }}">
+  <meta property="og:url" content="{{ current_url | safe }}">
+  <meta property="og:image" content="{{ card | safe }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="snapshotd: two camera irises joined at a seam, beside the tagline">
+  <meta name="twitter:card" content="summary_large_image">
   <script>
     (() => {
       let saved = null;
@@ -14,13 +35,14 @@
     })();
   </script>
   <link rel="stylesheet" href="{{ get_url(path='site.css', cachebust=true) | safe }}">
+  <link rel="icon" type="image/svg+xml" href="{{ get_url(path='img/favicon.svg', cachebust=true) | safe }}">
 </head>
 <body>
   {% set root = get_section(path="_index.md") %}
   {% set here = current_path | default(value="/") %}
   <div class="sheet">
     <header class="bar">
-      <a class="wordmark" href="{{ config.base_url | safe }}/">{{ config.title }}</a>
+      <a class="wordmark" href="{{ config.base_url | safe }}/">{% include "logo.html" %}{{ config.title }}</a>
       <div class="prefs">
         <a href="{{ config.extra.repo_url | safe }}">GitHub</a>
         <button type="button" id="theme-toggle">Theme</button>

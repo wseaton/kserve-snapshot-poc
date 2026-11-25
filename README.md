@@ -1,3 +1,5 @@
+<img src="docs/static/img/logo.svg" alt="" width="140">
+
 # snapshotd
 
 `snapshotd` is a node daemon that brings a vLLM replica up by restoring it from a CRIU checkpoint

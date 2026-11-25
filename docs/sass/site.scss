@@ -119,6 +119,16 @@ main { flex: 1; }
 
 .bar a { color: inherit; }
 .wordmark { font-size: 14px; letter-spacing: 0.14em; text-transform: uppercase; }
+.wordmark { display: inline-flex; align-items: center; gap: 9px; }
+
+.logo { width: 34px; height: 22px; flex: none; }
+.logo-w { fill: currentColor; }
+.logo-e { fill: #6fc292; }
+.logo-spin-w, .logo-spin-e { transform-box: view-box; animation: logo-spin 24s linear infinite; }
+.logo-spin-w { transform-origin: 34px 50px; }
+.logo-spin-e { transform-origin: 66px 50px; animation-direction: reverse; }
+@keyframes logo-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .logo-spin-w, .logo-spin-e { animation: none; } }
 .prefs { margin-left: auto; display: flex; align-items: center; gap: 14px; text-transform: uppercase; letter-spacing: 0.08em; }
 
 .prefs button {
