@@ -31,10 +31,6 @@ Checked against the code and upstream on 2026-11-24.
 
 ## Restore
 
-- **gpt-oss-120b does not survive `--checkpoint-release-weights`.** After reload every worker logs
-  `YaRNScalingRotaryEmbedding: Failed to load weights` and output is incoherent, on one node too
-  and with graphs off. Its checkpoints keep the weights (~100 GB). Measured on the earlier base;
-  main restores buffers differently, and a rerun there is pending.
 - **Released weights at 0.9 utilization** captured in 10.4 s (31 GB) and got through CRIU, CUDA
   and cuInterpose restore, then ran out of memory re-committing the KV cache.
 - **CUDA graph recapture** is most of the vLLM restore without cuInterpose (~7 s at TP=2, ~25 s

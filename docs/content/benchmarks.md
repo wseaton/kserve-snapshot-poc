@@ -35,6 +35,22 @@ Qwen3-30B-A3B with expert parallel, bench pod, each rank restored onto another r
 | **Restore total** | **26.6 s** | **24.4 s** |
 | Cold boot | 96.6 s | 66.4 s |
 
+Bench pod, TP=2 unless noted, no cuInterpose, each rank restored onto another rank's GPU. "KV back"
+is the bytes CPU KV offload loaded back for a prompt pushed out of a 1 GiB GPU KV cache after the
+restore:
+
+| Run | Checkpoint | CRIU dump | vLLM restore | Restore total | Cold boot | KV back |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-8B, CPU offload 16 GiB, released | 11.2 GB | 8.3 s | 10.2 s | 13.4 s | 61.4 s | 510 MB |
+| The same under async_init | 11.2 GB | 8.3 s | 8.8 s | 12.1 s | 45.3 s | 510 MB |
+| Qwen3-8B with a Qwen3-0.6B draft model | 15.9 GB | 9.3 s | 16.7 s | 20.9 s | 45.3 s | |
+| Qwen2.5-VL-3B-Instruct, encoder CUDA graphs | 13.8 GB | 9.2 s | 9.7 s | 13.4 s | 74.5 s | |
+| gpt-oss-120b TP=4 | 28.0 GB | 17.8 s | 32.4 s | 37.5 s | 161.0 s | |
+
+gpt-oss-120b now survives the weight reload that left it incoherent on the earlier base. It still
+logs `YaRNScalingRotaryEmbedding: Failed to load weights`, which is the reload putting back the
+rotary cache it backed up.
+
 Qwen3-8B TP=1 as a DisaggregatedSet with NIXL prefill and decode roles under `snapshotd node`, KV
 over TCP. Times are pod creation to Ready:
 

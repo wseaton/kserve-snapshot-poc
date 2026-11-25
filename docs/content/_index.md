@@ -63,8 +63,9 @@ gpt-oss-120b (106 GB). Every number, with setup: [benchmarks](@/benchmarks.md).
 
 ## Status
 
-The patches are rebased onto vLLM main (nightly `f2f9edca`). On that stack, expert parallel at
-DP=2 and TP=2 restores onto other GPUs with identical output, and prefill and decode under an LWS
-DisaggregatedSet restore per role, across nodes and across a revision change, with every request
-answered right. The table above was measured on the earlier base.
+The patches are rebased onto vLLM main (nightly `f2f9edca`). On that stack, restores onto other
+GPUs give identical output for expert parallel at DP=2 and TP=2, CPU KV offload with and without
+async_init, a draft model for speculative decoding, encoder CUDA graphs, and gpt-oss-120b with its
+weights released. Prefill and decode under an LWS DisaggregatedSet restore per role, across nodes
+and across a revision change, with every request answered right. The table above was measured on the earlier base.
 [Validated configurations](@/validated.md) lists every run and what main is not validated on yet.

@@ -28,6 +28,11 @@ server.
 
 | Date | Stack | Path | Model | Parallelism | Weights | Also | Restored onto | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | CPU offload 16 GiB, released; KV loaded back after restore | rotated GPUs | MATCH |
+| 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | CPU offload 16 GiB under async_init; KV loaded back after restore | rotated GPUs | MATCH |
+| 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | Qwen3-0.6B draft model, 3 speculative tokens | rotated GPUs | MATCH |
+| 2026-11-25 | main | bench | Qwen2.5-VL-3B-Instruct | TP=2 | released, volume | encoder CUDA graphs; text prompt only | rotated GPUs | MATCH |
+| 2026-11-25 | main | bench | gpt-oss-120b | TP=4 | released, volume | | rotated GPUs | MATCH |
 | 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | NIXL over TCP, roles keyed apart | same node | 60/60 |
 | 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | second pod of each role, all four pairings | same node, and other node pulled | 160/160 |
 | 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | decode-only template change, both roles recaptured | same node | 40/40 |
@@ -61,7 +66,8 @@ without a checkpoint, so its restores were checked for coherent output instead.
 
 ## Not validated yet on main
 
-- Speculative decoding with released weights.
-- CPU KV offload, with and without `async_init`.
-- A multimodal model with encoder CUDA graphs.
-- gpt-oss-120b with released weights.
+- Prefill and decode through the llm-d router and its rollout screener, and with KV over RDMA.
+- DeepSeek-V4.1-Flash TP=8 across two nodes, streamed into RAM, with weights from a serving peer.
+- OpenShift, and KServe with the daemon.
+- An image request to a restored multimodal server.
+- Multi-pod data and expert parallel groups, which the daemon does not capture yet.
