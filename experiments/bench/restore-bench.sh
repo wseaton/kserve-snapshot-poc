@@ -62,7 +62,7 @@ mkdir -p "$W" "$IMG" /work/empty; cd "$W" || exit 1
 SD=${SNAPSHOTD:-/models/bin/snapshotd}
 B=/tmp/snapshot-cuda/snapshot-binaries
 BUNDLE=/work/cuinterpose
-SITE=/usr/local/lib/python3.12/dist-packages
+SITE=$(python3 -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("vllm").origin).parent.parent)') || exit 1
 
 now() { date +%s%N; }
 secs() { python3 -c "print(round(($(now) - $1) / 1e9, 3))"; }
@@ -193,11 +193,14 @@ echo "before: $(cat before.txt)"
 if [ "$PHASE" = serve ]; then R[result]=SERVING; report; exit 0; fi
 
 T=$(now)
-curl -s -XPOST localhost:8000/checkpoint/prepare >/dev/null
+code=$(curl -s -o prepare.json -w '%{http_code}' -XPOST localhost:8000/checkpoint/prepare)
+[ "$code" = 200 ] || { cat prepare.json; echo; fail PREPARE_REFUSED; }
+prepared=
 for _ in $(seq 1200); do
   code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/checkpoint/status)
-  [ "$code" = 200 ] && break; [ "$code" = 500 ] && fail PREPARE_FAILED; sleep 0.5
+  [ "$code" = 200 ] && { prepared=1; break; }; [ "$code" = 500 ] && fail PREPARE_FAILED; sleep 0.5
 done
+[ -n "$prepared" ] || fail PREPARE_TIMEOUT
 lap prepare "$T"
 PIDS=$($SD cuda pids $VP); R[cuda_processes]=$(echo "$PIDS" | wc -w)
 R[gpu_mib_after_prepare]=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s}')
