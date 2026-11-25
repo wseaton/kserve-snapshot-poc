@@ -1,7 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - ../../../kserve-dynamo-snapshot/config/companion
+  - https://github.com/wseaton/kserve-dynamo-snapshot//config/companion?ref=de961355797e3907ce3027b245a3f92c87015e48
 images:
   - name: ghcr.io/neuralmagic/kserve-dynamo-snapshot
     newName: quay.io/wseaton/kserve-dynamo-snapshot

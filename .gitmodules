@@ -1,3 +1,0 @@
-[submodule "kserve-dynamo-snapshot"]
-	path = kserve-dynamo-snapshot
-	url = https://github.com/wseaton/kserve-dynamo-snapshot.git

@@ -36,7 +36,6 @@ parallel and prefill/decode under an LWS DisaggregatedSet pass;
 | [`experiments/`](experiments/README.md) | Pod specs and scripts for every measurement, and how to rerun them. |
 | [`patches/`](patches/README.md) | Patches to vLLM, ModelExpress, Dynamo Snapshot and CRIU against the commits in [`upstream.tsv`](upstream.tsv). `./checkout.sh vllm` applies them to a clean clone in `src/`. |
 | [`docs/`](docs) | The docs site, built with Zola (`zola --root docs serve`). |
-| [`kserve-dynamo-snapshot/`](https://github.com/wseaton/kserve-dynamo-snapshot) | Submodule: the earlier KServe integration on Dynamo Snapshot's agent. |
 
 ## License
 

@@ -62,7 +62,7 @@ deploy/
 | `ghcr.io/wseaton/snapshotd/vllm-checkpoint` | [`images/vllm-checkpoint`](../images/vllm-checkpoint): vLLM nightly `f2f9edca` + patches, ModelExpress fork, CUDA 13.1 compat `libcuda` at `/usr/local/cuda-13.1/compat` |
 | `ghcr.io/wseaton/snapshotd/snapshotd` | [`images/snapshotd`](../images/snapshotd): both builds of [`daemon/`](../daemon), with NIXL and UCX |
 | `ghcr.io/wseaton/snapshotd/snapshot-agent` | Dynamo Snapshot `bc9d216` + [`patches/dynamo-snapshot`](../patches/dynamo-snapshot), CRIU `1a93585` |
-| `quay.io/wseaton/kserve-dynamo-snapshot@sha256:77c68762…` | `kserve-dynamo-snapshot/Dockerfile` |
+| `quay.io/wseaton/kserve-dynamo-snapshot@sha256:77c68762…` | [`kserve-dynamo-snapshot`](https://github.com/wseaton/kserve-dynamo-snapshot) `Dockerfile` at `de96135` |
 | `ghcr.io/ai-dynamo/snapshot/{operator,agent}:v0.0.0-gbc9d2161` | upstream |
 | `nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.6.0` | upstream |
 
@@ -73,7 +73,6 @@ Needs KServe with `LLMInferenceService` and the ModelExpress annotations
 
 ```bash
 # chart from the pinned checkout; kustomize only reads charts below the kustomization
-git submodule update --init
 ./checkout.sh dynamo-snapshot
 mkdir -p deploy/dynamo-snapshot/agent/charts
 cp -RL src/dynamo-snapshot/charts/snapshot deploy/dynamo-snapshot/agent/charts/
