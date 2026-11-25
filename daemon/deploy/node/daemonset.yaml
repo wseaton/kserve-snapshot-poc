@@ -39,6 +39,11 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: tools
               mountPath: /tools
@@ -51,6 +56,9 @@ spec:
             - --tools-dir=/tools
           securityContext:
             privileged: true
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: metrics
               containerPort: 9090
@@ -68,12 +76,16 @@ spec:
               mountPath: /tools
             - name: store
               mountPath: /store
+            - name: tmp
+              mountPath: /tmp
             - name: runtime
               mountPath: /run/containerd
             - name: pod-resources
               mountPath: /var/lib/kubelet/pod-resources
       volumes:
         - name: tools
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
         - name: store
           hostPath:

@@ -1,0 +1,52 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: snapshotd
+  annotations:
+    kubernetes.io/description: >-
+      snapshotd's node daemon: privileged, host PID and host directories for
+      checkpointing and restoring other pods' GPU processes. No host network,
+      host IPC or default capabilities.
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: true
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: true
+allowHostPorts: true
+allowedCapabilities: []
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+readOnlyRootFilesystem: false
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+  - unconfined
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - hostPath
+  - persistentVolumeClaim
+  - projected
+  - secret
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: snapshotd-scc
+  namespace: snapshotd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:snapshotd
+subjects:
+  - kind: ServiceAccount
+    name: snapshotd

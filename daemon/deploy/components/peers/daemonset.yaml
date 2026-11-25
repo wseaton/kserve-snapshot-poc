@@ -78,6 +78,8 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             requests:
               cpu: 50m

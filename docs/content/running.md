@@ -52,7 +52,8 @@ A workload pod differs from a plain vLLM Deployment in four places
 
 ```bash
 kubectl apply -k deploy/snapshotd/node              # DaemonSet; needs cert-manager; set its store path
-kubectl apply -k deploy/snapshotd/node-openshift    # the same for OpenShift
+kubectl apply -k deploy/snapshotd/node-openshift    # the same for OpenShift;
+                                                    # then node-openshift-scc for its SCC
 kubectl apply -k deploy/snapshotd/workload          # example Deployment, Qwen3-8B
 kubectl apply -k deploy/snapshotd/kserve/qwen3-8b   # or as an LLMInferenceService
 daemon/e2e/run.sh                                   # whole flow on kind, no GPU, stand-in server
@@ -205,8 +206,23 @@ Every `snapshotd node` flag also reads from `SNAPSHOTD_<FLAG>`; `snapshotd node 
 ## OpenShift
 
 [`deploy/snapshotd/node-openshift`](https://github.com/wseaton/snapshotd/tree/main/deploy/snapshotd/node-openshift)
-swaps four things: the CRI-O socket, the `nvidia` runtime class, a binding to the `privileged` SCC,
-and the service CA in place of cert-manager.
+swaps four things: the CRI-O socket, the `nvidia` runtime class, the service CA in place of
+cert-manager, and the daemon's SecurityContextConstraints in place of the built-in `privileged` one:
+
+```bash
+kubectl apply -k deploy/snapshotd/node-openshift
+kubectl apply -k deploy/snapshotd/node-openshift-scc
+```
+
+The SCC is applied on its own because it is cluster-scoped: a Kustomization that sets a namespace
+would give the SCC one, and the API server rejects that. It grants what the daemon needs and no
+more. The daemon is a privileged container, since it joins the namespaces of the pods it
+checkpoints, mounts into their roots, dumps them through CRIU and writes the node store, and on
+OpenShift `spc_t` is what makes the store writable. Everything else is denied: no host network, no
+host IPC, no capability added by default, and only the volume types the DaemonSet mounts. In the
+pod, the daemon runs with `readOnlyRootFilesystem` and the runtime's default seccomp profile; its
+`/store`, `/tools` and `/tmp` are mounts. The proxies and init containers run unprivileged with
+their capabilities dropped and the same seccomp profile.
 
 SELinux needed two fixes:
 
@@ -217,8 +233,9 @@ SELinux needed two fixes:
   pod's context to `criu restore`. Without it the restored server stays `spc_t` and the shim
   cannot signal it.
 
-Not yet applied to a cluster: the overlay's own SCC binding and peers with a service CA
-certificate.
+Not yet applied to a cluster: the narrow SCC and peers with a service CA certificate. Until the
+SCC is applied the daemon's pods are rejected; `node-openshift` alone no longer binds
+the built-in `privileged` SCC.
 
 ## KServe
 

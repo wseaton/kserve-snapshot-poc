@@ -28,7 +28,8 @@ deploy/
     qwen3-8b/service/        the LLMInferenceService
   snapshotd/
     node/                    the snapshotd DaemonSet with peers, from daemon/deploy
-    node-openshift/          the same for OpenShift: CRI-O, the privileged SCC, the service CA
+    node-openshift/          the same for OpenShift: CRI-O, the nvidia runtime class, the service CA
+    node-openshift-scc/      the daemon's SCC, applied on its own because it is cluster-scoped
     workload/                an example Deployment for the daemon
     workload-pd/             the same as NIXL prefill and decode Deployments
     kserve/                  the daemon under KServe; its README documents the layer
