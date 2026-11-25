@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use rustix::process::{Pid, Signal, WaitOptions};
 use snapshotd_shim::{Reply, Request, SERVER_LOG, SOCKET};
@@ -28,6 +28,12 @@ use snapshotd_shim::{Reply, Request, SERVER_LOG, SOCKET};
 const TICK: Duration = Duration::from_millis(100);
 const PROBE: Duration = Duration::from_millis(200);
 const READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+#[derive(Debug, thiserror::Error)]
+enum ShimError {
+    #[error("the server was already started")]
+    AlreadyStarted,
+}
 
 #[derive(Parser)]
 #[command(name = "snapshotd-shim")]
@@ -132,7 +138,7 @@ impl Shim {
 
     fn start(&mut self) -> Result<Pid> {
         if self.server != Server::NotStarted {
-            bail!("the server was already started");
+            return Err(ShimError::AlreadyStarted.into());
         }
         let log = OpenOptions::new()
             .create(true)

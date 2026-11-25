@@ -1,9 +1,9 @@
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tonic::transport::{Channel, Endpoint};
 
-use crate::vllm::{CONNECT_TIMEOUT, Lifecycle, PauseMode, failed};
+use crate::vllm::{CONNECT_TIMEOUT, Lifecycle, PauseMode, VllmError, failed};
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -20,7 +20,7 @@ fn lifecycle(response: &pb::CheckpointStateResponse) -> Result<Lifecycle> {
         pb::CheckpointState::Prepared => Ok(Lifecycle::Prepared),
         pb::CheckpointState::Restoring => Ok(Lifecycle::Restoring),
         pb::CheckpointState::Failed => Err(failed(response.error.as_deref())),
-        pb::CheckpointState::Unspecified => bail!("vLLM reported no checkpoint state"),
+        pb::CheckpointState::Unspecified => Err(VllmError::NoState.into()),
     }
 }
 

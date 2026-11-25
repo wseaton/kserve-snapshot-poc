@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use tonic::{Request, Response, Status};
@@ -119,9 +119,15 @@ enum Step {
     Resume(Vec<i32>),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TimesliceError {
+    #[error("some of the job's processes are paused and some are not")]
+    Torn,
+}
+
 fn step(action: Action, seen: Seen) -> Result<Step> {
     Ok(match (action, seen) {
-        (_, Seen::Torn) => bail!("some of the job's processes are paused and some are not"),
+        (_, Seen::Torn) => return Err(TimesliceError::Torn.into()),
         (Action::Snapshot, Seen::Running(pids)) => Step::Pause(pids),
         (Action::Restore, Seen::Saved(pids)) => Step::Resume(pids),
         (Action::Snapshot, Seen::Idle | Seen::Saved(_))

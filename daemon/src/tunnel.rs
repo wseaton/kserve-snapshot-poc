@@ -366,7 +366,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use anyhow::{Result, bail};
+    use anyhow::{Result, anyhow};
     use openssl::asn1::Asn1Time;
     use openssl::bn::BigNum;
     use openssl::hash::MessageDigest;
@@ -548,7 +548,7 @@ mod tests {
             *HOLDER_KEY.lock().unwrap() = Some(*tunnel.key.as_bytes());
             tunnel.socket.write_all(b"here it comes\n")?;
             if line(&mut tunnel.socket) != "got it\n" {
-                bail!("the asker did not answer");
+                return Err(anyhow!("the asker did not answer"));
             }
             tunnel.socket.write_all(b"done\n")?;
             Ok(())
@@ -654,7 +654,7 @@ mod tests {
             front,
             &files("stop", &ca),
             &revision("serving/qwen/held"),
-            |_| -> Result<()> { bail!("out of room") },
+            |_| -> Result<()> { Err(anyhow!("out of room")) },
         )
         .await;
         assert!(format!("{:#}", failed.unwrap_err()).contains("out of room"));

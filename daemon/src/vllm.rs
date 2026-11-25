@@ -7,7 +7,7 @@ mod http;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Error, Result, anyhow, bail};
+use anyhow::{Error, Result, anyhow};
 use clap::ValueEnum;
 use tokio::time::{Instant, sleep};
 
@@ -22,11 +22,35 @@ pub enum Lifecycle {
     Restoring,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum VllmError {
+    #[error("vLLM's checkpoint lifecycle failed: {reason}")]
+    Failed { reason: String },
+    #[error("vLLM reported no checkpoint state")]
+    NoState,
+    #[error("vLLM answered {code}: {body:?}")]
+    Unexpected {
+        code: hyper::StatusCode,
+        body: String,
+    },
+    #[error("vLLM at {address} is still {state:?}")]
+    NotUp {
+        address: SocketAddr,
+        state: Lifecycle,
+    },
+    #[error("vLLM is still {state:?} after {limit:?}, waiting for {wanted:?}")]
+    TimedOut {
+        state: Lifecycle,
+        limit: Duration,
+        wanted: Lifecycle,
+    },
+}
+
 fn failed(reason: Option<&str>) -> Error {
-    anyhow!(
-        "vLLM's checkpoint lifecycle failed: {}",
-        reason.unwrap_or("no reason given")
-    )
+    VllmError::Failed {
+        reason: reason.unwrap_or("no reason given").to_string(),
+    }
+    .into()
 }
 
 /// How the daemon drives a server's checkpoint lifecycle.
@@ -106,7 +130,7 @@ impl Control {
                     return Ok((control, state));
                 }
                 Ok(_) | Err(_) if Instant::now() < deadline => sleep(POLL * 5).await,
-                Ok((_, state)) => bail!("vLLM at {address} is still {state:?}"),
+                Ok((_, state)) => return Err(VllmError::NotUp { address, state }.into()),
                 Err(error) => return Err(error.context("vLLM did not start serving")),
             }
         }
@@ -145,7 +169,12 @@ impl Control {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("vLLM is still {state:?} after {limit:?}, waiting for {wanted:?}");
+                return Err(VllmError::TimedOut {
+                    state,
+                    limit,
+                    wanted,
+                }
+                .into());
             }
             sleep(POLL).await;
         }

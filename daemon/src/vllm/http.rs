@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Context, Error, Result, anyhow, bail};
+use anyhow::{Context, Error, Result, anyhow};
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::Bytes;
 use hyper::header::HOST;
@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::vllm::{CONNECT_TIMEOUT, Lifecycle, PauseMode, failed};
+use crate::vllm::{CONNECT_TIMEOUT, Lifecycle, PauseMode, VllmError, failed};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_LIMIT: usize = 64 << 10;
@@ -48,7 +48,7 @@ struct Answer {
 
 impl Answer {
     fn parse(code: StatusCode, body: &[u8]) -> Result<Self> {
-        serde_json::from_slice(body).with_context(|| unexpected(code, body))
+        serde_json::from_slice(body).with_context(|| unexpected(code, body).to_string())
     }
 
     fn lifecycle(&self) -> Result<Lifecycle> {
@@ -70,11 +70,11 @@ impl Answer {
     }
 }
 
-fn unexpected(code: StatusCode, body: &[u8]) -> String {
-    format!(
-        "vLLM answered {code}: {:?}",
-        String::from_utf8_lossy(body).trim()
-    )
+fn unexpected(code: StatusCode, body: &[u8]) -> VllmError {
+    VllmError::Unexpected {
+        code,
+        body: String::from_utf8_lossy(body).trim().to_string(),
+    }
 }
 
 /// `GET /checkpoint/status`: the body names the state whatever the status.
@@ -87,7 +87,7 @@ fn started(code: StatusCode, body: &[u8]) -> Result<()> {
     match code {
         StatusCode::OK => Answer::parse(code, body)?.lifecycle().map(drop),
         StatusCode::BAD_REQUEST => Err(Answer::parse(code, body)?.refusal()),
-        _ => bail!(unexpected(code, body)),
+        _ => Err(unexpected(code, body).into()),
     }
 }
 

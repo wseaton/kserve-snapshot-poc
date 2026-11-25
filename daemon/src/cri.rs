@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use tonic::transport::Channel;
 
@@ -16,6 +16,12 @@ pub mod pb {
 use pb::runtime_service_client::RuntimeServiceClient;
 
 const CONTAINER_NAME: &str = "io.kubernetes.container.name";
+
+#[derive(Debug, thiserror::Error)]
+pub enum CriError {
+    #[error("the container has no process (pid {pid})")]
+    NoProcess { pid: i32 },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sandbox {
@@ -44,7 +50,7 @@ pub fn container_pid(info: &HashMap<String, String>) -> Result<i32> {
     let info: ContainerInfo =
         serde_json::from_str(info).context("parse the runtime's container info")?;
     if info.pid <= 0 {
-        bail!("the container has no process (pid {})", info.pid);
+        return Err(CriError::NoProcess { pid: info.pid }.into());
     }
     Ok(info.pid)
 }

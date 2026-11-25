@@ -20,7 +20,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use cuinterpose_protocol::{NamespacePid, Record, Reply, Request, Response};
 use openssl::hash::{Hasher, MessageDigest};
 use procfs::process::{MMapPath, MemoryMaps, Process};
@@ -32,6 +32,14 @@ const LIBRARIES: [&str; 2] = [FRONTEND_LIBRARY, CORE_LIBRARY];
 const COORDINATOR: &str = "cuinterpose-coordinator";
 const MANIFEST_FILE: &str = "cuinterpose.json";
 const STATE_FILE: &str = "cuinterpose.state";
+
+#[derive(Debug, thiserror::Error)]
+pub enum CuinterposeError {
+    #[error("pid {pid} did not preload {}", library.display())]
+    NotPreloaded { pid: i32, library: PathBuf },
+    #[error("{}: expected an inspection, got {reply}", endpoint.display())]
+    NotAnInspection { endpoint: PathBuf, reply: String },
+}
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct Config {
@@ -188,7 +196,11 @@ fn check_loaded_libraries(config: &Config, pids: &[i32]) -> Result<()> {
                     loaded.display()
                 ),
                 None if name == FRONTEND_LIBRARY => {
-                    bail!("pid {pid} did not preload {}", loaded.display())
+                    return Err(CuinterposeError::NotPreloaded {
+                        pid,
+                        library: loaded,
+                    }
+                    .into());
                 }
                 None => {}
             }
@@ -231,10 +243,11 @@ pub fn inspect(socket_dir: &Path, pid: NamespacePid) -> Result<Vec<Record>> {
     );
     match response.result.map_err(anyhow::Error::msg)? {
         Reply::Inspection { records } => Ok(records),
-        other => bail!(
-            "{}: expected an inspection, got {other:?}",
-            endpoint.display()
-        ),
+        other => Err(CuinterposeError::NotAnInspection {
+            endpoint,
+            reply: format!("{other:?}"),
+        }
+        .into()),
     }
 }
 

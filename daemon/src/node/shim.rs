@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep};
@@ -12,6 +12,14 @@ use snapshotd_shim::{Reply, Request, SOCKET};
 pub struct Progress {
     pub started: bool,
     pub serving: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShimError {
+    #[error("the shim refused {request:?}: {reason}")]
+    Refused { request: Request, reason: String },
+    #[error("unexpected {reply:?}")]
+    Unexpected { reply: Reply },
 }
 
 pub struct ShimClient {
@@ -48,7 +56,7 @@ impl ShimClient {
             "the shim closed the connection"
         );
         match serde_json::from_str(&answer).context("parse the shim's reply")? {
-            Reply::Refused { reason } => bail!("the shim refused {request:?}: {reason}"),
+            Reply::Refused { reason } => Err(ShimError::Refused { request, reason }.into()),
             reply => Ok(reply),
         }
     }
@@ -56,21 +64,21 @@ impl ShimClient {
     async fn done(&mut self, request: Request) -> Result<()> {
         match self.call(request).await? {
             Reply::Done => Ok(()),
-            other => bail!("unexpected {other:?}"),
+            reply => Err(ShimError::Unexpected { reply }.into()),
         }
     }
 
     pub async fn progress(&mut self) -> Result<Progress> {
         match self.call(Request::State).await? {
             Reply::State { started, serving } => Ok(Progress { started, serving }),
-            other => bail!("unexpected {other:?}"),
+            reply => Err(ShimError::Unexpected { reply }.into()),
         }
     }
 
     pub async fn start(&mut self) -> Result<PodPid> {
         match self.call(Request::Start).await? {
             Reply::Started { pid } => Ok(PodPid(pid)),
-            other => bail!("unexpected {other:?}"),
+            reply => Err(ShimError::Unexpected { reply }.into()),
         }
     }
 

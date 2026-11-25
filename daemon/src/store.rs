@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -154,7 +154,10 @@ impl FromStr for RevisionKey {
     fn from_str(name: &str) -> Result<Self> {
         let parts: Vec<&str> = name.split('/').collect();
         let [namespace, workload, hash] = parts[..] else {
-            anyhow::bail!("{name:?} is not <namespace>/<workload>/<hash>");
+            return Err(StoreError::NotARevision {
+                name: name.to_string(),
+            }
+            .into());
         };
         Self::new(namespace, workload.parse()?, hash)
     }
@@ -164,6 +167,14 @@ impl fmt::Display for RevisionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}/{}", self.namespace, self.workload, self.hash)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("{name:?} is not <namespace>/<workload>/<hash>")]
+    NotARevision { name: String },
+    #[error("this node has no store class {name:?}")]
+    NoClass { name: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -445,7 +456,10 @@ impl Classes {
         let name = name.unwrap_or(DEFAULT_CLASS);
         match self.0.get(name) {
             Some(class) => Ok(class),
-            None => bail!("this node has no store class {name:?}"),
+            None => Err(StoreError::NoClass {
+                name: name.to_string(),
+            }
+            .into()),
         }
     }
 

@@ -26,7 +26,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use nixl_sys::{
     Agent, Backend, MemType, MemoryRegion, NixlRegistration, OptArgs, SystemStorage, XferDescList,
     XferOp, XferRequest,
@@ -39,6 +39,22 @@ use crate::image::{self, Arena, Extent, HugeRegion, Store, huge_page_fraction};
 use crate::store::ensure_room;
 use crate::trace::{self, FILE_TRACKS, Trace};
 use walkdir::WalkDir;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TransferError {
+    #[error("the receiver did not answer with Ready")]
+    NoReady,
+    #[error("the receiver did not answer with Stats")]
+    NoStats,
+    #[error("the sender did not start with Hello")]
+    NoHello,
+    #[error("the sender did not encrypt a chunk")]
+    Unencrypted,
+    #[error("an encrypted chunk and no key for it")]
+    NoKey,
+    #[error("unexpected {message}")]
+    Unexpected { message: String },
+}
 
 const BACKEND: &str = "UCX";
 const RECEIVER: &str = "snapshotd-receive";
@@ -377,7 +393,7 @@ pub fn send_over(
         huge_page_fraction,
     } = receive(&mut reader)?
     else {
-        bail!("the receiver did not answer with Ready");
+        return Err(TransferError::NoReady.into());
     };
     ensure!(
         slot_addresses.len() == pool.slots,
@@ -502,7 +518,7 @@ pub fn send_over(
         .recv()
         .context("the receiver closed before reporting")?
     else {
-        bail!("the receiver did not answer with Stats");
+        return Err(TransferError::NoStats.into());
     };
     let elapsed = start.elapsed().as_secs_f64();
     let workers = pool.slots as f64;
@@ -814,7 +830,7 @@ pub fn receive_over(
         files,
     } = receive(&mut reader)?
     else {
-        bail!("the sender did not start with Hello");
+        return Err(TransferError::NoHello.into());
     };
     ensure_room(dir, files.iter().map(|entry| entry.size).sum())?;
     let handles = files
@@ -883,8 +899,8 @@ pub fn receive_over(
                         let buffer = unsafe { slots.slice_mut(slot, job.len) };
                         match (key, tag) {
                             (Some(key), Some(tag)) => key.decrypt(&tag, job.place(), buffer)?,
-                            (Some(_), None) => bail!("the sender did not encrypt a chunk"),
-                            (None, Some(_)) => bail!("an encrypted chunk and no key for it"),
+                            (Some(_), None) => return Err(TransferError::Unencrypted.into()),
+                            (None, Some(_)) => return Err(TransferError::NoKey.into()),
                             (None, None) => {}
                         }
                         destination(job.file)?
@@ -957,7 +973,12 @@ pub fn receive_over(
                     handles.push(opened);
                 }
                 Message::Done => break,
-                other => bail!("unexpected {other:?}"),
+                other => {
+                    return Err(TransferError::Unexpected {
+                        message: format!("{other:?}"),
+                    }
+                    .into());
+                }
             }
         }
         drop(queues);
@@ -1032,7 +1053,7 @@ pub fn stream_capture(
         huge_page_fraction,
     } = receive(&mut reader)?
     else {
-        bail!("the receiver did not answer with Ready");
+        return Err(TransferError::NoReady.into());
     };
     ensure!(
         slot_addresses.len() == pool.slots,
@@ -1201,7 +1222,7 @@ pub fn stream_capture(
         .recv()
         .context("the receiver closed before reporting")?
     else {
-        bail!("the receiver did not answer with Stats");
+        return Err(TransferError::NoStats.into());
     };
     let elapsed = start.elapsed().as_secs_f64();
     let total = bytes.load(Ordering::Relaxed);

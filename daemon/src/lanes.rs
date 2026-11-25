@@ -85,7 +85,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
-    use anyhow::{anyhow, bail};
+    use anyhow::anyhow;
 
     use crate::lanes::Lanes;
 
@@ -120,7 +120,8 @@ mod tests {
         assert_eq!(made.load(Ordering::SeqCst), 0);
         assert_eq!(lanes.run(|resource: &usize| Ok(*resource)).unwrap(), 0);
         assert_eq!(lanes.run(|resource: &usize| Ok(*resource)).unwrap(), 0);
-        let failed = lanes.run(|_: &usize| -> anyhow::Result<()> { bail!("the peer went away") });
+        let failed =
+            lanes.run(|_: &usize| -> anyhow::Result<()> { Err(anyhow!("the peer went away")) });
         assert!(format!("{:#}", failed.unwrap_err()).contains("the peer went away"));
         assert_eq!(lanes.run(|resource: &usize| Ok(*resource)).unwrap(), 1);
         assert_eq!(made.load(Ordering::SeqCst), 2);

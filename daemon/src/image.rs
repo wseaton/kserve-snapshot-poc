@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use procfs::process::Process;
 use prost::Message;
 use rustix::mm::{Advice, MapFlags, ProtFlags};
@@ -530,7 +530,7 @@ pub fn hold(images_dir: &Path, segment_bytes: usize, reserve_bytes: usize) -> Re
 pub fn serve_forever(store: &Store, restores: &UnixListener) -> Result<()> {
     loop {
         if let Err(error) = serve(store, restores) {
-            bail!("serve a restore: {error:#}");
+            return Err(error.context("serve a restore"));
         }
     }
 }
