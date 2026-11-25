@@ -68,7 +68,7 @@ spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
   containers:
     - name: main
-      image: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint@sha256:b58cb17af4d87569ba5614bff26fb6c8a8d826f56ca05cfc056fc3d106fc4ee9
+      image: ghcr.io/wseaton/snapshotd/vllm-checkpoint@sha256:b58cb17af4d87569ba5614bff26fb6c8a8d826f56ca05cfc056fc3d106fc4ee9
       command: [sleep, infinity]
       resources:
         requests: {cpu: "1", memory: 1Gi, nvidia.com/gpu: "1"}

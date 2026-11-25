@@ -5,6 +5,9 @@ resources:
 components:
   - ../../components/images
 images:
+  - name: ghcr.io/wseaton/kserve-snapshot-poc/vllm-checkpoint
+    newName: ghcr.io/wseaton/snapshotd/vllm-checkpoint
+    digest: sha256:5557cde2aa31b25034c94cb4212472d2f9b7dd22ce82db33da12d6631b4880b0
   - name: ghcr.io/neuralmagic/kserve-dynamo-snapshot
     newName: quay.io/wseaton/kserve-dynamo-snapshot
     digest: sha256:77c68762fdbd7fce6784de14989f813cf0b418b52f8bec7d48522347a0dd012f
