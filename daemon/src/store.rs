@@ -5,6 +5,8 @@
 //! <class>/<namespace>/<workload>/<hash>/image/           the checkpoint; it appears whole, by rename
 //! <class>/<namespace>/<workload>/<hash>/incoming-<pod>/  a capture or a pull in progress
 //! <class>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
+//! <class>/<namespace>/<workload>/<hash>/stale-<pod>/     an image taken in another environment, being removed
+//! <class>/<namespace>/<workload>/<hash>/recaptured       the environment the image was last recaptured for
 //! <class>/<namespace>/<workload>/<hash>/used             touched when a pod of the revision starts
 //! ```
 //!
@@ -21,8 +23,11 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::node::environment::Environment;
+
 pub const DEFAULT_CLASS: &str = "default";
 const USED: &str = "used";
+const RECAPTURED: &str = "recaptured";
 
 /// Separates a workload's name from its role, and the role from the member.
 /// Label values contain neither.
@@ -371,10 +376,20 @@ pub fn directory_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+fn remove_tree(dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(dir) {
+        Err(error) if error.kind() != ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("remove {}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub struct RevisionStore {
     dir: PathBuf,
     staging: PathBuf,
     failure: PathBuf,
+    stale: PathBuf,
 }
 
 impl RevisionStore {
@@ -388,6 +403,7 @@ impl RevisionStore {
         Ok(Self {
             staging: dir.join(format!("incoming-{pod_uid}")),
             failure: dir.join(format!("failed-{pod_uid}")),
+            stale: dir.join(format!("stale-{pod_uid}")),
             dir,
         })
     }
@@ -405,12 +421,36 @@ impl RevisionStore {
     }
 
     pub fn clear_staging(&self) -> Result<()> {
-        match fs::remove_dir_all(&self.staging) {
-            Err(error) if error.kind() != ErrorKind::NotFound => {
-                Err(error).context("remove the unfinished image")
-            }
-            _ => Ok(()),
+        remove_tree(&self.staging).context("remove the unfinished image")
+    }
+
+    /// Take the image out of use by one rename, then delete it. An image
+    /// another pod retired first leaves nothing to do.
+    pub fn retire_image(&self) -> Result<()> {
+        remove_tree(&self.stale)?;
+        match fs::rename(self.image_dir(), &self.stale) {
+            Ok(()) => remove_tree(&self.stale).context("remove the stale image"),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("move the stale image aside"),
         }
+    }
+
+    /// The environment the image was last recaptured for, if it was.
+    pub fn recaptured_for(&self) -> Result<Option<Environment>> {
+        let path = self.dir.join(RECAPTURED);
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .with_context(|| format!("parse {}", path.display())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn record_recapture(&self, environment: &Environment) -> Result<()> {
+        let path = self.dir.join(RECAPTURED);
+        fs::write(&path, serde_json::to_vec_pretty(environment)?)
+            .with_context(|| format!("write {}", path.display()))
     }
 
     /// If another pod published first, that image stays and this one is dropped.
@@ -439,6 +479,7 @@ mod tests {
 
     use anyhow::anyhow;
 
+    use crate::node::environment::tests::{environment, with_driver};
     use crate::store::{
         Class, Classes, RevisionKey, RevisionStore, USED, Usage, Workload, directory_bytes,
         ensure_room, revisions,
@@ -841,6 +882,52 @@ mod tests {
             .unwrap();
         assert!(ours.failed_before() && open(&dir, "a").failed_before());
         assert!(!theirs.failed_before());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_retired_image_is_gone_and_a_second_retirement_is_harmless() {
+        let dir = scratch("retire");
+        let (ours, theirs) = (open(&dir, "a"), open(&dir, "b"));
+        fs::create_dir_all(ours.image_dir().join("img")).unwrap();
+        fs::write(ours.image_dir().join("img/pages-1.img"), "stale").unwrap();
+        fs::create_dir_all(dir.join("serving/qwen3-8b/7b9f694bf8/stale-a/old")).unwrap();
+        ours.retire_image().unwrap();
+        assert!(!ours.image_ready() && !theirs.image_ready());
+        let left: Vec<String> = fs::read_dir(dir.join("serving/qwen3-8b/7b9f694bf8"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, [USED], "only the used marker is left");
+        theirs.retire_image().unwrap();
+
+        fs::create_dir_all(ours.staging_dir()).unwrap();
+        fs::write(ours.staging_dir().join("inventory.img"), "fresh").unwrap();
+        ours.publish().unwrap();
+        assert_eq!(
+            fs::read_to_string(theirs.image_dir().join("inventory.img")).unwrap(),
+            "fresh",
+            "a recapture publishes where the stale image was"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_recapture_is_remembered_for_the_revision_on_this_node() {
+        let dir = scratch("recapture");
+        let (ours, theirs) = (open(&dir, "a"), open(&dir, "b"));
+        assert_eq!(ours.recaptured_for().unwrap(), None);
+        ours.record_recapture(&environment()).unwrap();
+        assert_eq!(theirs.recaptured_for().unwrap(), Some(environment()));
+        ours.record_recapture(&with_driver("590.1")).unwrap();
+        assert_eq!(theirs.recaptured_for().unwrap(), Some(with_driver("590.1")));
+        assert_eq!(
+            revisions(&dir).len(),
+            1,
+            "the marker is not mistaken for a revision"
+        );
+        fs::write(dir.join("serving/qwen3-8b/7b9f694bf8/recaptured"), "{").unwrap();
+        assert!(theirs.recaptured_for().is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

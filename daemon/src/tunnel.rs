@@ -30,6 +30,7 @@ use tokio_openssl::SslStream;
 use tracing::{Instrument, debug, warn};
 
 use crate::encrypt::TransferKey;
+use crate::node::environment::Environment;
 use crate::store::RevisionKey;
 use crate::topology::Place;
 
@@ -57,6 +58,10 @@ pub struct Status {
     /// Transfers the daemon could start now.
     pub free_lanes: usize,
     pub place: Place,
+    /// The environment the held checkpoint was taken in. `None` when the
+    /// checkpoint records none or the daemon is older than this field.
+    #[serde(default)]
+    pub environment: Option<Environment>,
 }
 
 pub trait Holder: Send + Sync + 'static {
@@ -377,6 +382,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_openssl::SslStream;
 
+    use crate::node::environment::tests::environment;
     use crate::store::RevisionKey;
     use crate::topology::Place;
     use crate::tunnel::{
@@ -487,6 +493,7 @@ mod tests {
                 held: name != "serving/qwen/other",
                 free_lanes: usize::from(name == "serving/qwen/held"),
                 place: place(),
+                environment: (name == "serving/qwen/held").then(environment),
             }
         }
 
@@ -707,6 +714,7 @@ mod tests {
                 held,
                 free_lanes,
                 place: place(),
+                environment: (name == "serving/qwen/held").then(environment),
             };
             assert_eq!(status, wanted, "{name}");
         }
@@ -714,6 +722,15 @@ mod tests {
         let held = revision("serving/qwen/held");
         assert!(inquire(untrusted, &identity, &held).await.is_err());
         assert_eq!(daemon.admitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_status_from_a_daemon_without_environments_has_none() {
+        let older = r#"{"held": true, "free_lanes": 2, "place": []}"#;
+        let status: Status = serde_json::from_str(older).unwrap();
+        assert!(status.held);
+        assert_eq!(status.free_lanes, 2);
+        assert_eq!(status.environment, None);
     }
 
     #[test]

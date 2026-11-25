@@ -14,6 +14,7 @@
 //! restore     verify library hashes ─► CRIU restore ─► cuda restore+unlock ─► coordinator --restore
 //! ```
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -57,7 +58,7 @@ impl Config {
 pub struct Sha256Digest(#[serde(with = "hex_digest")] [u8; 32]);
 
 impl Sha256Digest {
-    fn of_file(path: &Path) -> Result<Self> {
+    pub fn of_file(path: &Path) -> Result<Self> {
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         ensure!(
             file.metadata()?.is_file(),
@@ -72,6 +73,12 @@ impl Sha256Digest {
             .try_into()
             .context("SHA-256 digest is not 32 bytes")?;
         Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
     }
 }
 

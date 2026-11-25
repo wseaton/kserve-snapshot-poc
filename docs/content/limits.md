@@ -44,9 +44,19 @@ Each gap below is the current behavior, then what is missing.
 
 - The revision key is `pod-template-hash`. It misses model files changed in place, images by tag
   and a recreated Deployment.
-- GPU model, driver, kernel and CPU features are not recorded or checked before a restore.
+- A checkpoint records the node's NVIDIA driver version, GPU models and compute capabilities,
+  SHA-256 digests of CRIU and the cuInterpose libraries, the kernel release and the daemon
+  version. Before a restore the driver, GPU models and tool digests must match the node's. If
+  they do not, the daemon removes the checkpoint, logs why, and the pod captures a new one. A
+  revision is recaptured at most once per node environment; if the new checkpoint still does
+  not match, later pods cold boot. Checkpoints taken before the environment was recorded are
+  replaced the same way. A peer is not asked for a checkpoint whose environment does not match
+  the asking node.
+- A different kernel release is logged and the restore goes ahead. CPU features and the shim
+  version are not recorded. The daemon version is recorded but not compared.
 - A failed restore is remembered for that pod only; the next pod tries the same checkpoint.
-- The shim, daemon, CRIU and cuInterpose versions are not pinned to the checkpoint.
+- A stale checkpoint is replaced by a capture on this node. A matching checkpoint on a peer is
+  not pulled in its place.
 
 **Placement**
 
