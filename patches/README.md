@@ -38,7 +38,8 @@ patches.
   any background setup, unregisters the offload region and frees its pages, and
   `/checkpoint/restore` sets it up again, in the background under `async_init`. The checkpoint does
   not grow by the region size. Workers sharing the replicated layout's one region meet at a
-  barrier before freeing it; per-rank regions do not. The tiering spec refuses to prepare.
+  barrier before freeing it; per-rank regions do not. The tiering spec frees its region the same
+  way when it has no secondary tiers, and refuses to prepare when it has them.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by
