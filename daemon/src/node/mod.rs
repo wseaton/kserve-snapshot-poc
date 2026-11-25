@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use crate::access::{self, AccessError, Subject, Verdict};
+use crate::access::{self, AccessError, Read, Subject, Verdict};
 use crate::cri::{Runtime, Sandbox};
 use crate::cuda::Gpu;
 use crate::metrics::{self, How, Metrics, Step};
@@ -462,7 +462,7 @@ async fn may_read(
 ) -> Result<Verdict, AccessError> {
     let api = node.api.as_ref().ok_or(AccessError::NoClient)?;
     let subject = Subject::service_account(&identity.namespace, &identity.service_account);
-    access::may_read(api, &subject, revision).await
+    access::may_read(api, &subject, revision, Read::Restore).await
 }
 
 /// Why the pod may not read `revision`, if it may not.

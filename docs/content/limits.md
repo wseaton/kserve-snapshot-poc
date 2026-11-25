@@ -39,8 +39,8 @@ Each gap below is the current behavior, then what is missing.
   namespace. Missing: admission policy that pins a pod's controller reference and ServiceAccount.
   Checkpoints taken before captures were attested restore into any pod of the revision.
 - Every daemon runs as one ServiceAccount, and pulls a namespace's checkpoints only if that
-  ServiceAccount may `get` `checkpoints.snapshot.llm-d.ai` there; the grant cannot name single
-  workloads. Missing: per-node identity, NetworkPolicy on the proxy and NIXL ports.
+  ServiceAccount may `get` `checkpoints/transfer` in `snapshot.llm-d.ai` there; the grant cannot
+  name single workloads. Missing: per-node identity, NetworkPolicy on the proxy and NIXL ports.
 - Checkpoints are unencrypted process memory (credentials, request data) on the node's disk.
 - Every labelled pod is tried. Missing: refusing multi-node workers, runtime LoRA and cache-aware
   routing before paying for a failed checkpoint.

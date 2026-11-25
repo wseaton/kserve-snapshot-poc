@@ -11,6 +11,9 @@
 //!     resourceNames: [qwen3-8b]   # optional: one workload only
 //!     verbs: [get]
 //! ```
+//!
+//! Restoring a checkpoint into a pod is `get` on `checkpoints`; sending it to
+//! another node's daemon is `get` on `checkpoints/transfer`.
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec, SubjectAccessReviewStatus,
 };
@@ -21,6 +24,25 @@ use crate::store::RevisionKey;
 pub const GROUP: &str = "snapshot.llm-d.ai";
 pub const RESOURCE: &str = "checkpoints";
 const VERB: &str = "get";
+pub const TRANSFER: &str = "transfer";
+
+/// What a checkpoint is read for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// Into a pod of this node.
+    Restore,
+    /// By another node's daemon.
+    Transfer,
+}
+
+impl Read {
+    fn subresource(self) -> Option<&'static str> {
+        match self {
+            Self::Restore => None,
+            Self::Transfer => Some(TRANSFER),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccessError {
@@ -62,8 +84,8 @@ pub enum Verdict {
     Denied(String),
 }
 
-/// The review that asks whether `subject` may read `revision`.
-pub fn review(subject: &Subject, revision: &RevisionKey) -> SubjectAccessReview {
+/// The review that asks whether `subject` may read `revision` for `read`.
+pub fn review(subject: &Subject, revision: &RevisionKey, read: Read) -> SubjectAccessReview {
     SubjectAccessReview {
         spec: SubjectAccessReviewSpec {
             user: Some(subject.user.clone()),
@@ -71,6 +93,7 @@ pub fn review(subject: &Subject, revision: &RevisionKey) -> SubjectAccessReview 
             resource_attributes: Some(ResourceAttributes {
                 group: Some(GROUP.to_string()),
                 resource: Some(RESOURCE.to_string()),
+                subresource: read.subresource().map(str::to_string),
                 verb: Some(VERB.to_string()),
                 namespace: Some(revision.namespace().to_string()),
                 name: Some(revision.workload().name().to_string()),
@@ -100,15 +123,16 @@ pub fn verdict(status: Option<SubjectAccessReviewStatus>) -> Verdict {
     })
 }
 
-/// Whether `subject` may read `revision`. An error means the API server
-/// could not be asked, which callers treat as a denial.
+/// Whether `subject` may read `revision` for `read`. An error means the API
+/// server could not be asked, which callers treat as a denial.
 pub async fn may_read(
     client: &kube::Client,
     subject: &Subject,
     revision: &RevisionKey,
+    read: Read,
 ) -> Result<Verdict, AccessError> {
     let answered = Api::<SubjectAccessReview>::all(client.clone())
-        .create(&PostParams::default(), &review(subject, revision))
+        .create(&PostParams::default(), &review(subject, revision, read))
         .await
         .map_err(|source| AccessError::Review {
             user: subject.user.clone(),
@@ -122,7 +146,7 @@ pub async fn may_read(
 mod tests {
     use k8s_openapi::api::authorization::v1::{ResourceAttributes, SubjectAccessReviewStatus};
 
-    use crate::access::{Subject, Verdict, review, verdict};
+    use crate::access::{Read, Subject, Verdict, review, verdict};
     use crate::store::RevisionKey;
 
     #[test]
@@ -138,7 +162,7 @@ mod tests {
             ]
         );
         let revision: RevisionKey = "serving/qwen3-8b@prefill+0/7b9f694bf8".parse().unwrap();
-        let spec = review(&subject, &revision).spec;
+        let spec = review(&subject, &revision, Read::Restore).spec;
         assert_eq!(spec.user.as_deref(), Some(subject.user.as_str()));
         assert_eq!(spec.groups.as_ref(), Some(&subject.groups));
         assert_eq!(spec.non_resource_attributes, None);
@@ -153,6 +177,24 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn a_transfer_to_another_node_is_its_own_subresource() {
+        let subject = Subject::service_account("snapshotd", "snapshotd");
+        let revision: RevisionKey = "serving/qwen3-8b/7b9f694bf8".parse().unwrap();
+        let attributes = |read| {
+            review(&subject, &revision, read)
+                .spec
+                .resource_attributes
+                .unwrap()
+        };
+        assert_eq!(attributes(Read::Restore).subresource, None);
+        let transfer = attributes(Read::Transfer);
+        assert_eq!(transfer.subresource.as_deref(), Some("transfer"));
+        assert_eq!(transfer.resource.as_deref(), Some("checkpoints"));
+        assert_eq!(transfer.namespace.as_deref(), Some("serving"));
+        assert_eq!(transfer.name.as_deref(), Some("qwen3-8b"));
     }
 
     #[test]

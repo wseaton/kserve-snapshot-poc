@@ -11,4 +11,5 @@ data:
       resourceAttributes:
         apiGroup: snapshot.llm-d.ai
         resource: checkpoints
+        subresource: transfer
         namespace: "{{ .Value }}"

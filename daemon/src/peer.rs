@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
-use crate::access::{self, AccessError, Subject, Verdict};
+use crate::access::{self, AccessError, Read, Subject, Verdict};
 use crate::lanes::Lanes;
 use crate::link;
 use crate::store::{Attestation, Classes, Principal, RevisionKey, RevisionStore, directory_bytes};
@@ -225,7 +225,7 @@ impl Holder for Peers {
         let (api, caller, revision) = (self.api.clone(), caller.clone(), revision.clone());
         async move {
             let api = api.ok_or(AccessError::NoClient)?;
-            access::may_read(&api, &caller, &revision).await
+            access::may_read(&api, &caller, &revision, Read::Transfer).await
         }
     }
 

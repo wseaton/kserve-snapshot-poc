@@ -12,10 +12,10 @@
 //! ```
 //!
 //! The proxy authenticates the asker, checks that it may `get`
-//! `checkpoints.snapshot.llm-d.ai` in the `namespace` of the query, and
-//! passes the asker's user and groups on in headers. The daemon checks the
-//! query names the path's namespace and asks the API server the same
-//! question itself (see [`crate::access`]).
+//! `checkpoints/transfer` in `snapshot.llm-d.ai` in the `namespace` of the
+//! query, and passes the asker's user and groups on in headers. The daemon
+//! checks the query names the path's namespace and asks the API server the
+//! same question itself (see [`crate::access`]).
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;

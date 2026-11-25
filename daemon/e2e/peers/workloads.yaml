@@ -142,7 +142,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: snapshotd-checkpoint-reader
+  name: snapshotd-checkpoint-transfer
 subjects:
   - kind: ServiceAccount
     name: snapshotd
