@@ -34,6 +34,15 @@ pods are labelled `<service name>-prefill`. [`qwen3-8b-pd/`](qwen3-8b-pd) is an 
 - The daemon on every GPU node the service may land on: `kubectl apply -k deploy/snapshotd/node`.
   It needs cert-manager. A replica on a node without the daemon cold boots after 30 s and is
   never checkpointed.
+- RBAC that lets the service's pods read their checkpoints. The daemon restores a pod only if its
+  ServiceAccount may `get` `checkpoints.snapshot.llm-d.ai` in the namespace, and nothing grants
+  that by default; without it every replica cold boots. To let every pod of a namespace restore:
+
+  ```bash
+  kubectl -n <namespace> create rolebinding snapshotd-checkpoint-reader \
+    --clusterrole=snapshotd-checkpoint-reader --group=system:serviceaccounts:<namespace>
+  ```
+
 - The model on a volume (`pvc://`). The checkpoint does not hold the weights; a restored server
   reads them again from `/mnt/models`. Other storage schemes have not been run.
 - The two images the layer names, pinned by [`deploy/components/images`](../../components/images):
@@ -74,7 +83,7 @@ Each step is a Kubernetes strategic merge. Three consequences shaped the layer:
 
 | Field | Value | Why |
 | --- | --- | --- |
-| `spec.labels` | `snapshot.llm-d.ai/workload: <service name>` | The daemon handles pods that carry this label. Its value, the namespace and the pod's `pod-template-hash` name the checkpoint |
+| `spec.labels` | `snapshot.llm-d.ai/workload: <service name>` | The daemon handles pods that carry this label. The checkpoint is named after the Deployment KServe creates from the template (for example `qwen3-8b-kserve`), the namespace and the pod's `pod-template-hash`. The label's value names it only for a pod that no controller owns |
 | init container `snapshot-tools` | copies `snapshotd-shim` and `noiouring.py` into an `emptyDir` | The shim has to be PID 1 of the server's container, and the vLLM image does not contain it |
 | `main` command | `snapshotd-shim -- bash -c 'exec … vllm serve …'` | The shim starts the server when the daemon says to, or leaves room for a restored one |
 | `LD_PRELOAD`, in the command | `/run/snapshotd/tools/cuinterpose/libcuinterpose.so` | The library that lets workers which share GPU memory be checkpointed. The daemon mounts it into the pod before the server starts |

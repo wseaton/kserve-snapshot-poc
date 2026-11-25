@@ -2,6 +2,7 @@
 //!
 //! `node` is the daemon. The other subcommands are its building blocks,
 //! usable on their own from a privileged container.
+mod access;
 mod cri;
 mod cuda;
 mod cuinterpose;

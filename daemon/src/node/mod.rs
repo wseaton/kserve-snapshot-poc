@@ -8,7 +8,13 @@
 //!           cold boot, checkpoint, restore ─────────────────────────────► serving
 //!           cold boot (no room, or it failed here before) ──────────────► serving
 //! ```
+//!
+//! The revision is named after the controller that owns the pod's template,
+//! read from the API server, and a pod restores it only if its
+//! ServiceAccount may `get` it (see [`crate::access`]) and the image was
+//! captured by a pod of the same controller.
 mod criu;
+mod identity;
 mod layout;
 mod manifest;
 mod pod;
@@ -28,8 +34,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use crate::access::{self, AccessError, Subject, Verdict};
 use crate::cri::{Runtime, Sandbox};
+use crate::cuda::Gpu;
 use crate::metrics::{self, How, Metrics, Step};
+use crate::node::identity::{IdentityError, PodIdentity};
 use crate::node::manifest::Manifest;
 use crate::node::pod::Pod;
 use crate::node::process::{HostPid, PodPid};
@@ -40,7 +49,9 @@ use crate::peer::{self, Peers};
 use crate::podresources;
 #[cfg(feature = "nixl")]
 use crate::store::directory_bytes;
-use crate::store::{Class, Classes, RevisionKey, RevisionStore, Workload};
+use crate::store::{
+    Attestation, Class, Classes, Owner, Published, RevisionKey, RevisionStore, Workload,
+};
 use crate::timeslice;
 use crate::vllm::{Control, Endpoint, Lifecycle, Transport};
 
@@ -186,6 +197,9 @@ pub struct Args {
 struct Node {
     args: Args,
     classes: Classes,
+    /// `None` when the daemon could not configure a client, and every pod
+    /// cold boots.
+    api: Option<kube::Client>,
     metrics: Arc<Metrics>,
     #[cfg(feature = "nixl")]
     peers: Option<Arc<Peers>>,
@@ -211,15 +225,34 @@ enum Image {
     Absent,
     Usable,
     Unusable(String),
+    /// Captured by a pod of another principal, named here.
+    Foreign(String),
 }
 
 impl Image {
-    fn of(store: &RevisionStore, pod: &Pod) -> Result<Self> {
+    /// `ours` is what this pod would attest to if it captured the image.
+    fn of(store: &RevisionStore, gpus: &[Gpu], ours: &Attestation) -> Result<Self> {
         if !store.image_ready() {
             return Ok(Self::Absent);
         }
         let image = store.image_dir();
-        Ok(match Manifest::load(&image)?.refusal(&image, pod.gpus())? {
+        let manifest = Manifest::load(&image)?;
+        match &manifest.attestation {
+            Some(by) if !by.same_principal(ours) => {
+                warn!(
+                    security = "foreign-checkpoint",
+                    revision = %ours.revision,
+                    pod = %format_args!("{}/{}", ours.namespace, ours.pod),
+                    captured_by = %by,
+                    pod_is = %ours,
+                    "refused the pod a checkpoint of its revision that another principal captured"
+                );
+                return Ok(Self::Foreign(by.to_string()));
+            }
+            Some(_) => {}
+            None => info!("the checkpoint predates attestation; it is restored as owned by no one"),
+        }
+        Ok(match manifest.refusal(&image, gpus)? {
             Some(reason) => Self::Unusable(reason),
             None => Self::Usable,
         })
@@ -243,6 +276,10 @@ impl Plan {
             (Image::Usable, _) => Self::Restore,
             (Image::Unusable(reason), _) => Self::ColdBoot(format!(
                 "the node's checkpoint cannot be restored into it: {reason}"
+            )),
+            (Image::Foreign(by), _) => Self::ColdBoot(format!(
+                "the node's checkpoint of the revision was captured by {by}, \
+                 which is not the pod's controller"
             )),
             (Image::Absent, Ok(())) => Self::Capture,
             (Image::Absent, Err(error)) => Self::ColdBoot(format!("{error:#}")),
@@ -342,11 +379,16 @@ struct Labels<'a> {
 }
 
 impl Labels<'_> {
-    fn workload(&self, sandbox: &Sandbox) -> Result<Workload> {
-        let name = sandbox
-            .labels
-            .get(self.workload)
-            .context("the opt-in label is gone")?;
+    /// Named after `owner`, or after the opt-in label for a pod that no
+    /// controller owns.
+    fn workload(&self, sandbox: &Sandbox, owner: Option<&Owner>) -> Result<Workload> {
+        let name = match owner {
+            Some(owner) => &owner.name,
+            None => sandbox
+                .labels
+                .get(self.workload)
+                .context("the opt-in label is gone")?,
+        };
         let role = configured(self.role)
             .and_then(|label| sandbox.labels.get(label))
             .map(String::as_str);
@@ -378,7 +420,7 @@ impl Labels<'_> {
             .with_context(|| format!("{label} is {member:?}, not a pod index"))
     }
 
-    fn revision_of(&self, sandbox: &Sandbox) -> Result<RevisionKey> {
+    fn revision_of(&self, sandbox: &Sandbox, owner: Option<&Owner>) -> Result<RevisionKey> {
         let hash = self
             .revision
             .iter()
@@ -389,17 +431,16 @@ impl Labels<'_> {
                     self.revision.join(", ")
                 )
             })?;
-        RevisionKey::new(&sandbox.namespace, self.workload(sandbox)?, hash)
+        RevisionKey::new(&sandbox.namespace, self.workload(sandbox, owner)?, hash)
     }
 
     /// The workload as metrics name it, which is how the store names it.
-    fn workload_of(&self, sandbox: &Sandbox) -> String {
-        match self.workload(sandbox) {
+    fn workload_of(&self, sandbox: &Sandbox, owner: Option<&Owner>) -> String {
+        match self.workload(sandbox, owner) {
             Ok(workload) => workload.to_string(),
-            Err(_) => sandbox
-                .labels
-                .get(self.workload)
-                .cloned()
+            Err(_) => owner
+                .map(|owner| owner.name.clone())
+                .or_else(|| sandbox.labels.get(self.workload).cloned())
                 .unwrap_or_default(),
         }
     }
@@ -407,6 +448,53 @@ impl Labels<'_> {
 
 fn configured(label: &str) -> Option<&str> {
     (!label.is_empty()).then_some(label)
+}
+
+async fn identify(node: &Node, sandbox: &Sandbox) -> Result<PodIdentity, IdentityError> {
+    let api = node.api.as_ref().ok_or(IdentityError::NoClient)?;
+    PodIdentity::of(api, sandbox).await
+}
+
+async fn may_read(
+    node: &Node,
+    identity: &PodIdentity,
+    revision: &RevisionKey,
+) -> Result<Verdict, AccessError> {
+    let api = node.api.as_ref().ok_or(AccessError::NoClient)?;
+    let subject = Subject::service_account(&identity.namespace, &identity.service_account);
+    access::may_read(api, &subject, revision).await
+}
+
+/// Why the pod may not read `revision`, if it may not.
+fn refusal(
+    asked: Result<Verdict, AccessError>,
+    identity: &PodIdentity,
+    revision: &RevisionKey,
+) -> Option<String> {
+    match asked {
+        Ok(Verdict::Allowed) => None,
+        Ok(Verdict::Denied(why)) => {
+            warn!(
+                security = "checkpoint-access-denied",
+                %revision,
+                pod = %format_args!("{}/{}", identity.namespace, identity.name),
+                service_account = %identity.service_account,
+                why,
+                "the pod may not read its revision's checkpoint"
+            );
+            Some(format!(
+                "ServiceAccount {} may not get checkpoints.{} {} in {}: {why}",
+                identity.service_account,
+                access::GROUP,
+                revision.workload().name(),
+                revision.namespace()
+            ))
+        }
+        Err(error) => Some(format!(
+            "could not ask whether the pod may read its checkpoint: {:#}",
+            anyhow::Error::from(error)
+        )),
+    }
 }
 
 #[cfg(feature = "nixl")]
@@ -482,6 +570,7 @@ async fn bring_up(
     sandbox: &Sandbox,
     pod: &Pod,
     shim: &mut ShimClient,
+    identity: Result<PodIdentity, IdentityError>,
 ) -> Result<Served> {
     let args = &node.args;
     info!(
@@ -494,11 +583,29 @@ async fn bring_up(
         "new pod"
     );
     pod.mount_tools().await?;
-    let revision = match args.labels().revision_of(sandbox) {
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            let because = format!(
+                "could not tell which controller the pod belongs to: {:#}",
+                anyhow::Error::from(error)
+            );
+            return cold_boot_only(node, pod, shim, because).await;
+        }
+    };
+    let revision = match args.labels().revision_of(sandbox, identity.owner.as_ref()) {
         Ok(revision) => revision,
         Err(error) => return cold_boot_only(node, pod, shim, format!("{error:#}")).await,
     };
-    info!(%revision, "keyed the pod's revision");
+    info!(
+        %revision,
+        owner = %identity
+            .owner
+            .as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string),
+        service_account = %identity.service_account,
+        "keyed the pod's revision"
+    );
     let named = sandbox.annotations.get(&args.class_annotation);
     let class = match node.classes.get(named.map(String::as_str)) {
         Ok(class) => class,
@@ -510,6 +617,11 @@ async fn bring_up(
         );
         return cold_boot_only(node, pod, shim, because).await;
     }
+    let asked = may_read(node, &identity, &revision).await;
+    if let Some(because) = refusal(asked, &identity, &revision) {
+        return cold_boot_only(node, pod, shim, because).await;
+    }
+    let ours = identity.attestation(&revision);
     let store = RevisionStore::open(&class.dir, &revision, &sandbox.uid)?;
     #[cfg(feature = "nixl")]
     if let Some(peers) = &node.peers {
@@ -525,7 +637,7 @@ async fn bring_up(
     }
     let plan = Plan::choose(
         store.failed_before(),
-        Image::of(&store, pod)?,
+        Image::of(&store, pod.gpus(), &ours)?,
         class.room(&revision),
     );
     match plan {
@@ -545,7 +657,8 @@ async fn bring_up(
             let staging = store.staging_dir();
             let cycled = async {
                 let asked = Instant::now();
-                pod.checkpoint(control, shim, server, staging).await?;
+                pod.checkpoint(control, shim, server, staging, &ours)
+                    .await?;
                 node.metrics.stepped(Step::Checkpoint, asked.elapsed());
                 let asked = Instant::now();
                 let restored = pod.restore(staging).await?;
@@ -554,8 +667,17 @@ async fn bring_up(
             }
             .await;
             adopt_or_give_up(cycled, pod, &store, shim).await?;
-            store.publish()?;
-            info!(image = %store.image_dir().display(), "checkpoint published on this node");
+            match store.publish()? {
+                Published::Ours => info!(
+                    image = %store.image_dir().display(),
+                    "checkpoint published on this node"
+                ),
+                Published::Kept => info!(
+                    image = %store.image_dir().display(),
+                    "another pod of the workload published first; its checkpoint stays"
+                ),
+                Published::Collided(_) => {}
+            }
             Ok(Served::Captured)
         }
     }
@@ -587,29 +709,35 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
     .await?;
     let control = args.control(sandbox, runtime.address(sandbox).await?);
     let pod = Pod::new(init, control, &args.pod, &allotted)?;
-    let served = if progress.started {
+    let (served, owner) = if progress.started {
         info!("the server was started before this daemon; waiting for it to run");
         let boot = Duration::from_secs(args.boot_timeout_s);
         let (control, state) = Control::connect_when_up(pod.control(), boot).await?;
         if state == Lifecycle::Prepared {
             pod.resume(control).await?;
         }
-        Served::StartedEarlier
+        (Served::StartedEarlier, None)
     } else {
-        bring_up(node, sandbox, &pod, &mut shim).await?
+        let identity = identify(node, sandbox).await;
+        let owner = identity
+            .as_ref()
+            .ok()
+            .and_then(|identity| identity.owner.clone());
+        let served = bring_up(node, sandbox, &pod, &mut shim, identity).await?;
+        (served, owner)
     };
     shim.serving().await?;
     info!(seconds = %seconds(seen), how = %served, "serving");
     node.metrics.served(
         &sandbox.namespace,
-        &workload_of(node, sandbox),
+        &workload_of(node, sandbox, owner.as_ref()),
         served.how(),
     );
     Ok(())
 }
 
-fn workload_of(node: &Node, sandbox: &Sandbox) -> String {
-    node.args.labels().workload_of(sandbox)
+fn workload_of(node: &Node, sandbox: &Sandbox, owner: Option<&Owner>) -> String {
+    node.args.labels().workload_of(sandbox, owner)
 }
 
 /// Remove what is past its retention and measure what is left.
@@ -659,7 +787,7 @@ fn watch(node: Arc<Node>, sandbox: Sandbox) -> JoinHandle<()> {
                     "gave up on this pod for now"
                 );
                 node.metrics
-                    .failed(&sandbox.namespace, &workload_of(&node, &sandbox));
+                    .failed(&sandbox.namespace, &workload_of(&node, &sandbox, None));
                 sleep(Duration::from_secs(node.args.retry_s)).await;
             }
         }
@@ -684,7 +812,18 @@ async fn serve(args: Args) -> Result<()> {
     );
     let metrics = Arc::new(Metrics::default());
     metrics::start(args.metrics_listen, Arc::clone(&metrics)).await?;
+    let api = match kube::Client::try_default().await {
+        Ok(api) => Some(api),
+        Err(error) => {
+            warn!(
+                %error,
+                "no Kubernetes API client; every pod cold boots without a checkpoint"
+            );
+            None
+        }
+    };
     let node = Arc::new(Node {
+        api,
         #[cfg(feature = "nixl")]
         peers: Peers::start(&args.peers, classes.clone()).await?,
         classes,
@@ -746,16 +885,23 @@ pub fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::io::{self, Write};
     use std::net::{IpAddr, SocketAddr};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use anyhow::anyhow;
     use clap::Parser;
     use tracing_subscriber::fmt::MakeWriter;
 
+    use crate::access::{AccessError, Verdict};
     use crate::cri::Sandbox;
-    use crate::node::{Args, Image, Labels, Plan};
+    use crate::node::identity::PodIdentity;
+    use crate::node::manifest::Manifest;
+    use crate::node::process::PodPid;
+    use crate::node::{Args, Image, Labels, Plan, refusal};
+    use crate::store::{Attestation, Owner, RevisionKey, RevisionStore};
     use crate::vllm::{Endpoint, Transport};
 
     fn sandbox(labels: &[(&str, &str)]) -> Sandbox {
@@ -936,22 +1082,22 @@ mod tests {
                 ("leaderworkerset.sigs.k8s.io/template-revision-hash", "aa11"),
             ])
         };
-        let prefill = labels.revision_of(&pod("prefill", "0")).unwrap();
-        let decode = labels.revision_of(&pod("decode", "0")).unwrap();
+        let prefill = labels.revision_of(&pod("prefill", "0"), None).unwrap();
+        let decode = labels.revision_of(&pod("decode", "0"), None).unwrap();
         assert_eq!(prefill.to_string(), "serving/qwen@prefill/6f9b7c");
         assert_eq!(decode.to_string(), "serving/qwen@decode/6f9b7c");
         assert_eq!(
-            labels.revision_of(&pod("prefill", "3")).unwrap(),
+            labels.revision_of(&pod("prefill", "3"), None).unwrap(),
             prefill,
             "slices are copies of one template and share its checkpoint"
         );
         assert_eq!(
-            labels.workload_of(&pod("decode", "0")),
+            labels.workload_of(&pod("decode", "0"), None),
             decode.workload().to_string()
         );
 
         let next = sandbox(&[WORKLOAD, (DS_REVISION, "0c41e2"), (DS_ROLE, "prefill")]);
-        assert_ne!(labels.revision_of(&next).unwrap(), prefill);
+        assert_ne!(labels.revision_of(&next, None).unwrap(), prefill);
     }
 
     #[test]
@@ -960,10 +1106,10 @@ mod tests {
         let labels = args.labels();
         let pod = sandbox(&[WORKLOAD, ("pod-template-hash", "7b9f694bf8")]);
         assert_eq!(
-            labels.revision_of(&pod).unwrap().to_string(),
+            labels.revision_of(&pod, None).unwrap().to_string(),
             "serving/qwen/7b9f694bf8"
         );
-        assert_eq!(labels.workload_of(&pod), "qwen");
+        assert_eq!(labels.workload_of(&pod, None), "qwen");
 
         let both = sandbox(&[
             WORKLOAD,
@@ -971,7 +1117,7 @@ mod tests {
             (DS_REVISION, "6f9b7c"),
         ]);
         assert_eq!(
-            labels.revision_of(&both).unwrap().to_string(),
+            labels.revision_of(&both, None).unwrap().to_string(),
             "serving/qwen/6f9b7c",
             "the first listed revision label wins"
         );
@@ -982,7 +1128,7 @@ mod tests {
         let args = defaults();
         let labels = args.labels();
         let error = labels
-            .revision_of(&sandbox(&[WORKLOAD, (DS_ROLE, "prefill")]))
+            .revision_of(&sandbox(&[WORKLOAD, (DS_ROLE, "prefill")]), None)
             .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -990,16 +1136,15 @@ mod tests {
         );
         assert!(
             labels
-                .revision_of(&sandbox(&[(DS_REVISION, "6f9b7c")]))
+                .revision_of(&sandbox(&[(DS_REVISION, "6f9b7c")]), None)
                 .is_err()
         );
         assert!(
             labels
-                .revision_of(&sandbox(&[
-                    WORKLOAD,
-                    (DS_REVISION, "6f9b7c"),
-                    (DS_ROLE, "")
-                ]))
+                .revision_of(
+                    &sandbox(&[WORKLOAD, (DS_REVISION, "6f9b7c"), (DS_ROLE, "")]),
+                    None
+                )
                 .is_err()
         );
     }
@@ -1020,18 +1165,18 @@ mod tests {
                 size,
             )
         };
-        let leader = labels.revision_of(&pod("0", "0", Some("2"))).unwrap();
-        let worker = labels.revision_of(&pod("1", "0", Some("2"))).unwrap();
+        let leader = labels.revision_of(&pod("0", "0", Some("2")), None).unwrap();
+        let worker = labels.revision_of(&pod("1", "0", Some("2")), None).unwrap();
         assert_eq!(leader.to_string(), "serving/qwen@decode+0/6f9b7c");
         assert_eq!(worker.to_string(), "serving/qwen@decode+1/6f9b7c");
         assert_eq!(worker.workload().member(), Some(1));
         assert_eq!(
-            labels.revision_of(&pod("1", "5", Some("2"))).unwrap(),
+            labels.revision_of(&pod("1", "5", Some("2")), None).unwrap(),
             worker,
             "groups are copies of one template and share their members' checkpoints"
         );
         for single in [Some("1"), None] {
-            let whole = labels.revision_of(&pod("0", "0", single)).unwrap();
+            let whole = labels.revision_of(&pod("0", "0", single), None).unwrap();
             assert_eq!(whole.to_string(), "serving/qwen@decode/6f9b7c");
             assert_eq!(whole.workload().member(), None);
         }
@@ -1048,7 +1193,7 @@ mod tests {
             ),
         ] {
             let error = labels
-                .revision_of(&pod(member, "0", Some(size)))
+                .revision_of(&pod(member, "0", Some(size)), None)
                 .unwrap_err();
             assert_eq!(error.to_string(), wanted);
         }
@@ -1057,13 +1202,16 @@ mod tests {
             Some("4"),
         );
         assert_eq!(
-            labels.revision_of(&lws).unwrap().to_string(),
+            labels.revision_of(&lws, None).unwrap().to_string(),
             "serving/qwen+3/5b6d",
             "a LeaderWorkerSet outside a DisaggregatedSet is keyed by its own revision"
         );
         let unlabelled = grouped(&[WORKLOAD, (DS_REVISION, "6f9b7c")], Some("4"));
         assert_eq!(
-            labels.revision_of(&unlabelled).unwrap_err().to_string(),
+            labels
+                .revision_of(&unlabelled, None)
+                .unwrap_err()
+                .to_string(),
             "a pod of a group of 4 has no leaderworkerset.sigs.k8s.io/worker-index label"
         );
     }
@@ -1079,10 +1227,10 @@ mod tests {
         };
         let pod = sandbox(&[WORKLOAD, (DS_REVISION, "6f9b7c"), (DS_ROLE, "prefill")]);
         assert_eq!(
-            labels.revision_of(&pod).unwrap().to_string(),
+            labels.revision_of(&pod, None).unwrap().to_string(),
             "serving/qwen/6f9b7c"
         );
-        assert_eq!(labels.workload_of(&pod), "qwen");
+        assert_eq!(labels.workload_of(&pod, None), "qwen");
     }
 
     #[test]
@@ -1109,6 +1257,284 @@ mod tests {
                 wanted,
                 "case {number}"
             );
+        }
+    }
+
+    const HASH: (&str, &str) = ("pod-template-hash", "7b9f694bf8");
+
+    fn owner(kind: &str, name: &str, uid: &str) -> Owner {
+        Owner {
+            api_version: "apps/v1".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn identity(pod: &str, owner: Option<Owner>, service_account: &str) -> PodIdentity {
+        PodIdentity {
+            namespace: "serving".to_string(),
+            name: pod.to_string(),
+            uid: format!("{pod}-uid"),
+            service_account: service_account.to_string(),
+            owner,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("snapshotd-node-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A store for `revision` whose image was captured by `by`.
+    fn captured(dir: &Path, revision: &RevisionKey, by: Option<Attestation>) -> RevisionStore {
+        let store = RevisionStore::open(dir, revision, "restoring-pod").unwrap();
+        fs::create_dir_all(store.image_dir()).unwrap();
+        Manifest {
+            root: PodPid(1),
+            gpus: Vec::new(),
+            address: "10.0.0.7".parse().unwrap(),
+            attestation: by,
+        }
+        .save(&store.image_dir())
+        .unwrap();
+        store
+    }
+
+    fn with_log<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let logged = Logged::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_ansi(false)
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, run);
+        (value, logged.text())
+    }
+
+    #[test]
+    fn a_controller_names_the_workload_whatever_the_label_says() {
+        let args = defaults();
+        let labels = args.labels();
+        let qwen = owner("Deployment", "qwen", "d-1");
+        let labelled = sandbox(&[WORKLOAD, HASH]);
+        assert_eq!(
+            labels.revision_of(&labelled, Some(&qwen)).unwrap(),
+            labels.revision_of(&labelled, None).unwrap(),
+            "a Deployment named as its label keeps its key"
+        );
+        let evil = owner("Deployment", "evil", "d-2");
+        assert_eq!(
+            labels
+                .revision_of(&labelled, Some(&evil))
+                .unwrap()
+                .to_string(),
+            "serving/evil/7b9f694bf8",
+            "a pod of another Deployment cannot claim qwen's key by its label"
+        );
+        assert_eq!(labels.workload_of(&labelled, Some(&evil)), "evil");
+        let kserve = owner("Deployment", "qwen3-8b-kserve", "d-3");
+        assert_eq!(
+            labels
+                .revision_of(
+                    &sandbox(&[("snapshot.llm-d.ai/workload", "qwen3-8b"), HASH]),
+                    Some(&kserve)
+                )
+                .unwrap()
+                .to_string(),
+            "serving/qwen3-8b-kserve/7b9f694bf8"
+        );
+
+        let set = Owner {
+            api_version: "disaggregatedset.x-k8s.io/v1".to_string(),
+            ..owner("DisaggregatedSet", "qwen", "s-1")
+        };
+        let prefill = sandbox(&[WORKLOAD, (DS_REVISION, "6f9b7c"), (DS_ROLE, "prefill")]);
+        let keyed = labels.revision_of(&prefill, Some(&set)).unwrap();
+        assert_eq!(keyed, labels.revision_of(&prefill, None).unwrap());
+        assert_eq!(keyed.to_string(), "serving/qwen@prefill/6f9b7c");
+        assert_eq!(labels.workload_of(&prefill, Some(&set)), "qwen@prefill");
+
+        let unlabelled = sandbox(&[HASH]);
+        assert_eq!(
+            labels
+                .revision_of(&unlabelled, Some(&qwen))
+                .unwrap()
+                .to_string(),
+            "serving/qwen/7b9f694bf8",
+            "an owned pod needs the label only to opt in"
+        );
+        assert!(labels.revision_of(&unlabelled, None).is_err());
+        assert_eq!(labels.workload_of(&unlabelled, None), "");
+    }
+
+    #[test]
+    fn a_pod_labelled_as_another_workloads_revision_cold_boots_instead_of_restoring() {
+        let dir = scratch("foreign");
+        let args = defaults();
+        let labels = args.labels();
+        let qwen = owner("Deployment", "qwen", "d-1");
+        let qwen_pod = sandbox(&[WORKLOAD, HASH]);
+        let revision = labels.revision_of(&qwen_pod, Some(&qwen)).unwrap();
+        let store = captured(
+            &dir,
+            &revision,
+            Some(
+                identity("qwen-7b9f694bf8-aaaaa", Some(qwen.clone()), "qwen")
+                    .attestation(&revision),
+            ),
+        );
+
+        let stranger = sandbox(&[WORKLOAD, HASH]);
+        let stranger_key = labels.revision_of(&stranger, None).unwrap();
+        assert_eq!(
+            stranger_key, revision,
+            "an unowned pod still keys by its label"
+        );
+        let ours = identity("stranger", None, "qwen").attestation(&stranger_key);
+        let (image, log) = with_log(|| Image::of(&store, &[], &ours).unwrap());
+        let Image::Foreign(by) = &image else {
+            panic!("{image:?}");
+        };
+        assert!(by.contains("Deployment qwen (d-1)"), "{by}");
+        for wanted in [
+            "WARN",
+            "security=\"foreign-checkpoint\"",
+            "revision=serving/qwen/7b9f694bf8",
+            "pod=serving/stranger",
+            "captured_by=Deployment qwen (d-1)",
+            "owned by no controller, as ServiceAccount qwen",
+            "refused the pod a checkpoint of its revision that another principal captured",
+        ] {
+            assert!(log.contains(wanted), "{wanted:?} not in {log}");
+        }
+        let Plan::ColdBoot(because) = Plan::choose(false, image, Ok(())) else {
+            panic!("the stranger was not cold booted");
+        };
+        assert!(
+            because.contains("captured by Deployment qwen (d-1)"),
+            "{because}"
+        );
+
+        let lookalike = identity(
+            "lookalike",
+            Some(owner("Deployment", "qwen", "d-9")),
+            "qwen",
+        );
+        assert!(
+            matches!(
+                Image::of(&store, &[], &lookalike.attestation(&revision)).unwrap(),
+                Image::Foreign(_)
+            ),
+            "a recreated Deployment of the same name is another principal"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_replica_of_the_capturing_controller_still_restores() {
+        let dir = scratch("sibling");
+        let args = defaults();
+        let labels = args.labels();
+        let set = Owner {
+            api_version: "disaggregatedset.x-k8s.io/v1".to_string(),
+            ..owner("DisaggregatedSet", "qwen", "s-1")
+        };
+        let cases = [
+            (
+                owner("Deployment", "qwen", "d-1"),
+                sandbox(&[WORKLOAD, HASH]),
+            ),
+            (
+                set,
+                sandbox(&[WORKLOAD, (DS_REVISION, "6f9b7c"), (DS_ROLE, "decode")]),
+            ),
+        ];
+        for (controller, pod) in cases {
+            let revision = labels.revision_of(&pod, Some(&controller)).unwrap();
+            assert_eq!(
+                revision,
+                labels.revision_of(&pod, None).unwrap(),
+                "{controller}"
+            );
+            let first = identity("first", Some(controller.clone()), "qwen");
+            let store = captured(&dir, &revision, Some(first.attestation(&revision)));
+            let later = identity("later", Some(controller.clone()), "other");
+            let image = Image::of(&store, &[], &later.attestation(&revision)).unwrap();
+            assert_eq!(image, Image::Usable, "{controller}");
+            assert_eq!(
+                Plan::choose(false, image, Ok(())),
+                Plan::Restore,
+                "{controller}"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_image_captured_before_attestation_is_restored_as_owned_by_no_one() {
+        let dir = scratch("legacy");
+        let revision: RevisionKey = "serving/qwen/7b9f694bf8".parse().unwrap();
+        let store = captured(&dir, &revision, None);
+        let ours = identity("later", Some(owner("Deployment", "qwen", "d-1")), "qwen");
+        let (image, log) =
+            with_log(|| Image::of(&store, &[], &ours.attestation(&revision)).unwrap());
+        assert_eq!(image, Image::Usable);
+        assert!(log.contains("the checkpoint predates attestation"), "{log}");
+        assert_eq!(Plan::choose(false, image, Ok(())), Plan::Restore);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pod_whose_service_account_may_not_read_its_revision_cold_boots() {
+        let revision: RevisionKey = "serving/qwen@prefill/6f9b7c".parse().unwrap();
+        let pod = identity("stranger", None, "other-sa");
+        assert_eq!(refusal(Ok(Verdict::Allowed), &pod, &revision), None);
+
+        let denied = Verdict::Denied("no RoleBinding grants it".to_string());
+        let (because, log) = with_log(|| refusal(Ok(denied), &pod, &revision));
+        assert_eq!(
+            because.as_deref(),
+            Some(
+                "ServiceAccount other-sa may not get checkpoints.snapshot.llm-d.ai qwen in serving: \
+                 no RoleBinding grants it"
+            )
+        );
+        for wanted in [
+            "WARN",
+            "security=\"checkpoint-access-denied\"",
+            "revision=serving/qwen@prefill/6f9b7c",
+            "pod=serving/stranger",
+            "service_account=other-sa",
+            "why=\"no RoleBinding grants it\"",
+            "the pod may not read its revision's checkpoint",
+        ] {
+            assert!(log.contains(wanted), "{wanted:?} not in {log}");
+        }
+
+        let unreachable = refusal(Err(AccessError::NoClient), &pod, &revision);
+        assert_eq!(
+            unreachable.as_deref(),
+            Some(
+                "could not ask whether the pod may read its checkpoint: \
+                 this daemon has no Kubernetes API client"
+            )
+        );
+    }
+
+    #[test]
+    fn a_foreign_image_cold_boots_without_a_capture() {
+        let foreign = || Image::Foreign("Deployment qwen (d-1)".to_string());
+        for (failed_before, room) in [
+            (false, Ok(())),
+            (false, Err(anyhow!("full"))),
+            (true, Ok(())),
+        ] {
+            assert!(matches!(
+                Plan::choose(failed_before, foreign(), room),
+                Plan::ColdBoot(_)
+            ));
         }
     }
 }

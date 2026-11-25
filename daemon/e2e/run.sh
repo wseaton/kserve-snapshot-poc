@@ -7,7 +7,8 @@
 # process, that later replicas are restored from that checkpoint instead of booting and carry
 # their pod's security label, that a new revision boots and is checkpointed again, that a pod's
 # checkpoint goes to the store class it names, that the daemon's metrics count all of it, and that
-# a pod naming the HTTP transport goes through the same capture and restore over vLLM's HTTP routes.
+# a pod naming the HTTP transport goes through the same capture and restore over vLLM's HTTP routes,
+# and that a pod whose ServiceAccount may not read its checkpoint cold boots instead.
 #
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e)
@@ -151,4 +152,23 @@ for address in $(addresses); do
   [ "$got" = "$fourth" ] || fail "replica $address of the HTTP revision is not a restore: $got"
 done
 [ "$(logged "transport=Http")" -ge 2 ] || fail "the daemon did not drive the HTTP revision's pods over HTTP"
+
+# The revision is named after the pod's Deployment, and a pod whose ServiceAccount may not get its
+# revision's checkpoint cold boots instead of restoring it.
+[ "$(logged "owner=Deployment stand-in ")" -ge 1 ] || fail "no pod was keyed by its Deployment"
+settle 1
+refused=$(logged "the pod may not read its revision's checkpoint")
+k delete rolebinding snapshotd-checkpoint-reader
+settle 2
+[ "$(logged "the pod may not read its revision's checkpoint")" = $((refused + 1)) ] \
+  || fail "a pod without RBAC on its checkpoint was not refused it"
+cold=0
+for address in $(addresses); do
+  got=$(info_http "$address")
+  [[ $got == *" Running" ]] || fail "replica $address is not serving: $got"
+  [ "$got" = "$fourth" ] || cold=$((cold + 1))
+done
+[ "$cold" = 1 ] || fail "expected the refused replica to cold boot, $cold did"
+k apply -f daemon/e2e/reader.yaml
+echo "a pod without RBAC on its checkpoint cold boots"
 echo PASS

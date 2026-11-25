@@ -16,7 +16,7 @@ use crate::node::manifest::Manifest;
 use crate::node::process::{self, HostPid, PodPid, blocking, copy_tree};
 use crate::node::report::{gib, plain, seconds, step};
 use crate::node::shim::ShimClient;
-use crate::store::directory_bytes;
+use crate::store::{Attestation, directory_bytes};
 use crate::vllm::{Control, Endpoint, PauseMode};
 use snapshotd_shim::SERVER_LOG;
 
@@ -171,6 +171,7 @@ impl Pod {
         shim: &mut ShimClient,
         root: PodPid,
         image: &Path,
+        attestation: &Attestation,
     ) -> Result<()> {
         let started = Instant::now();
         fs::create_dir_all(image.join("img"))
@@ -238,6 +239,7 @@ impl Pod {
             root,
             gpus: self.gpus.clone(),
             address: self.address(),
+            attestation: Some(attestation.clone()),
         }
         .save(image)?;
         info!(

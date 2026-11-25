@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - ../deploy/node
   - workload.yaml
+  - reader.yaml
 images:
   - name: ghcr.io/wseaton/snapshotd/snapshotd
     newName: localhost/snapshotd-e2e

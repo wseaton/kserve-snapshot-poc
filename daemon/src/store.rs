@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! <class>/<namespace>/<workload>/<hash>/image/           the checkpoint; it appears whole, by rename
+//! <class>/<namespace>/<workload>/<hash>/image/manifest.json  how to restore it, and who captured it
 //! <class>/<namespace>/<workload>/<hash>/incoming-<pod>/  a capture or a pull in progress
 //! <class>/<namespace>/<workload>/<hash>/failed-<pod>     why this pod no longer tries
 //! <class>/<namespace>/<workload>/<hash>/used             touched when a pod of the revision starts
@@ -19,9 +20,11 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 pub const DEFAULT_CLASS: &str = "default";
+pub const MANIFEST: &str = "manifest.json";
 const USED: &str = "used";
 
 /// Separates a workload's name from its role, and the role from the member.
@@ -50,6 +53,10 @@ impl Workload {
             role: role.map(str::to_string),
             member,
         })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Which pod of its group this is, when the group has more than one.
@@ -112,6 +119,10 @@ impl RevisionKey {
         })
     }
 
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
     pub fn workload(&self) -> &Workload {
         &self.workload
     }
@@ -153,6 +164,117 @@ impl fmt::Display for RevisionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}/{}", self.namespace, self.workload, self.hash)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AttestationError {
+    #[error("read {}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parse {}", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// The controller a pod's workload is named after, as the API server
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+}
+
+impl fmt::Display for Owner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} ({})", self.kind, self.name, self.uid)
+    }
+}
+
+/// The pod that captured an image, kept in the image's manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attestation {
+    pub namespace: String,
+    pub pod: String,
+    pub uid: String,
+    pub service_account: String,
+    /// `None` for a pod that no controller owns.
+    pub owner: Option<Owner>,
+    /// The revision the pod was keyed to.
+    pub revision: String,
+}
+
+impl Attestation {
+    /// Whether pods attested as `self` and `other` may use each other's
+    /// image: they have the same controller, or no controller and the same
+    /// ServiceAccount.
+    pub fn same_principal(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && match (&self.owner, &other.owner) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                (None, None) => self.service_account == other.service_account,
+                _ => false,
+            }
+    }
+
+    /// `None` for an image captured before images were attested.
+    pub fn of_image(image: &Path) -> Result<Option<Self>, AttestationError> {
+        #[derive(Deserialize)]
+        struct Attested {
+            #[serde(default)]
+            attestation: Option<Attestation>,
+        }
+        let path = image.join(MANIFEST);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) => return Err(AttestationError::Read { path, source }),
+        };
+        match serde_json::from_slice::<Attested>(&bytes) {
+            Ok(attested) => Ok(attested.attestation),
+            Err(source) => Err(AttestationError::Parse { path, source }),
+        }
+    }
+}
+
+impl fmt::Display for Attestation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pod = format!("pod {}/{} ({})", self.namespace, self.pod, self.uid);
+        match &self.owner {
+            Some(owner) => write!(f, "{owner} through {pod}"),
+            None => write!(
+                f,
+                "{pod}, owned by no controller, as ServiceAccount {}",
+                self.service_account
+            ),
+        }
+    }
+}
+
+/// What became of a staging directory on [`RevisionStore::publish`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Published {
+    /// It is the image now.
+    Ours,
+    /// An image of the same principal, or one captured before images were
+    /// attested, was there first. That image stays.
+    Kept,
+    /// An image of another principal was there first. That image stays.
+    Collided(Box<Collision>),
+}
+
+/// Who captured each of two images of one revision. `None` for an image
+/// without a readable attestation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Collision {
+    pub kept: Option<Attestation>,
+    pub dropped: Option<Attestation>,
 }
 
 /// One place checkpoints are kept, and what it allows.
@@ -341,6 +463,13 @@ impl Classes {
     }
 }
 
+fn described(attestation: Option<&Attestation>) -> String {
+    attestation.map_or_else(
+        || "an image without a readable attestation".to_string(),
+        ToString::to_string,
+    )
+}
+
 fn free_bytes(dir: &Path) -> Result<u64> {
     let stat = rustix::fs::statvfs(dir).with_context(|| format!("stat {}", dir.display()))?;
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
@@ -413,11 +542,34 @@ impl RevisionStore {
         }
     }
 
-    /// If another pod published first, that image stays and this one is dropped.
-    pub fn publish(&self) -> Result<()> {
+    /// If another pod published first, that image stays and this one is
+    /// dropped. A pod of another principal publishing first is logged as a
+    /// security event.
+    pub fn publish(&self) -> Result<Published> {
         match fs::rename(&self.staging, self.image_dir()) {
-            Ok(()) => Ok(()),
-            Err(_) if self.image_ready() => self.clear_staging(),
+            Ok(()) => Ok(Published::Ours),
+            Err(_) if self.image_ready() => {
+                let kept = Attestation::of_image(&self.image_dir());
+                let dropped = Attestation::of_image(&self.staging);
+                self.clear_staging()?;
+                Ok(match (kept, dropped) {
+                    (Ok(None), _) => Published::Kept,
+                    (Ok(Some(kept)), Ok(Some(dropped))) if kept.same_principal(&dropped) => {
+                        Published::Kept
+                    }
+                    (kept, dropped) => {
+                        let (kept, dropped) = (kept.ok().flatten(), dropped.ok().flatten());
+                        warn!(
+                            security = "checkpoint-collision",
+                            image = %self.image_dir().display(),
+                            kept = %described(kept.as_ref()),
+                            dropped = %described(dropped.as_ref()),
+                            "two principals captured one revision; the image already there stays"
+                        );
+                        Published::Collided(Box::new(Collision { kept, dropped }))
+                    }
+                })
+            }
             Err(error) => Err(error).context("publish the image"),
         }
     }
@@ -440,8 +592,8 @@ mod tests {
     use anyhow::anyhow;
 
     use crate::store::{
-        Class, Classes, RevisionKey, RevisionStore, USED, Usage, Workload, directory_bytes,
-        ensure_room, revisions,
+        Attestation, Class, Classes, Collision, MANIFEST, Owner, Published, RevisionKey,
+        RevisionStore, USED, Usage, Workload, directory_bytes, ensure_room, revisions,
     };
 
     fn scratch(name: &str) -> PathBuf {
@@ -798,7 +950,7 @@ mod tests {
         fs::create_dir_all(store.staging_dir().join("img")).unwrap();
         fs::write(store.staging_dir().join("img/pages-1.img"), "ours").unwrap();
         assert!(!store.image_ready());
-        store.publish().unwrap();
+        assert_eq!(store.publish().unwrap(), Published::Ours);
         assert!(store.image_ready());
         assert!(!store.staging_dir().exists());
         assert_eq!(
@@ -808,21 +960,181 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    fn deployment(name: &str, uid: &str) -> Owner {
+        Owner {
+            api_version: "apps/v1".to_string(),
+            kind: "Deployment".to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn attested(pod: &str, owner: Option<Owner>, service_account: &str) -> Attestation {
+        Attestation {
+            namespace: "serving".to_string(),
+            pod: pod.to_string(),
+            uid: format!("{pod}-uid"),
+            service_account: service_account.to_string(),
+            owner,
+            revision: "serving/qwen3-8b/7b9f694bf8".to_string(),
+        }
+    }
+
+    /// Stage an image holding `content`, its manifest attested as `by`.
+    fn stage(store: &RevisionStore, content: &str, by: Option<&Attestation>) {
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        fs::write(store.staging_dir().join("inventory.img"), content).unwrap();
+        let manifest = match by {
+            Some(by) => serde_json::json!({ "attestation": by }),
+            None => serde_json::json!({}),
+        };
+        fs::write(store.staging_dir().join(MANIFEST), manifest.to_string()).unwrap();
+    }
+
+    fn image_content(store: &RevisionStore) -> String {
+        fs::read_to_string(store.image_dir().join("inventory.img")).unwrap()
+    }
+
     #[test]
-    fn an_image_published_first_by_another_pod_stays() {
+    fn an_image_published_first_by_another_pod_of_its_controller_stays() {
         let dir = scratch("race");
         let (ours, theirs) = (open(&dir, "a"), open(&dir, "b"));
-        for (store, content) in [(&theirs, "theirs"), (&ours, "ours")] {
-            fs::create_dir_all(store.staging_dir()).unwrap();
-            fs::write(store.staging_dir().join("inventory.img"), content).unwrap();
-            store.publish().unwrap();
-        }
-        assert_eq!(
-            fs::read_to_string(ours.image_dir().join("inventory.img")).unwrap(),
-            "theirs"
+        let owner = Some(deployment("qwen3-8b", "d-1"));
+        stage(
+            &theirs,
+            "theirs",
+            Some(&attested("b", owner.clone(), "default")),
         );
+        assert_eq!(theirs.publish().unwrap(), Published::Ours);
+        stage(&ours, "ours", Some(&attested("a", owner, "other")));
+        assert_eq!(ours.publish().unwrap(), Published::Kept);
+        assert_eq!(image_content(&ours), "theirs");
         assert!(!ours.staging_dir().exists() && !theirs.staging_dir().exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn publishing_over_an_image_of_another_principal_is_refused_and_it_survives() {
+        let dir = scratch("collision");
+        let qwen_pod = attested(
+            "qwen-replica",
+            Some(deployment("qwen3-8b", "d-1")),
+            "default",
+        );
+        let stranger = attested("stranger", None, "default");
+        let lookalike = attested("lookalike", Some(deployment("qwen3-8b", "d-2")), "default");
+        let cases = [
+            (&stranger, &qwen_pod),
+            (&qwen_pod, &stranger),
+            (&qwen_pod, &lookalike),
+        ];
+        for (number, (first, second)) in cases.into_iter().enumerate() {
+            let (theirs, ours) = (open(&dir, "first"), open(&dir, "second"));
+            stage(&theirs, "first", Some(first));
+            assert_eq!(theirs.publish().unwrap(), Published::Ours, "case {number}");
+            stage(&ours, "second", Some(second));
+            assert_eq!(
+                ours.publish().unwrap(),
+                Published::Collided(Box::new(Collision {
+                    kept: Some(first.clone()),
+                    dropped: Some(second.clone()),
+                })),
+                "case {number}"
+            );
+            assert_eq!(image_content(&ours), "first", "case {number}");
+            assert_eq!(
+                Attestation::of_image(&ours.image_dir()).unwrap().as_ref(),
+                Some(first),
+                "case {number}"
+            );
+            assert!(!ours.staging_dir().exists(), "case {number}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_image_captured_before_attestation_is_kept_and_counts_as_unowned() {
+        let dir = scratch("legacy");
+        let (old, new) = (open(&dir, "old"), open(&dir, "new"));
+        stage(&old, "old", None);
+        assert_eq!(old.publish().unwrap(), Published::Ours);
+        assert_eq!(Attestation::of_image(&old.image_dir()).unwrap(), None);
+        stage(
+            &new,
+            "new",
+            Some(&attested(
+                "new",
+                Some(deployment("qwen3-8b", "d-1")),
+                "default",
+            )),
+        );
+        assert_eq!(new.publish().unwrap(), Published::Kept);
+        assert_eq!(image_content(&new), "old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_without_a_readable_manifest_collides_with_anything() {
+        let dir = scratch("unreadable");
+        let (theirs, ours) = (open(&dir, "a"), open(&dir, "b"));
+        stage(&theirs, "theirs", None);
+        fs::write(theirs.staging_dir().join(MANIFEST), "{").unwrap();
+        theirs.publish().unwrap();
+        assert!(Attestation::of_image(&theirs.image_dir()).is_err());
+        let ours_by = attested("b", None, "default");
+        stage(&ours, "ours", Some(&ours_by));
+        assert_eq!(
+            ours.publish().unwrap(),
+            Published::Collided(Box::new(Collision {
+                kept: None,
+                dropped: Some(ours_by),
+            }))
+        );
+        assert_eq!(image_content(&ours), "theirs");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(Attestation::of_image(&dir).is_err());
+    }
+
+    #[test]
+    fn principals_are_a_controller_or_an_unowned_service_account() {
+        let qwen = || Some(deployment("qwen3-8b", "d-1"));
+        let base = attested("a", qwen(), "default");
+        let same = [
+            attested("b", qwen(), "default"),
+            attested("b", qwen(), "other-sa"),
+        ];
+        for other in &same {
+            assert!(
+                base.same_principal(other) && other.same_principal(&base),
+                "{other}"
+            );
+        }
+        let different = [
+            attested("b", Some(deployment("qwen3-8b", "d-2")), "default"),
+            attested("b", Some(deployment("glm", "d-1")), "default"),
+            attested("b", None, "default"),
+            Attestation {
+                namespace: "batch".to_string(),
+                ..attested("b", qwen(), "default")
+            },
+        ];
+        for other in &different {
+            assert!(
+                !base.same_principal(other) && !other.same_principal(&base),
+                "{other}"
+            );
+        }
+        let unowned = attested("a", None, "default");
+        assert!(unowned.same_principal(&attested("b", None, "default")));
+        assert!(!unowned.same_principal(&attested("b", None, "other-sa")));
+        assert_eq!(
+            unowned.to_string(),
+            "pod serving/a (a-uid), owned by no controller, as ServiceAccount default"
+        );
+        assert_eq!(
+            base.to_string(),
+            "Deployment qwen3-8b (d-1) through pod serving/a (a-uid)"
+        );
     }
 
     #[test]

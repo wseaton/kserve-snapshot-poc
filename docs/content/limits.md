@@ -34,6 +34,10 @@ Each gap below is the current behavior, then what is missing.
 
 - Opting in takes only a pod label, so it needs admission policy: the label makes a privileged
   daemon enter the pod.
+- A checkpoint is named after the controller that owns the pod's template, and restored only into
+  pods of that controller whose ServiceAccount may `get` `checkpoints.snapshot.llm-d.ai` in the
+  namespace. Missing: admission policy that pins a pod's controller reference and ServiceAccount.
+  Checkpoints taken before captures were attested restore into any pod of the revision.
 - Every daemon runs as one ServiceAccount and may pull any revision. Missing: per-node identity,
   NetworkPolicy on the proxy and NIXL ports.
 - Checkpoints are unencrypted process memory (credentials, request data) on the node's disk.
