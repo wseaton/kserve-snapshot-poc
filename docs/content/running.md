@@ -22,7 +22,7 @@ flowchart LR
     STA[("checkpoint store<br/>node data disk")]
     RA["CRI socket<br/>kubelet PodResources socket"]
     DA -- "shim.sock through /proc/PID/root" --> SA
-    DA -- "CheckpointPrepare / Restore" --> VA
+    DA -- "checkpoint prepare / restore<br/>over gRPC or HTTP" --> VA
     DA -- "CUDA checkpoint by host PID<br/>CRIU in the pod's namespaces and cgroup" --> WA
     DA <--> STA
     DA --> RA
@@ -61,7 +61,26 @@ daemon/e2e/peers.sh                                 # checkpoints between three 
 
 Both e2e scripts run in CI. The stand-in
 ([`stand_in.rs`](https://github.com/wseaton/snapshotd/blob/main/daemon/examples/stand_in.rs))
-serves vLLM's checkpoint RPCs and an instance ID drawn at start, which tells a restore from a boot.
+serves vLLM's checkpoint RPCs and HTTP routes and an instance ID drawn at start, which tells a
+restore from a boot.
+
+## gRPC or HTTP
+
+The daemon drives vLLM's checkpoint lifecycle over one of two transports:
+
+| Transport | Port | Served by |
+| --- | --- | --- |
+| `grpc` | `--control-port` (50051) | the Rust frontend's `Control` service, with `--grpc-port` |
+| `http` | `--http-port` (8000) | `/checkpoint/prepare`, `/checkpoint/restore` and `/checkpoint/status` on the inference port, in the Python and the Rust frontend |
+
+`--control-transport` (`SNAPSHOTD_CONTROL_TRANSPORT`, default `grpc`) sets it for the node. A pod
+overrides it with the annotation `snapshot.llm-d.ai/control: http` or `grpc`
+(`--control-annotation`), so one daemon serves pods of both frontends. A pod running vLLM's
+default Python frontend has no gRPC port and needs `http`. A pod that names another value is not
+started; the daemon logs why and tries again every `--retry-s`.
+
+`--prepare-mode` (`wait`, `abort` or `keep`; default `wait`) is how vLLM drains in-flight requests
+before a checkpoint, on either transport.
 
 ## What it does
 

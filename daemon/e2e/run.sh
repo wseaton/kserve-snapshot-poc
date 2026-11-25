@@ -6,7 +6,8 @@
 # It checks that the first replica of a revision is checkpointed and comes back as the same
 # process, that later replicas are restored from that checkpoint instead of booting and carry
 # their pod's security label, that a new revision boots and is checkpointed again, that a pod's
-# checkpoint goes to the store class it names, and that the daemon's metrics count all of it.
+# checkpoint goes to the store class it names, that the daemon's metrics count all of it, and that
+# a pod naming the HTTP transport goes through the same capture and restore over vLLM's HTTP routes.
 #
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e)
@@ -127,4 +128,27 @@ for line in \
   grep -qF "$line" <<<"$scraped" || { grep -v '^#' <<<"$scraped" >&2; fail "the daemon's metrics have no: $line"; }
 done
 echo "the daemon's metrics count what it did and what each class holds"
+
+# A pod that names the HTTP transport is driven through vLLM's HTTP routes, all a server without
+# the gRPC control port serves: it is captured as it comes up, and a second replica is restored.
+info_http() { k -n snapshotd exec ds/snapshotd -c snapshotd -- stand-in info --http "$1:8000"; }
+settle 1
+published=$(logged "checkpoint published on this node")
+k patch deploy/stand-in --type=json -p '[
+  {"op":"remove","path":"/spec/template/metadata/annotations/snapshot.llm-d.ai~1class"},
+  {"op":"add","path":"/spec/template/metadata/annotations/snapshot.llm-d.ai~1control","value":"http"},
+  {"op":"add","path":"/spec/template/spec/containers/0/command/-","value":"--http-only"}]'
+settle 1
+fourth=$(info_http "$(addresses)")
+echo "over HTTP: $fourth"
+[[ $fourth == *" Running" ]] || fail "a pod driven over HTTP is not serving: $fourth"
+[ "$fourth" != "$third" ] || fail "the HTTP revision came up as an old process"
+[ "$(logged "checkpoint published on this node")" = $((published + 1)) ] \
+  || fail "the pod driven over HTTP was not checkpointed"
+settle 2
+for address in $(addresses); do
+  got=$(info_http "$address")
+  [ "$got" = "$fourth" ] || fail "replica $address of the HTTP revision is not a restore: $got"
+done
+[ "$(logged "transport=Http")" -ge 2 ] || fail "the daemon did not drive the HTTP revision's pods over HTTP"
 echo PASS

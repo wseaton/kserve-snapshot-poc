@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::node::process::{self, HostPid, PodPid, blocking, copy_tree};
 use crate::node::report::{gib, plain, seconds, step};
 use crate::node::shim::ShimClient;
 use crate::store::directory_bytes;
-use crate::vllm::Control;
+use crate::vllm::{Control, Endpoint, PauseMode};
 use snapshotd_shim::SERVER_LOG;
 
 #[derive(Clone, clap::Args)]
@@ -29,6 +29,14 @@ pub struct Options {
     /// from one.
     #[arg(long, env = "SNAPSHOTD_LIFECYCLE_TIMEOUT_S", default_value_t = 900)]
     lifecycle_timeout_s: u64,
+    /// How vLLM drains in-flight requests before a checkpoint.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_PREPARE_MODE",
+        value_enum,
+        default_value_t = PauseMode::Wait
+    )]
+    prepare_mode: PauseMode,
     /// Seconds a process may take to reach a point where the driver can
     /// checkpoint it.
     #[arg(long, env = "SNAPSHOTD_CUDA_LOCK_TIMEOUT_S", default_value_t = 60)]
@@ -54,7 +62,7 @@ impl Options {
 
 pub struct Pod {
     init: HostPid,
-    control: SocketAddr,
+    control: Endpoint,
     options: Options,
     /// The pod's GPUs, in the driver's order.
     gpus: Vec<Gpu>,
@@ -65,7 +73,7 @@ pub struct Pod {
 impl Pod {
     pub fn new(
         init: HostPid,
-        control: SocketAddr,
+        control: Endpoint,
         options: &Options,
         allotted: &[GpuUuid],
     ) -> Result<Self> {
@@ -94,10 +102,10 @@ impl Pod {
     }
 
     pub fn address(&self) -> IpAddr {
-        self.control.ip()
+        self.control.address.ip()
     }
 
-    pub fn control(&self) -> SocketAddr {
+    pub fn control(&self) -> Endpoint {
         self.control
     }
 
@@ -169,7 +177,7 @@ impl Pod {
             .with_context(|| format!("create {}", image.display()))?;
         step(
             "vLLM prepare",
-            control.prepare(self.options.lifecycle_timeout()),
+            control.prepare(self.options.prepare_mode, self.options.lifecycle_timeout()),
         )
         .await?;
         drop(control);

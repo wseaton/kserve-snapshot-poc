@@ -17,7 +17,7 @@ extend it:
 - give KV connectors checkpoint hooks, and checkpoint NIXL prefill and decode instances (`0001`, `0002`)
 - release the weights at prepare and reload them at restore (`0003`)
 - destroy and recreate the NCCL communicator, so no GPU memory is shared at checkpoint time (`0004`)
-- serve the lifecycle over the Rust frontend's gRPC `Control` service, which the daemon calls (`0005`, `0006`)
+- serve the lifecycle over the Rust frontend's gRPC `Control` service, the daemon's default transport; it can use the HTTP routes instead ([Running](@/running.md#grpc-or-http)) (`0005`, `0006`)
 - free and refill the CPU KV offload region (`0007`)
 
 ## CUDA checkpoint driver API

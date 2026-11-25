@@ -18,7 +18,7 @@ mod shim;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,7 +42,7 @@ use crate::podresources;
 use crate::store::directory_bytes;
 use crate::store::{Class, Classes, RevisionKey, RevisionStore, Workload};
 use crate::timeslice;
-use crate::vllm::{Control, Lifecycle};
+use crate::vllm::{Control, Endpoint, Lifecycle, Transport};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -76,6 +76,26 @@ pub struct Args {
     /// vLLM's gRPC control port.
     #[arg(long, env = "SNAPSHOTD_CONTROL_PORT", default_value_t = 50051)]
     control_port: u16,
+    /// vLLM's HTTP port, which serves the `/checkpoint` routes in the Python
+    /// and the Rust frontend.
+    #[arg(long, env = "SNAPSHOTD_HTTP_PORT", default_value_t = 8000)]
+    http_port: u16,
+    /// How a pod's checkpoint lifecycle is driven when the pod does not name
+    /// a transport: over the gRPC control port or the HTTP port.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_CONTROL_TRANSPORT",
+        value_enum,
+        default_value_t = Transport::Grpc
+    )]
+    control_transport: Transport,
+    /// Pod annotation that names a pod's transport, `grpc` or `http`.
+    #[arg(
+        long,
+        env = "SNAPSHOTD_CONTROL_ANNOTATION",
+        default_value = "snapshot.llm-d.ai/control"
+    )]
+    control_annotation: String,
     /// Free space the store must have before a checkpoint is taken.
     #[arg(long, env = "SNAPSHOTD_MIN_FREE_GIB", default_value_t = 256)]
     min_free_gib: u64,
@@ -277,6 +297,30 @@ async fn container_init(
 }
 
 impl Args {
+    /// Where and how to reach the server of a pod at `address`. An annotation
+    /// that names no transport falls back to the node's, with a warning.
+    fn control(&self, sandbox: &Sandbox, address: IpAddr) -> Endpoint {
+        let named = sandbox.annotations.get(&self.control_annotation);
+        let transport = Transport::named(named.map(String::as_str), self.control_transport)
+            .unwrap_or_else(|error| {
+                warn!(
+                    annotation = %self.control_annotation,
+                    error = %format_args!("{error:#}"),
+                    fallback = ?self.control_transport,
+                    "using the node's control transport"
+                );
+                self.control_transport
+            });
+        let port = match transport {
+            Transport::Grpc => self.control_port,
+            Transport::Http => self.http_port,
+        };
+        Endpoint {
+            transport,
+            address: SocketAddr::new(address, port),
+        }
+    }
+
     fn labels(&self) -> Labels<'_> {
         Labels {
             workload: &self.label,
@@ -443,6 +487,7 @@ async fn bring_up(
     info!(
         pod = %format_args!("{}/{}", sandbox.namespace, sandbox.name),
         address = %pod.address(),
+        transport = ?pod.control().transport,
         gpus = pod.gpus().len(),
         visible_gpus = pod.visible_gpus(),
         pid = %pod.init(),
@@ -540,7 +585,7 @@ async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
         &args.container,
     )
     .await?;
-    let control = SocketAddr::new(runtime.address(sandbox).await?, args.control_port);
+    let control = args.control(sandbox, runtime.address(sandbox).await?);
     let pod = Pod::new(init, control, &args.pod, &allotted)?;
     let served = if progress.started {
         info!("the server was started before this daemon; waiting for it to run");
@@ -701,12 +746,17 @@ pub fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::{self, Write};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::{Arc, Mutex};
 
     use anyhow::anyhow;
     use clap::Parser;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::cri::Sandbox;
     use crate::node::{Args, Image, Labels, Plan};
+    use crate::vllm::{Endpoint, Transport};
 
     fn sandbox(labels: &[(&str, &str)]) -> Sandbox {
         grouped(labels, None)
@@ -745,6 +795,34 @@ mod tests {
         Cli::try_parse_from(argv).unwrap().args
     }
 
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl Logged {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Logged {
+        type Writer = Logged;
+
+        fn make_writer(&'a self) -> Logged {
+            self.clone()
+        }
+    }
+
     fn defaults() -> Args {
         parse(&["node", "--store-dir", "/store", "--tools-dir", "/tools"])
     }
@@ -772,6 +850,77 @@ mod tests {
         ]);
         assert_eq!(listed.revision_label, ["a", "b"]);
         assert_eq!(listed.role_label, "");
+    }
+
+    #[test]
+    fn a_pod_annotation_picks_the_transport_and_its_port() {
+        const CONTROL: &str = "snapshot.llm-d.ai/control";
+        let address: IpAddr = "10.0.0.7".parse().unwrap();
+        let pod = |named: Option<&str>| Sandbox {
+            annotations: named
+                .map(|named| HashMap::from([(CONTROL.to_string(), named.to_string())]))
+                .unwrap_or_default(),
+            ..sandbox(&[WORKLOAD])
+        };
+        let endpoint = |transport, port| Endpoint {
+            transport,
+            address: SocketAddr::new(address, port),
+        };
+        let args = defaults();
+        assert_eq!(args.control_transport, Transport::Grpc);
+        for (named, wanted) in [
+            (None, endpoint(Transport::Grpc, 50051)),
+            (Some("grpc"), endpoint(Transport::Grpc, 50051)),
+            (Some("http"), endpoint(Transport::Http, 8000)),
+        ] {
+            assert_eq!(args.control(&pod(named), address), wanted);
+        }
+        let logged = Logged::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_ansi(false)
+            .finish();
+        let fallback = tracing::subscriber::with_default(subscriber, || {
+            args.control(&pod(Some("rest")), address)
+        });
+        assert_eq!(
+            fallback,
+            endpoint(Transport::Grpc, 50051),
+            "an unknown transport falls back to the node's"
+        );
+        let logged = logged.text();
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(
+            logged.contains("using the node's control transport"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains(r#"no vLLM control transport "rest""#),
+            "{logged}"
+        );
+        assert!(logged.contains(CONTROL), "{logged}");
+        assert!(logged.contains("fallback=Grpc"), "{logged}");
+
+        let http = parse(&[
+            "node",
+            "--store-dir",
+            "/store",
+            "--tools-dir",
+            "/tools",
+            "--control-transport",
+            "http",
+            "--http-port",
+            "9000",
+            "--control-port",
+            "6000",
+        ]);
+        for (named, wanted) in [
+            (None, endpoint(Transport::Http, 9000)),
+            (Some("http"), endpoint(Transport::Http, 9000)),
+            (Some("grpc"), endpoint(Transport::Grpc, 6000)),
+        ] {
+            assert_eq!(http.control(&pod(named), address), wanted);
+        }
     }
 
     #[test]

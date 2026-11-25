@@ -1,16 +1,15 @@
+//! vLLM's process checkpoint lifecycle, over the Rust frontend's gRPC
+//! `Control` service or the `/checkpoint` routes both frontends serve over
+//! HTTP.
+mod grpc;
+mod http;
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Error, Result, anyhow, bail};
+use clap::ValueEnum;
 use tokio::time::{Instant, sleep};
-use tonic::transport::{Channel, Endpoint};
-
-#[allow(clippy::all)]
-pub mod pb {
-    tonic::include_proto!("vllm");
-}
-
-use pb::control_client::ControlClient;
 
 const POLL: Duration = Duration::from_millis(200);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,48 +22,83 @@ pub enum Lifecycle {
     Restoring,
 }
 
-/// A failed lifecycle is an error carrying the server's reason.
-pub fn lifecycle(response: &pb::CheckpointStateResponse) -> Result<Lifecycle> {
-    match response.state() {
-        pb::CheckpointState::Running => Ok(Lifecycle::Running),
-        pb::CheckpointState::Preparing => Ok(Lifecycle::Preparing),
-        pb::CheckpointState::Prepared => Ok(Lifecycle::Prepared),
-        pb::CheckpointState::Restoring => Ok(Lifecycle::Restoring),
-        pb::CheckpointState::Failed => Err(anyhow!(
-            "vLLM's checkpoint lifecycle failed: {}",
-            response.error.as_deref().unwrap_or("no reason given")
-        )),
-        pb::CheckpointState::Unspecified => bail!("vLLM reported no checkpoint state"),
+fn failed(reason: Option<&str>) -> Error {
+    anyhow!(
+        "vLLM's checkpoint lifecycle failed: {}",
+        reason.unwrap_or("no reason given")
+    )
+}
+
+/// How the daemon drives a server's checkpoint lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    /// The Rust frontend's gRPC `Control` service.
+    Grpc,
+    /// The `/checkpoint` routes on the inference port, which the Python
+    /// frontend serves too.
+    Http,
+}
+
+impl Transport {
+    /// The transport a pod names, or `default` when it names none.
+    pub fn named(name: Option<&str>, default: Self) -> Result<Self> {
+        match name {
+            None => Ok(default),
+            Some(name) => Self::from_str(name, false)
+                .map_err(|_| anyhow!("no vLLM control transport {name:?}; grpc or http")),
+        }
     }
 }
 
-pub struct Control {
-    client: ControlClient<Channel>,
+/// How in-flight requests are drained before a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PauseMode {
+    /// Let them finish.
+    Wait,
+    /// Abort them.
+    Abort,
+    /// Pause them and keep them for after the restore.
+    Keep,
+}
+
+impl PauseMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Abort => "abort",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+/// Where a pod's server answers, and over which transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub transport: Transport,
+    pub address: SocketAddr,
+}
+
+pub enum Control {
+    Grpc(grpc::Control),
+    Http(http::Control),
 }
 
 impl Control {
-    pub async fn connect(address: SocketAddr) -> Result<Self> {
-        let channel = Endpoint::from_shared(format!("http://{address}"))
-            .context("vLLM control address")?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .connect()
-            .await
-            .with_context(|| format!("connect to vLLM's control port at {address}"))?;
-        Ok(Self {
-            client: ControlClient::new(channel),
+    pub async fn connect(endpoint: Endpoint) -> Result<Self> {
+        Ok(match endpoint.transport {
+            Transport::Grpc => Self::Grpc(grpc::Control::connect(endpoint.address).await?),
+            Transport::Http => Self::Http(http::Control::new(endpoint.address)),
         })
     }
 
     /// Wait for a starting server to answer: serving, or prepared for a
     /// checkpoint if it prepares itself at startup.
-    pub async fn connect_when_up(
-        address: SocketAddr,
-        limit: Duration,
-    ) -> Result<(Self, Lifecycle)> {
+    pub async fn connect_when_up(endpoint: Endpoint, limit: Duration) -> Result<(Self, Lifecycle)> {
+        let address = endpoint.address;
         let deadline = Instant::now() + limit;
         loop {
             let attempt = async {
-                let mut control = Self::connect(address).await?;
+                let mut control = Self::connect(endpoint).await?;
                 control.state().await.map(|state| (control, state))
             };
             match attempt.await {
@@ -79,31 +113,27 @@ impl Control {
     }
 
     pub async fn state(&mut self) -> Result<Lifecycle> {
-        let response = self
-            .client
-            .get_checkpoint_state(pb::GetCheckpointStateRequest {})
-            .await
-            .context("GetCheckpointState")?;
-        lifecycle(response.get_ref())
+        match self {
+            Self::Grpc(control) => control.state().await,
+            Self::Http(control) => control.state().await,
+        }
     }
 
     /// Returns once it is safe to capture.
-    pub async fn prepare(&mut self, limit: Duration) -> Result<()> {
-        self.client
-            .checkpoint_prepare(pb::CheckpointPrepareRequest {
-                mode: pb::PauseMode::Wait.into(),
-            })
-            .await
-            .context("CheckpointPrepare")?;
+    pub async fn prepare(&mut self, mode: PauseMode, limit: Duration) -> Result<()> {
+        match self {
+            Self::Grpc(control) => control.prepare(mode).await?,
+            Self::Http(control) => control.prepare(mode).await?,
+        }
         self.wait_for(Lifecycle::Prepared, limit).await
     }
 
     /// Returns once the server serves.
     pub async fn restore(&mut self, limit: Duration) -> Result<()> {
-        self.client
-            .checkpoint_restore(pb::CheckpointRestoreRequest {})
-            .await
-            .context("CheckpointRestore")?;
+        match self {
+            Self::Grpc(control) => control.restore().await?,
+            Self::Http(control) => control.restore().await?,
+        }
         self.wait_for(Lifecycle::Running, limit).await
     }
 
@@ -124,34 +154,39 @@ impl Control {
 
 #[cfg(test)]
 mod tests {
-    use crate::vllm::{lifecycle, pb};
+    use crate::vllm::{PauseMode, Transport};
 
-    fn response(state: pb::CheckpointState, error: Option<&str>) -> pb::CheckpointStateResponse {
-        pb::CheckpointStateResponse {
-            state: state.into(),
-            error: error.map(str::to_string),
+    #[test]
+    fn a_pod_names_its_transport_or_takes_the_default() {
+        assert_eq!(
+            Transport::named(None, Transport::Grpc).unwrap(),
+            Transport::Grpc
+        );
+        assert_eq!(
+            Transport::named(None, Transport::Http).unwrap(),
+            Transport::Http
+        );
+        assert_eq!(
+            Transport::named(Some("http"), Transport::Grpc).unwrap(),
+            Transport::Http
+        );
+        assert_eq!(
+            Transport::named(Some("grpc"), Transport::Http).unwrap(),
+            Transport::Grpc
+        );
+        for name in ["HTTP", "rest", ""] {
+            let error = Transport::named(Some(name), Transport::Grpc).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("no vLLM control transport {name:?}; grpc or http")
+            );
         }
     }
 
     #[test]
-    fn a_failed_lifecycle_is_an_error_with_the_reason() {
-        let error = lifecycle(&response(
-            pb::CheckpointState::Failed,
-            Some("could not release the weights"),
-        ))
-        .unwrap_err();
-        assert!(error.to_string().contains("could not release the weights"));
-        let error = lifecycle(&response(pb::CheckpointState::Failed, None)).unwrap_err();
-        assert!(error.to_string().contains("no reason given"));
-    }
-
-    #[test]
-    fn an_unset_or_unknown_state_is_an_error() {
-        assert!(lifecycle(&response(pb::CheckpointState::Unspecified, None)).is_err());
-        let unknown = pb::CheckpointStateResponse {
-            state: 99,
-            error: None,
-        };
-        assert!(lifecycle(&unknown).is_err());
+    fn pause_modes_are_named_as_the_http_api_names_them() {
+        assert_eq!(PauseMode::Wait.name(), "wait");
+        assert_eq!(PauseMode::Abort.name(), "abort");
+        assert_eq!(PauseMode::Keep.name(), "keep");
     }
 }

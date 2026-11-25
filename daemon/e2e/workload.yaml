@@ -23,6 +23,8 @@ spec:
           ports:
             - name: control
               containerPort: 50051
+            - name: http
+              containerPort: 8000
             - name: ready
               containerPort: 8001
           readinessProbe:

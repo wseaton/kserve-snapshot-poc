@@ -12,6 +12,10 @@ rust-version = "1.95"
 name = "snapshotd"
 path = "src/main.rs"
 
+[[example]]
+name = "stand_in"
+test = true
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
