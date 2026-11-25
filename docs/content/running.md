@@ -90,7 +90,9 @@ For each pod on its node with the workload label:
 2. If the node holds a checkpoint for `<namespace>/<workload>/<pod-template-hash>`, restore it and
    tell the shim to report ready.
 3. Otherwise let it cold boot, checkpoint it, restore it, publish the checkpoint, report ready.
-4. On failure the container exits and cold boots. No second attempt.
+4. On failure the container exits and cold boots. No second attempt. A checkpoint that
+   `--condemn-after` (2) pods in a row fail to restore is removed, and the next pod pulls or
+   captures another ([Limits](@/limits.md#what-an-orchestrator-still-has-to-add)).
 
 It writes nothing to the Kubernetes API. Its one read is its own node's labels, for
 `--topology-levels`.
@@ -193,6 +195,8 @@ Prometheus at `:9090/metrics` (`SNAPSHOTD_METRICS_LISTEN`). Stores are scanned a
 | --- | --- | --- |
 | `snapshotd_pods_total` | `namespace`, `workload`, `how` | Pods brought up: `restore`, `capture`, `cold_boot`, `started_earlier` |
 | `snapshotd_pod_failures_total` | `namespace`, `workload` | Failed attempts |
+| `snapshotd_condemned_images_total` | `namespace`, `workload` | Checkpoints removed after pods failed to restore them in a row |
+| `snapshotd_abandoned_revisions_total` | `namespace`, `workload` | Revisions whose captures stopped after a recapture was condemned |
 | `snapshotd_step_seconds` | `step` | `cold_boot`, `checkpoint`, `restore`, `pull` |
 | `snapshotd_store_bytes`, `snapshotd_store_revisions` | `class`, `namespace`, `workload` | What a class holds |
 | `snapshotd_store_free_bytes` | `class` | Free space |

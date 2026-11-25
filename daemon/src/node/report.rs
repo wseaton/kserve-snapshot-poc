@@ -1,8 +1,8 @@
-use std::future::Future;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
-use anyhow::Result;
 use tokio::time::Instant;
-use tracing::{info, warn};
 
 /// The part of a pod's name that tells it from its siblings. A pod synced
 /// from a vCluster is named `<name>-x-<namespace>-x-<vcluster>` on the host.
@@ -19,14 +19,18 @@ pub fn gib(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1u64 << 30) as f64)
 }
 
-pub async fn step<T>(name: &'static str, work: impl Future<Output = Result<T>>) -> Result<T> {
-    let started = Instant::now();
-    let outcome = work.await;
-    match &outcome {
-        Ok(_) => info!(seconds = %seconds(started), "{name}"),
-        Err(_) => warn!(seconds = %seconds(started), "{name} failed"),
-    }
-    outcome
+/// The last `cap` bytes of a file, or nothing if it cannot be read.
+pub fn tail(path: &Path, cap: usize) -> Vec<u8> {
+    let cap = u64::try_from(cap).unwrap_or(u64::MAX);
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(cap)))?;
+        let mut kept = Vec::new();
+        file.take(cap).read_to_end(&mut kept)?;
+        Ok(kept)
+    };
+    read().unwrap_or_default()
 }
 
 pub fn plain(line: &str) -> String {
@@ -48,7 +52,9 @@ pub fn plain(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::node::report::{plain, short_id};
+    use std::fs;
+
+    use crate::node::report::{plain, short_id, tail};
 
     #[test]
     fn colour_sequences_are_removed() {
@@ -66,5 +72,20 @@ mod tests {
             "zw7mr"
         );
         assert_eq!(short_id("pod"), "pod");
+    }
+
+    #[test]
+    fn a_tail_keeps_the_end_of_a_file_up_to_its_cap() {
+        let dir = std::env::temp_dir().join(format!("snapshotd-tail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("restore.log");
+        fs::write(&log, "0123456789").unwrap();
+        assert_eq!(tail(&log, 4), b"6789");
+        assert_eq!(tail(&log, 10), b"0123456789");
+        assert_eq!(tail(&log, 4096), b"0123456789");
+        assert_eq!(tail(&log, 0), b"");
+        assert!(tail(&dir.join("missing.log"), 4096).is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

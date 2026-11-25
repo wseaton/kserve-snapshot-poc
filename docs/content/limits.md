@@ -44,17 +44,30 @@ Each gap below is the current behavior, then what is missing.
 
 - The revision key is `pod-template-hash`. It misses model files changed in place, images by tag
   and a recreated Deployment.
-- A checkpoint records the node's NVIDIA driver version, GPU models and compute capabilities,
-  SHA-256 digests of CRIU and the cuInterpose libraries, the kernel release and the daemon
-  version. Before a restore the driver, GPU models and tool digests must match the node's. If
-  they do not, the daemon removes the checkpoint, logs why, and the pod captures a new one. A
-  revision is recaptured at most once per node environment; if the new checkpoint still does
-  not match, later pods cold boot. Checkpoints taken before the environment was recorded are
-  replaced the same way. A peer is not asked for a checkpoint whose environment does not match
-  the asking node.
-- A different kernel release is logged and the restore goes ahead. CPU features and the shim
-  version are not recorded. The daemon version is recorded but not compared.
-- A failed restore is remembered for that pod only; the next pod tries the same checkpoint.
+- A checkpoint records an id drawn when it is taken, the node's NVIDIA driver version, GPU
+  models and compute capabilities, the first CPU's flags from `/proc/cpuinfo`, SHA-256 digests of
+  CRIU and the cuInterpose libraries, the kernel release and the daemon version. Before a restore
+  the driver, GPU models and tool digests must match the node's, and every CPU flag of the
+  checkpoint must be one the node has. If not, the daemon removes the checkpoint, logs why, and
+  the pod captures a new one. A checkpoint from before the environment or the id was recorded is
+  replaced the same way; one from before CPU flags were recorded passes that check. A peer is not asked for a checkpoint whose environment does not match the asking node.
+- A different kernel release is logged and the restore goes ahead. The shim version is not
+  recorded. The daemon version is recorded but not compared.
+- A failed restore cold boots its pod, which does not try a checkpoint again. Each restore of
+  the node's checkpoint is recorded in the revision's directory against its id: the pod, and for
+  a failure the step and the error. When `--condemn-after` (default 2) different pods fail it in
+  a row in CRIU restore, CUDA restore, cuInterpose restore or the copy of shared memory, with no
+  restore of it working in between, the daemon condemns it: it moves the image aside, deletes
+  it, and keeps those records, its manifest and the last 4 KiB of CRIU's restore log under
+  `condemned/<id>/`. Failures in vLLM restore (KV cache, weights) or in a pull do not count. The
+  next pod asks peers first, skipping any that holds a condemned id, and captures only if none
+  has another. A pulled checkpoint is checked again before it is published: one with a
+  condemned id or another environment is dropped. A restore that works cuts the record down to
+  itself, and a condemn moves its image's lines out with the evidence.
+- A revision is recaptured at most once per node environment, whether its checkpoint went stale
+  or was condemned. A stale checkpoint after that cold boots its pods; a second condemn stops
+  captures of the revision on the node and its pods cold boot. Another environment, such as new
+  tool digests after a daemon upgrade, starts over.
 - A stale checkpoint is replaced by a capture on this node. A matching checkpoint on a peer is
   not pulled in its place.
 

@@ -6,8 +6,10 @@
 # It checks that the first replica of a revision is checkpointed and comes back as the same
 # process, that later replicas are restored from that checkpoint instead of booting and carry
 # their pod's security label, that a new revision boots and is checkpointed again, that a pod's
-# checkpoint goes to the store class it names, that the daemon's metrics count all of it, and that
-# a pod naming the HTTP transport goes through the same capture and restore over vLLM's HTTP routes.
+# checkpoint goes to the store class it names, that the daemon's metrics count all of it, that
+# a pod naming the HTTP transport goes through the same capture and restore over vLLM's HTTP routes,
+# that a checkpoint two pods in a row fail to restore is condemned and captured afresh, and that a
+# checkpoint taken on a CPU with a flag the node lacks is recaptured.
 #
 # Environment:
 #   CLUSTER  kind cluster to use, created if missing (default snapshotd-e2e)
@@ -151,4 +153,70 @@ for address in $(addresses); do
   [ "$got" = "$fourth" ] || fail "replica $address of the HTTP revision is not a restore: $got"
 done
 [ "$(logged "transport=Http")" -ge 2 ] || fail "the daemon did not drive the HTTP revision's pods over HTTP"
+
+# Each case below runs on a revision of its own, since a revision is recaptured at most once per
+# node environment.
+on_node() { k -n snapshotd exec ds/snapshotd -c snapshotd -- "$@"; }
+revision_dir() {
+  echo "/store/default/stand-in/$(k get pods -l app=stand-in -o jsonpath='{.items[0].metadata.labels.pod-template-hash}')"
+}
+running() {
+  for address in $(addresses); do
+    [[ $(info_http "$address") == *" Running" ]] || fail "replica $address is not serving after $1"
+  done
+}
+
+# A checkpoint whose pages are cut short fails CRIU restore in every pod. After two pods fail it,
+# the daemon removes it, keeps the evidence, and a later pod captures a new one.
+settle 1
+k set env deploy/stand-in REVISION=condemned
+settle 1
+corrupted=$(revision_dir)
+on_node sh -c "truncate -s 0 $corrupted/image/img/pages-*.img"
+published=$(logged "checkpoint published on this node")
+settle 4
+for _ in $(seq 60); do
+  [ "$(logged "condemned the node's checkpoint")" -ge 1 ] && break
+  sleep 1
+done
+condemns=$(k -n snapshotd logs ds/snapshotd -c snapshotd | grep "condemned the node's checkpoint" || true)
+echo "condemned: $condemns"
+[ "$(grep -c . <<<"$condemns")" = 1 ] || fail "expected one condemn of the corrupted checkpoint"
+[[ $condemns == *"pods=2"* ]] || fail "the checkpoint was not condemned after 2 failed restores"
+[ "$(logged "CRIU restore failed")" -ge 2 ] || fail "fewer than 2 pods failed CRIU restore"
+on_node sh -c "test -s $corrupted/condemned/*/restores && test -f $corrupted/condemned/*/restore.log" \
+  || fail "the condemned checkpoint's evidence was not kept"
+[ "$(logged "checkpoint published on this node")" -gt "$published" ] || settle 5
+[ "$(logged "checkpoint published on this node")" -gt "$published" ] \
+  || fail "no pod captured a new checkpoint after the condemn"
+on_node sh -c "test -d $corrupted/image" || fail "the new checkpoint is not the revision's image"
+running "the condemn"
+restored=$(restores)
+settle "$(( $(k get pods -l app=stand-in --no-headers | wc -l) + 1 ))"
+[ "$(restores)" -gt "$restored" ] || fail "the new checkpoint was not restored into a later pod"
+running "a restore of the new checkpoint"
+condemned_metric='snapshotd_condemned_images_total{namespace="default",workload="stand-in"} 1'
+grep -qF "$condemned_metric" <<<"$(metrics)" || fail "the daemon's metrics have no: $condemned_metric"
+grep -q 'snapshotd_abandoned_revisions_total{' <<<"$(metrics)" && fail "a single condemn abandoned the revision"
+
+# A checkpoint that needs a CPU flag the node lacks is retired, and the next pod captures anew.
+settle 1
+k set env deploy/stand-in REVISION=cpu-flags
+settle 1
+flagged=$(revision_dir)
+manifest=$(on_node cat "$flagged/image/manifest.json" \
+  | jq -e '.environment.cpu_flags += ["snapshotd_e2e_absent"]') \
+  || fail "the checkpoint's manifest could not be edited"
+k -n snapshotd exec -i ds/snapshotd -c snapshotd -- sh -c "cat > $flagged/image/manifest.json" <<<"$manifest"
+published=$(logged "checkpoint published on this node")
+settle 2
+[ "$(logged "CPU with flags the node lacks: snapshotd_e2e_absent")" -ge 1 ] \
+  || fail "a checkpoint that needs a CPU flag the node lacks was not refused"
+[ "$(logged "was taken in another environment; replacing it")" -ge 1 ] \
+  || fail "a checkpoint that needs a CPU flag the node lacks was not recaptured"
+[ "$(logged "checkpoint published on this node")" = $((published + 1)) ] \
+  || fail "the recapture was not published"
+on_node grep -q snapshotd_e2e_absent "$flagged/image/manifest.json" \
+  && fail "the recaptured checkpoint still needs the absent flag"
+running "the recapture"
 echo PASS

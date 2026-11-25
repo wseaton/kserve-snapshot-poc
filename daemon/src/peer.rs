@@ -5,6 +5,7 @@
 //! pull:  resolve the peers ─► ask each what it holds, at once ─► nearest holder first
 //!        ─► take a lane ─► upgrade and receive ─► publish
 //! ```
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::lanes::Lanes;
 use crate::node::environment::Environment;
-use crate::node::manifest::Manifest;
+use crate::node::manifest::{ImageId, Manifest};
 use crate::store::{Classes, RevisionKey, RevisionStore, directory_bytes};
 use crate::topology::{Candidate, Place, nearest_first};
 use crate::transfer::{self, Endpoint, Pool};
@@ -173,18 +174,22 @@ impl Peers {
 impl Holder for Peers {
     fn status(&self, revision: &RevisionKey) -> Status {
         let image = self.classes.image_of(revision);
-        let environment = image.as_deref().and_then(|image| match Manifest::load(image) {
-            Ok(manifest) => manifest.environment,
+        let manifest = image.as_deref().and_then(|image| match Manifest::load(image) {
+            Ok(manifest) => Some(manifest),
             Err(error) => {
                 debug!(%revision, error = %format_args!("{error:#}"), "the held manifest is unreadable");
                 None
             }
         });
+        let (environment, id) = manifest
+            .map(|manifest| (manifest.environment, manifest.image))
+            .unwrap_or_default();
         Status {
             held: image.is_some(),
             free_lanes: self.turns.available_permits(),
             place: self.place.clone(),
             environment,
+            image: id,
         }
     }
 
@@ -232,8 +237,13 @@ impl Peers {
         }
     }
 
-    /// The peers that hold `revision`, the nearest first.
-    async fn holders(self: &Arc<Self>, revision: &RevisionKey) -> Vec<Candidate> {
+    /// The peers that hold a checkpoint of `revision` this node can take,
+    /// the nearest first.
+    async fn holders(
+        self: &Arc<Self>,
+        revision: &RevisionKey,
+        condemned: &BTreeSet<ImageId>,
+    ) -> Vec<Candidate> {
         let addresses = self.addresses().await;
         let mut asked = JoinSet::new();
         for peer in addresses.iter().copied() {
@@ -249,10 +259,7 @@ impl Peers {
         while let Some(answer) = asked.join_next().await {
             match answer {
                 Ok((address, Ok(status))) if status.held => {
-                    match self
-                        .environment
-                        .incompatibility(status.environment.as_ref())
-                    {
+                    match status.refusal(&self.environment, condemned) {
                         None => holding.push(Candidate {
                             address,
                             place: status.place,
@@ -274,15 +281,17 @@ impl Peers {
         nearest_first(&self.place, holding)
     }
 
-    /// Returns the peer the checkpoint came from, if any had it.
+    /// Returns the peer the checkpoint came from, if any had one other
+    /// than those in `condemned`.
     pub async fn pull(
         self: &Arc<Self>,
         revision: &RevisionKey,
         store: &RevisionStore,
+        condemned: &BTreeSet<ImageId>,
     ) -> Result<Option<SocketAddr>> {
         let deadline = Instant::now() + self.busy_timeout;
         loop {
-            let holders = self.holders(revision).await;
+            let holders = self.holders(revision, condemned).await;
             let mut busy = None;
             {
                 let _turn = self
@@ -314,10 +323,12 @@ impl Peers {
                         "asking a peer that has it"
                     );
                     match tunnel::ask(peer, &self.identity, revision, receive).await {
-                        Ok(Ok(())) => {
-                            store.publish()?;
-                            return Ok(Some(peer));
-                        }
+                        Ok(Ok(())) => match store.publish_pulled(&self.environment, condemned)? {
+                            None => return Ok(Some(peer)),
+                            Some(reason) => {
+                                warn!(%peer, reason, "dropped the checkpoint pulled from a peer")
+                            }
+                        },
                         Ok(Err(Refusal::Busy)) => busy = Some(peer),
                         Ok(Err(Refusal::NoImage)) => {
                             debug!(%peer, "the peer no longer has it")

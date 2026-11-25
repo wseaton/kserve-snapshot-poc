@@ -1,5 +1,6 @@
 //! What a checkpoint depends on outside its own image: the NVIDIA driver,
-//! the GPU models, the tools that dump and restore it, and the kernel.
+//! the GPU models, the CPU's features, the tools that dump and restore it,
+//! and the kernel.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -14,6 +15,7 @@ use crate::node::layout::CUINTERPOSE;
 
 const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
 const NVIDIA_DRIVER: &str = "/proc/driver/nvidia/version";
+const CPUINFO: &str = "/proc/cpuinfo";
 
 macro_rules! text_newtype {
     ($name:ident) => {
@@ -33,6 +35,7 @@ text_newtype!(DaemonVersion);
 text_newtype!(KernelRelease);
 text_newtype!(DriverVersion);
 text_newtype!(GpuName);
+text_newtype!(CpuFlag);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ComputeCapability {
@@ -80,6 +83,10 @@ pub struct Environment {
     pub kernel: KernelRelease,
     /// `None` on a node without an NVIDIA driver.
     pub nvidia: Option<Nvidia>,
+    /// The CPU features the kernel reports. `None` in a fingerprint taken
+    /// before they were recorded.
+    #[serde(default)]
+    pub cpu_flags: Option<BTreeSet<CpuFlag>>,
     pub tools: Tools,
 }
 
@@ -100,6 +107,9 @@ impl Environment {
             daemon: DaemonVersion(env!("CARGO_PKG_VERSION").to_string()),
             kernel: KernelRelease(kernel.trim().to_string()),
             nvidia: nvidia()?,
+            cpu_flags: Some(cpu_flags(
+                &fs::read_to_string(CPUINFO).with_context(|| format!("read {CPUINFO}"))?,
+            )),
             tools: Tools {
                 criu: Sha256Digest::of_file(&tools_dir.join("criu"))?,
                 cuinterpose,
@@ -140,6 +150,15 @@ impl Environment {
                 now.driver
             )),
             (None, None) => {}
+        }
+        if let (Some(then), Some(now)) = (&taken.cpu_flags, &self.cpu_flags) {
+            let lacking: Vec<&str> = then.difference(now).map(|flag| flag.0.as_str()).collect();
+            if !lacking.is_empty() {
+                reasons.push(format!(
+                    "it was taken on a CPU with flags the node lacks: {}",
+                    lacking.join(" ")
+                ));
+            }
         }
         if taken.tools.criu != self.tools.criu {
             reasons.push(format!(
@@ -182,6 +201,9 @@ impl fmt::Display for Environment {
             )?,
             None => f.write_str(", no NVIDIA driver")?,
         }
+        if let Some(flags) = &self.cpu_flags {
+            write!(f, ", {} CPU flags", flags.len())?;
+        }
         write!(
             f,
             ", CRIU {}, cuInterpose {}",
@@ -210,6 +232,24 @@ fn bundle(libraries: Option<&BTreeMap<String, Sha256Digest>>) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
+}
+
+/// The flags of the first processor in `/proc/cpuinfo`: `flags` on x86,
+/// `Features` on Arm.
+fn cpu_flags(cpuinfo: &str) -> BTreeSet<CpuFlag> {
+    cpuinfo
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key.trim(), "flags" | "Features").then_some(value)
+        })
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(|flag| CpuFlag(flag.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn nvidia() -> Result<Option<Nvidia>> {
@@ -245,8 +285,8 @@ pub mod tests {
 
     use crate::cuinterpose::Sha256Digest;
     use crate::node::environment::{
-        ComputeCapability, DaemonVersion, DriverVersion, Environment, GpuModel, GpuName,
-        KernelRelease, Nvidia, Tools,
+        ComputeCapability, CpuFlag, DaemonVersion, DriverVersion, Environment, GpuModel, GpuName,
+        KernelRelease, Nvidia, Tools, cpu_flags,
     };
 
     fn digest(byte: u8) -> Sha256Digest {
@@ -269,6 +309,7 @@ pub mod tests {
                 driver: DriverVersion("580.65.06".to_string()),
                 gpus: BTreeSet::from([h100()]),
             }),
+            cpu_flags: Some(flags(&["avx2", "avx512f", "fpu", "sse4_2"])),
             tools: Tools {
                 criu: digest(1),
                 cuinterpose: Some(BTreeMap::from([
@@ -285,6 +326,17 @@ pub mod tests {
             nvidia.driver = DriverVersion(driver.to_string());
         }
         environment
+    }
+
+    pub fn flags(names: &[&str]) -> BTreeSet<CpuFlag> {
+        names.iter().map(|name| CpuFlag(name.to_string())).collect()
+    }
+
+    pub fn with_cpu_flags(names: Option<&[&str]>) -> Environment {
+        Environment {
+            cpu_flags: names.map(flags),
+            ..environment()
+        }
     }
 
     pub fn with_kernel(release: &str) -> Environment {
@@ -396,6 +448,52 @@ pub mod tests {
     }
 
     #[test]
+    fn a_checkpoint_needs_only_cpu_flags_the_node_has() {
+        let here = environment();
+        let fewer = with_cpu_flags(Some(&["avx2", "fpu"]));
+        assert_eq!(
+            here.incompatibility(Some(&fewer)),
+            None,
+            "a checkpoint taken on a CPU with a subset of the node's flags restores"
+        );
+        assert_eq!(here.incompatibility(Some(&with_cpu_flags(Some(&[])))), None);
+        let more = with_cpu_flags(Some(&[
+            "amx_tile", "avx2", "avx512f", "fpu", "sse4_2", "vaes",
+        ]));
+        assert_eq!(
+            here.incompatibility(Some(&more)).as_deref(),
+            Some("it was taken on a CPU with flags the node lacks: amx_tile vaes")
+        );
+        assert!(
+            fewer.incompatibility(Some(&here)).is_some(),
+            "the node lacks avx512f and sse4_2"
+        );
+        let legacy = with_cpu_flags(None);
+        assert_eq!(
+            here.incompatibility(Some(&legacy)),
+            None,
+            "a fingerprint from before CPU flags were recorded is accepted"
+        );
+        assert_eq!(legacy.incompatibility(Some(&here)), None);
+    }
+
+    #[test]
+    fn the_first_processors_flags_are_read_from_cpuinfo() {
+        let x86 = "processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu sse4_2 avx2\n\
+                   bugs\t\t: spectre_v1\n\nprocessor\t: 1\nflags\t\t: fpu\n";
+        assert_eq!(cpu_flags(x86), flags(&["avx2", "fpu", "sse4_2"]));
+        let arm = "processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd aes\n";
+        assert_eq!(cpu_flags(arm), flags(&["aes", "asimd", "fp"]));
+        assert!(cpu_flags("processor\t: 0\n").is_empty());
+        assert!(cpu_flags("").is_empty());
+        assert_eq!(
+            cpu_flags("vmx flags\t: ept vpid\nflags\t: fpu\n"),
+            flags(&["fpu"]),
+            "only the line keyed flags counts"
+        );
+    }
+
+    #[test]
     fn every_incompatibility_is_reported_at_once() {
         let mut here = with_driver("590.1");
         here.tools.criu = digest(7);
@@ -437,6 +535,10 @@ pub mod tests {
         );
         assert_eq!(json["tools"]["criu"], hex::encode([1; 32]));
         assert_eq!(
+            json["cpu_flags"],
+            serde_json::json!(["avx2", "avx512f", "fpu", "sse4_2"])
+        );
+        assert_eq!(
             serde_json::from_value::<Environment>(json).unwrap(),
             environment
         );
@@ -446,6 +548,12 @@ pub mod tests {
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(serde_json::from_str::<Environment>(&json).unwrap(), bare);
         assert!(serde_json::from_str::<Environment>(r#"{"daemon":"0.1.0"}"#).is_err());
+        let mut legacy = serde_json::to_value(&environment).unwrap();
+        legacy.as_object_mut().unwrap().remove("cpu_flags");
+        assert_eq!(
+            serde_json::from_value::<Environment>(legacy).unwrap(),
+            with_cpu_flags(None)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -467,6 +575,8 @@ pub mod tests {
             Sha256Digest::of_file(&tools.join("criu")).unwrap()
         );
         assert_eq!(read.tools.cuinterpose, None);
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap();
+        assert_eq!(read.cpu_flags, Some(cpu_flags(&cpuinfo)));
         assert_eq!(
             read.nvidia.is_some(),
             std::path::Path::new("/proc/driver/nvidia/version").exists()
@@ -505,6 +615,7 @@ pub mod tests {
             "kernel 5.14.0-570.el9_6.x86_64",
             "NVIDIA driver 580.65.06 on NVIDIA H100 80GB HBM3 (sm 9.0)",
             "libcuinterpose.so=0202",
+            "4 CPU flags",
         ] {
             assert!(text.contains(part), "{text}");
         }

@@ -3,6 +3,7 @@
 //! ```text
 //! asking daemon ══ TLS ══► kube-rbac-proxy ── HTTP, inside the pod ──► holding daemon
 //! ```
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fs;
 use std::net::SocketAddr;
@@ -31,6 +32,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::encrypt::TransferKey;
 use crate::node::environment::Environment;
+use crate::node::manifest::{ImageId, pull_refusal};
 use crate::store::RevisionKey;
 use crate::topology::Place;
 
@@ -62,6 +64,18 @@ pub struct Status {
     /// checkpoint records none or the daemon is older than this field.
     #[serde(default)]
     pub environment: Option<Environment>,
+    /// The held checkpoint's id. `None` when the checkpoint records none
+    /// or the daemon is older than this field.
+    #[serde(default)]
+    pub image: Option<ImageId>,
+}
+
+impl Status {
+    /// Why a node in `node` that condemned `condemned` should not pull the
+    /// held checkpoint, or `None` if it may.
+    pub fn refusal(&self, node: &Environment, condemned: &BTreeSet<ImageId>) -> Option<String> {
+        pull_refusal(self.environment.as_ref(), self.image, node, condemned)
+    }
 }
 
 pub trait Holder: Send + Sync + 'static {
@@ -362,6 +376,7 @@ pub fn host(name: &str) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -382,7 +397,8 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_openssl::SslStream;
 
-    use crate::node::environment::tests::environment;
+    use crate::node::environment::tests::{environment, with_driver};
+    use crate::node::manifest::{ImageId, NO_IMAGE_ID};
     use crate::store::RevisionKey;
     use crate::topology::Place;
     use crate::tunnel::{
@@ -481,6 +497,10 @@ mod tests {
         admitted: Arc<AtomicUsize>,
     }
 
+    fn held_image() -> ImageId {
+        "9b2e4f60-1c3d-4e5f-8a7b-6c5d4e3f2a10".parse().unwrap()
+    }
+
     fn place() -> Place {
         let levels = ["rack".to_string()];
         Place::of(&levels, &[("rack".to_string(), "237".to_string())].into())
@@ -494,6 +514,7 @@ mod tests {
                 free_lanes: usize::from(name == "serving/qwen/held"),
                 place: place(),
                 environment: (name == "serving/qwen/held").then(environment),
+                image: (name == "serving/qwen/held").then(held_image),
             }
         }
 
@@ -715,6 +736,7 @@ mod tests {
                 free_lanes,
                 place: place(),
                 environment: (name == "serving/qwen/held").then(environment),
+                image: (name == "serving/qwen/held").then(held_image),
             };
             assert_eq!(status, wanted, "{name}");
         }
@@ -731,6 +753,65 @@ mod tests {
         assert!(status.held);
         assert_eq!(status.free_lanes, 2);
         assert_eq!(status.environment, None);
+        assert_eq!(status.image, None);
+    }
+
+    #[test]
+    fn a_peers_checkpoint_is_pulled_only_if_it_fits_and_was_not_condemned_here() {
+        let held = Status {
+            held: true,
+            free_lanes: 1,
+            place: place(),
+            environment: Some(environment()),
+            image: Some(held_image()),
+        };
+        let node = environment();
+        let none = BTreeSet::new();
+        assert_eq!(held.refusal(&node, &none), None);
+        let elsewhere = BTreeSet::from([ImageId::draw()]);
+        assert_eq!(
+            held.refusal(&node, &elsewhere),
+            None,
+            "another condemned image does not matter"
+        );
+        let condemned = BTreeSet::from([ImageId::draw(), held_image()]);
+        assert_eq!(
+            held.refusal(&node, &condemned),
+            Some(format!("this node condemned image {}", held_image()))
+        );
+        assert!(
+            held.refusal(&with_driver("590.1"), &none)
+                .is_some_and(|reason| reason.contains("NVIDIA driver")),
+            "an environment mismatch comes first"
+        );
+        let unnamed = Status {
+            image: None,
+            ..held.clone()
+        };
+        assert_eq!(unnamed.refusal(&node, &none), Some(NO_IMAGE_ID.to_string()));
+        let legacy = Status {
+            environment: None,
+            image: None,
+            ..held
+        };
+        assert_eq!(
+            legacy.refusal(&node, &none).as_deref(),
+            Some("it records no environment")
+        );
+    }
+
+    #[test]
+    fn a_status_carries_its_image_id_as_text() {
+        let status = Status {
+            held: true,
+            free_lanes: 0,
+            place: place(),
+            environment: None,
+            image: Some(held_image()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["image"], held_image().to_string());
+        assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
     }
 
     #[test]
