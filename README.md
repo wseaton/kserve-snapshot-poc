@@ -21,6 +21,9 @@ target node's RAM while it is being taken.
 | Qwen3-8B, TP=4, one node, onto other GPUs | 48.8 s | 8.0 s |
 
 Setup and every other number: [benchmarks](https://wseaton.github.io/snapshotd/benchmarks/).
+These were measured on an earlier vLLM base. The patches now sit on vLLM main, where expert
+parallel and prefill/decode under an LWS DisaggregatedSet pass;
+[validated configurations](https://wseaton.github.io/snapshotd/validated/) lists every run.
 
 ## Repository layout
 

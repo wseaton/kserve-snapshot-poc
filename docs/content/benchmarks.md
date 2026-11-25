@@ -5,8 +5,9 @@ weight = 30
 
 ## Setup
 
-Unless noted: 8x H200 nodes on CKS, driver 580.126.09 (CUDA 13.0), ConnectX-7 InfiniBand, vLLM
-nightly `a2bcb565` with the patches as they were then
+Unless noted: 8x H200 nodes on CKS, driver 580.126.09 (CUDA 13.0), ConnectX-7 InfiniBand. The
+sections after [On vLLM main](#on-vllm-main) used vLLM nightly `a2bcb565` with the patches as they
+were then
 ([`checkpoint-patchset-with-pd`](https://github.com/wseaton/vllm/tree/checkpoint-patchset-with-pd)),
 CRIU 4.2.1 and cuInterpose from Dynamo Snapshot `bc9d216`. "cuInterpose" runs use the CUDA 13.1
 compat `libcuda`. A run passes when the restored server returns the source's greedy completion.
@@ -15,6 +16,38 @@ runs dump and restore from a privileged pod, without a node agent's mount, cgrou
 
 Restore total is `criu restore` start to `/checkpoint/restore` end. Cold boot is `vllm serve` to
 healthy, with warm compile caches.
+
+## On vLLM main
+
+vLLM nightly `f2f9edca` with `patches/vllm` 0001 to 0007, weights released at prepare and
+reloaded from the model volume, no cuInterpose, CUDA graphs on. 2026-11-24, one run each.
+
+Qwen3-30B-A3B with expert parallel, bench pod, each rank restored onto another rank's GPU:
+
+| | DP=2 TP=1 | TP=2 DP=1 |
+| --- | --- | --- |
+| Checkpoint size | 18.2 GB | 13.9 GB |
+| CUDA checkpoint | 1.9 s | 1.6 s |
+| CRIU dump | 11.4 s | 7.6 s |
+| CRIU restore | 2.8 s | 2.5 s |
+| CUDA restore | 2.3 s | 1.7 s |
+| vLLM restore, weight reload and graph recapture | 21.5 s | 20.1 s |
+| **Restore total** | **26.6 s** | **24.4 s** |
+| Cold boot | 96.6 s | 66.4 s |
+
+Qwen3-8B TP=1 as a DisaggregatedSet with NIXL prefill and decode roles under `snapshotd node`, KV
+over TCP. Times are pod creation to Ready:
+
+| | Prefill | Decode |
+| --- | --- | --- |
+| First pod: boot to prepared, checkpoint 5.2 GiB, restore | 67 s | 67 s |
+| Second pod, same node | | 6 s |
+| Second pod, other node: pull 5.2 GiB in 6.9 s, restore 8.9 s | 23 s | |
+| After a decode-only template change, both roles captured again | 64 s | 63 s |
+
+Retrieval prompts through prefill then decode, all answered right: 60 on the first pair, 160
+across all four pairings, 40 on the new revision. Every decode request pulled its KV over NIXL,
+with no failed transfers.
 
 ## DeepSeek-V4.1-Flash across two nodes
 
