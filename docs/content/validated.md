@@ -28,6 +28,9 @@ server.
 
 | Date | Stack | Path | Model | Parallelism | Weights | Also | Restored onto | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | NIXL over TCP, roles keyed apart | same node | 60/60 |
+| 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | second pod of each role, all four pairings | same node, and other node pulled | 160/160 |
+| 2026-11-24 | main | node | Qwen3-8B | TP=1, P/D, DisaggregatedSet | released, volume | decode-only template change, both roles recaptured | same node | 40/40 |
 | 2026-11-24 | main | bench | Qwen3-30B-A3B | DP=2 TP=1 EP | released, volume | CUDA graphs | rotated GPUs | MATCH |
 | 2026-11-24 | main | bench | Qwen3-30B-A3B | TP=2 EP | released, volume | CUDA graphs | rotated GPUs | MATCH |
 | 2026-11-18 | old | node | Qwen3-8B | TP=1 | released, volume | Deployment, KEDA | other node, pulled | answered |
@@ -58,8 +61,6 @@ without a checkpoint, so its restores were checked for coherent output instead.
 
 ## Not validated yet on main
 
-- Prefill and decode (NIXL), under the daemon or the bench.
-- A DisaggregatedSet with real vLLM.
 - Speculative decoding with released weights.
 - CPU KV offload, with and without `async_init`.
 - A multimodal model with encoder CUDA graphs.
