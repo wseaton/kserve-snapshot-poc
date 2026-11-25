@@ -1,0 +1,92 @@
+name: crucible-call-demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: Text the report quotes back
+        type: string
+        required: true
+      flavor:
+        description: Which build flavor the legs pretend to run
+        type: choice
+        options: [fast, thorough]
+        default: fast
+      loud:
+        description: Upper-case the summary
+        type: boolean
+        default: false
+      payload:
+        description: A JSON object, serialized
+        type: string
+        default: "{}"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      keys: ${{ steps.parse.outputs.keys }}
+    steps:
+      - id: parse
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          printf '%s' "$PAYLOAD" | jq -e 'type == "object"' >/dev/null
+          echo "keys=$(printf '%s' "$PAYLOAD" | jq -c 'keys')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        leg: [left, right]
+    steps:
+      - env:
+          LEG: ${{ matrix.leg }}
+          MESSAGE: ${{ inputs.message }}
+          FLAVOR: ${{ inputs.flavor }}
+          KEYS: ${{ needs.prepare.outputs.keys }}
+        run: |
+          echo "leg=$LEG flavor=$FLAVOR keys=$KEYS"
+          echo "message=$MESSAGE"
+          sleep 5
+
+  report:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          MESSAGE: ${{ inputs.message }}
+          FLAVOR: ${{ inputs.flavor }}
+          LOUD: ${{ inputs.loud }}
+          KEYS: ${{ needs.prepare.outputs.keys }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p out
+          summary="$FLAVOR build of '$MESSAGE' over 2 legs"
+          if [ "$LOUD" = "true" ]; then summary=$(printf '%s' "$summary" | tr '[:lower:]' '[:upper:]'); fi
+          jq -n \
+            --arg summary "$summary" \
+            --arg flavor "$FLAVOR" \
+            --argjson loud "$LOUD" \
+            --argjson keys "$KEYS" \
+            '{summary: $summary, flavor: $flavor, loud: $loud, legs: 2, payload_keys: $keys}' \
+            > out/result.json
+          {
+            echo "# crucible-call-demo"
+            echo
+            echo "- message: $MESSAGE"
+            echo "- flavor: $FLAVOR"
+            echo "- payload keys: $KEYS"
+            echo "- run: $RUN_URL"
+          } > out/notes.md
+          cat out/result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crucible-result
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
