@@ -27,7 +27,9 @@ patches.
 - `0004`: `/checkpoint/prepare` destroys the NCCL communicator and `/checkpoint/restore` creates a
   new one, releasing CUDA graphs before and capturing them again after. At TP>1 with custom
   all-reduce off, no CUDA memory is shared between workers when the process is checkpointed, and
-  cuda-checkpoint alone restores them, onto other GPUs too.
+  cuda-checkpoint alone restores them, onto other GPUs too. Graphs are captured again into a fresh
+  graph pool, since blocks captured into the old one (Engram's pinned host buffers, for one) can
+  outlive the released graphs.
 - `0005`, `0006`: the checkpoint lifecycle on the Rust frontend's gRPC `Control` service
   (`CheckpointPrepare`, `CheckpointRestore`, `GetCheckpointState`), sharing one state machine with
   the `/checkpoint` HTTP routes. Upstream serves it only over HTTP, on the inference port.
@@ -36,7 +38,8 @@ patches.
   any background setup, unregisters the offload region and frees its pages, and
   `/checkpoint/restore` sets it up again, in the background under `async_init`. The checkpoint does
   not grow by the region size. Workers sharing the replicated layout's one region meet at a
-  barrier before freeing it; per-rank regions do not. The tiering spec keeps its memory.
+  barrier before freeing it; per-rank regions do not. The tiering spec frees its region the same
+  way when it has no secondary tiers, and refuses to prepare when it has them.
 
 **ModelExpress**
 - `0001`: read `POD_NAME`, `POD_NAMESPACE` and `POD_UID` from a downward API volume named by

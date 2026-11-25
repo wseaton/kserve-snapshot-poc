@@ -1,4 +1,4 @@
-From de967f94c911bef72eb996112497cf39bd5f73c0 Mon Sep 17 00:00:00 2001
+From c0a67f35a270ce9618b495c7a5671c8a53d77b90 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 16:35:57 -0500
 Subject: [PATCH 6/7] [Rust Frontend] Add the process checkpoint lifecycle to

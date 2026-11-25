@@ -79,8 +79,7 @@ Checked against the code and upstream on 2026-11-25.
 | Release weights at prepare, with a tag-limited sleep backend suspend | `patches/vllm/0003` | carried |
 | Recreate the NCCL communicator around a checkpoint | `patches/vllm/0004` | carried |
 | Connector checkpoint hooks, NIXL prefill/decode | [vllm#64371](https://github.com/vllm-project/vllm/pull/64371), `0001`, `0002` | open |
-| Free and refill the CPU KV offload region | `patches/vllm/0007`, wanted by [vllm#69237](https://github.com/vllm-project/vllm/issues/69237) | carried, no upstream PR yet |
-| Free and refill the Tiering offload region, without secondary tiers | local vLLM commit, not pushed or in `patches/vllm` | unit-tested, not run on GPUs |
+| Free and refill the CPU KV offload region, and the Tiering region without secondary tiers | `patches/vllm/0007`, wanted by [vllm#69237](https://github.com/vllm-project/vllm/issues/69237) | carried, no upstream PR yet; Tiering not run on GPUs |
 | Checkpoint lifecycle on the Rust frontend's gRPC service | `patches/vllm/0005`, `0006`; branch `rust-checkpoint-grpc` | carried, no upstream PR yet |
 | Refill the offload region after serving resumes | vLLM | not started |
 | Release custom all-reduce IPC buffers at prepare | vLLM | not started |

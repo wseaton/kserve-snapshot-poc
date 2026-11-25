@@ -1,4 +1,4 @@
-From 7dba8b7850953968c7773489ecbea39261f48156 Mon Sep 17 00:00:00 2001
+From eeb489ce9a282a439ac431df5bf1f2d8e8a5b555 Mon Sep 17 00:00:00 2001
 From: Will Eaton <weaton@redhat.com>
 Date: Tue, 24 Nov 2026 17:07:12 -0500
 Subject: [PATCH 7/7] [Core][KV Offload] Free the CPU offload region for a
@@ -25,8 +25,12 @@ failing if the registration does not come back, because the transfer
 kernels dereference the host pointers.
 
 OffloadingConnector forwards the connector checkpoint hooks and
-supports process checkpoints with the CPU spec. The tiering spec keeps
-its memory and does not.
+supports process checkpoints with the CPU spec, and with the tiering
+spec when it has no secondary tiers: its primary tier is the same
+region, shared by every worker and the scheduler in both layouts, so
+tiering workers always meet at the barrier. Secondary tiers keep
+transfers and network connections a checkpoint cannot carry, so a
+spec_name with secondary_tiers still refuses.
 
 Signed-off-by: Will Eaton <weaton@redhat.com>
 Assisted-by: Claude
@@ -34,18 +38,18 @@ Assisted-by: Claude
  docs/serving/online_serving/README.md         |   2 +-
  .../offloading_connector/test_scheduler.py    |  33 ++++++
  .../unit/offloading_connector/test_worker.py  |  31 ++++-
- tests/v1/kv_connector/unit/test_config.py     |  20 +++-
+ tests/v1/kv_connector/unit/test_config.py     |  31 ++++-
  tests/v1/kv_offload/cpu/test_gpu_worker.py    | 112 ++++++++++++++++++
  .../cpu/test_shared_offload_region.py         |  49 ++++++++
  .../kv_connector/v1/offloading/scheduler.py   |  12 +-
  .../kv_connector/v1/offloading/worker.py      |   9 ++
- .../kv_connector/v1/offloading_connector.py   |  16 +++
+ .../kv_connector/v1/offloading_connector.py   |  17 +++
  vllm/v1/kv_offload/base.py                    |  16 +++
  vllm/v1/kv_offload/cpu/gpu_worker.py          |  57 ++++++++-
  .../kv_offload/cpu/shared_offload_region.py   |  25 ++--
  vllm/v1/kv_offload/cpu/spec.py                |   6 +
- vllm/v1/kv_offload/tiering/spec.py            |   5 +
- 14 files changed, 378 insertions(+), 15 deletions(-)
+ vllm/v1/kv_offload/tiering/spec.py            |  11 +-
+ 14 files changed, 395 insertions(+), 16 deletions(-)
 
 diff --git a/docs/serving/online_serving/README.md b/docs/serving/online_serving/README.md
 index 3d558b19c0..a9ff5364d6 100644
@@ -161,7 +165,7 @@ index fd40f8d2fa..e75ae1ffe7 100644
      worker, _ = _make_worker(
          KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),
 diff --git a/tests/v1/kv_connector/unit/test_config.py b/tests/v1/kv_connector/unit/test_config.py
-index e1b13d78ba..51967b9799 100644
+index e1b13d78ba..4d89f880e7 100644
 --- a/tests/v1/kv_connector/unit/test_config.py
 +++ b/tests/v1/kv_connector/unit/test_config.py
 @@ -191,6 +191,7 @@ def test_sleep_mode_refuses_unsupported_kv_connector(
@@ -182,17 +186,28 @@ index e1b13d78ba..51967b9799 100644
      ],
  )
  def test_kv_connectors_opt_in_to_process_checkpoints(
-@@ -219,6 +221,22 @@ def test_kv_connectors_opt_in_to_process_checkpoints(
+@@ -219,6 +221,33 @@ def test_kv_connectors_opt_in_to_process_checkpoints(
      assert connector_cls.supports_checkpoint(config) == supported
  
  
 +@pytest.mark.parametrize(
 +    "extra_config,supported",
-+    [(None, True), ({"spec_name": "TieringOffloadingSpec"}, False)],
++    [
++        (None, True),
++        ({"spec_name": "TieringOffloadingSpec"}, True),
++        (
++            {
++                "spec_name": "TieringOffloadingSpec",
++                "secondary_tiers": [{"type": "fs", "root_dir": "/tmp/kv"}],
++            },
++            False,
++        ),
++    ],
 +)
 +def test_offloading_connector_opts_in_to_process_checkpoints(extra_config, supported):
-+    """The CPU spec's region is released for a process checkpoint; the tiering
-+    spec's is not."""
++    """The CPU tier is released for a process checkpoint, alone or as the tiering
++    spec's primary tier. Secondary tiers keep transfers and connections a
++    checkpoint cannot carry."""
 +    config = _build_config(
 +        kv_connector="OffloadingConnector",
 +        kv_connector_extra_config=extra_config,
@@ -443,10 +458,10 @@ index 426c91e3c2..5d21332412 100644
          self._unsubmitted_store_jobs.clear()
          self._load_jobs.clear()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-index 202a44262d..d86c91a906 100644
+index 202a44262d..1d23b4e25b 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-@@ -102,6 +102,22 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+@@ -102,6 +102,23 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                  spec, vllm_config, kv_cache_config
              )
  
@@ -454,7 +469,8 @@ index 202a44262d..d86c91a906 100644
 +    def supports_checkpoint(cls, vllm_config: VllmConfig) -> bool:
 +        assert vllm_config.kv_transfer_config is not None
 +        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-+        return OffloadingSpecFactory.get_spec_cls(extra_config).supports_checkpoint()
++        spec_cls = OffloadingSpecFactory.get_spec_cls(extra_config)
++        return spec_cls.supports_checkpoint(extra_config)
 +
 +    def checkpoint_prepare(self) -> None:
 +        if self.connector_scheduler is not None:
@@ -470,7 +486,7 @@ index 202a44262d..d86c91a906 100644
          if self.connector_worker is not None:
              self.connector_worker.shutdown()
 diff --git a/vllm/v1/kv_offload/base.py b/vllm/v1/kv_offload/base.py
-index b660001c5b..bfd4d0f1ff 100644
+index b660001c5b..c101200cb9 100644
 --- a/vllm/v1/kv_offload/base.py
 +++ b/vllm/v1/kv_offload/base.py
 @@ -780,6 +780,16 @@ class OffloadingWorker(ABC):
@@ -495,9 +511,9 @@ index b660001c5b..bfd4d0f1ff 100644
          return ()
  
 +    @classmethod
-+    def supports_checkpoint(cls) -> bool:
-+        """Whether a process checkpoint of an engine using this spec can be
-+        restored."""
++    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
++        """Whether a process checkpoint of an engine using this spec, with
++        this kv_connector_extra_config, can be restored."""
 +        return False
 +
      def __init__(self, config: OffloadingConfig):
@@ -633,7 +649,7 @@ index 4f0a396840..78cf375f1e 100644
          # direct StorageImpl reference.  Freeing views first lets both refcounts
          # drop so the storage (which holds the mmap_obj buffer export) is freed
 diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
-index a16330a8fe..68451d8d40 100644
+index a16330a8fe..6ee8855b38 100644
 --- a/vllm/v1/kv_offload/cpu/spec.py
 +++ b/vllm/v1/kv_offload/cpu/spec.py
 @@ -215,6 +215,11 @@ class CPUOffloadingSpec(OffloadingSpec):
@@ -642,7 +658,7 @@ index a16330a8fe..68451d8d40 100644
  
 +    @classmethod
 +    @override
-+    def supports_checkpoint(cls) -> bool:
++    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
 +        return True
 +
      def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
@@ -657,21 +673,41 @@ index a16330a8fe..68451d8d40 100644
          except Exception:
              if mmap_region is not None:
 diff --git a/vllm/v1/kv_offload/tiering/spec.py b/vllm/v1/kv_offload/tiering/spec.py
-index e6ed9fff90..9895515727 100644
+index e6ed9fff90..f5b63bad55 100644
 --- a/vllm/v1/kv_offload/tiering/spec.py
 +++ b/vllm/v1/kv_offload/tiering/spec.py
+@@ -71,7 +71,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import (
+     REGION_SEGMENTS,
+     SharedOffloadRegion,
+ )
+-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
++from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, _all_workers_barrier
+ from vllm.v1.kv_offload.tiering.base import (
+     TIER_LABEL,
+     SecondaryTierManager,
 @@ -332,6 +332,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
  
          return metrics
  
 +    @classmethod
 +    @override
-+    def supports_checkpoint(cls) -> bool:
-+        return False
++    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
++        return not extra_config.get("secondary_tiers")
 +
      def __init__(self, config: OffloadingConfig):
          super().__init__(config)
          # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
+@@ -591,6 +596,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+                 num_cpu_chunks=self.num_chunks,
+                 mmap_region=worker_mmap,
+                 canonical_layout=self.config.canonical_layout,
++                prefault_shard=(
++                    (worker_index, world_size) if self.replicated_layout else None
++                ),
++                barrier=_all_workers_barrier,
+             )
+         except Exception:
+             worker_mmap.cleanup()
 -- 
 2.54.0 (Apple Git-157)
 
