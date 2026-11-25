@@ -29,7 +29,7 @@ server.
 | Date | Stack | Path | Model | Parallelism | Weights | Also | Restored onto | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2026-11-25 | main | bench | DeepSeek-V4.1-Flash | TP=8 EP | released, volume | DSpark, Engram CPU offload; 324 GB image | rotated GPUs | **FAIL**: graph recapture, `CachingHostAllocator` assertion |
-| 2026-11-25 | main | bench | DeepSeek-V4.1-Flash | TP=8 EP | released, volume | DSpark, Tiering offload 512 GiB, then 64 GiB | | no result: pod out of memory, node lost |
+| 2026-11-25 | main | bench | DeepSeek-V4.1-Flash | TP=8 EP | released, volume | DSpark, Tiering offload 512 GiB, then 64 GiB, on two nodes | | **FAIL**: container wedged at prepare, one node lost |
 | 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | CPU offload 16 GiB, released; KV loaded back after restore | rotated GPUs | MATCH |
 | 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | CPU offload 16 GiB under async_init; KV loaded back after restore | rotated GPUs | MATCH |
 | 2026-11-25 | main | bench | Qwen3-8B | TP=2 | released, volume | Qwen3-0.6B draft model, 3 speculative tokens | rotated GPUs | MATCH |
