@@ -44,7 +44,7 @@ ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/lo
 ENV NIXL_PREFIX=/usr/local
 
 ARG NIXL_REPO=https://github.com/wseaton/nixl
-ARG NIXL_REF=70b07d16232c9654b7ce8597de2c6f9c12032425
+ARG NIXL_REF=b61a2ab9bc29149582d147a28849ae20dc9d1caa
 COPY daemon/Cargo.toml /tmp/Cargo.toml
 RUN grep -q "rev = \"${NIXL_REF}\"" /tmp/Cargo.toml \
     && git init -q /src/nixl && cd /src/nixl \

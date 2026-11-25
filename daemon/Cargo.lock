@@ -1174,7 +1174,7 @@ dependencies = [
 [[package]]
 name = "nixl-sys"
 version = "1.6.0"
-source = "git+https://github.com/wseaton/nixl?rev=70b07d16232c9654b7ce8597de2c6f9c12032425#70b07d16232c9654b7ce8597de2c6f9c12032425"
+source = "git+https://github.com/wseaton/nixl?rev=b61a2ab9bc29149582d147a28849ae20dc9d1caa#b61a2ab9bc29149582d147a28849ae20dc9d1caa"
 dependencies = [
  "anyhow",
  "bincode",

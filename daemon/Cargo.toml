@@ -29,7 +29,7 @@ k8s-openapi = { version = "0.29", features = ["v1_35"], optional = true }
 kube = { version = "5", default-features = false, features = ["client", "openssl-tls"], optional = true }
 libc = "0.2"
 libloading = "0.9"
-nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "70b07d16232c9654b7ce8597de2c6f9c12032425", optional = true }
+nixl-sys = { git = "https://github.com/wseaton/nixl", rev = "b61a2ab9bc29149582d147a28849ae20dc9d1caa", optional = true }
 nvml-wrapper = "0.13"
 openssl = "0.10"
 prometheus-client = "0.26"
