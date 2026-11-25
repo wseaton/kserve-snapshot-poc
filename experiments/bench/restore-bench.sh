@@ -226,6 +226,8 @@ T=$(now)
 LD_LIBRARY_PATH=$B/lib $B/criu dump -t $VP -D "$IMG" -L /work/empty --tcp-established --ext-unix-sk --file-locks \
   --link-remap --ghost-limit "${GHOST_LIMIT:-1G}" --libdir $B/criu-plugins "${CRIU_STREAM[@]}" -v"${CRIU_VERBOSITY:-4}" -o dump.log || { grep Error "$IMG/dump.log" | tail -10; fail CRIU_DUMP_FAILED; }
 wait $VP 2>/dev/null
+for _ in $(seq 600); do ps -eo sid= | awk -v s="$VP" '$1 == s {f = 1} END {exit !f}' || break; sleep 0.1; done
+ps -eo sid= | awk -v s="$VP" '$1 == s {f = 1} END {exit !f}' && fail SOURCE_SESSION_ALIVE
 lap criu_dump "$T"
 if [ "$STREAM" = 1 ]; then
   for _ in $(seq 600); do grep -q ^CAPTURE "$W/hold.log" && break; sleep 0.1; done
