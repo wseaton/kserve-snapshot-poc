@@ -1,6 +1,6 @@
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 images:
-- digest: sha256:8fa9e4859595552ca0701c3784820442e2de07ffbbab76ceb399ea9467383d0b
+- digest: sha256:2f3e63fbc0f566459eb234b1c985ea39415f8365e80b75692acb94ed480f3162
   name: ghcr.io/wseaton/snapshotd/vllm-checkpoint
   newName: ghcr.io/wseaton/snapshotd/vllm-checkpoint
