@@ -6,11 +6,14 @@
 //! CRI ──► new pod ──► shim.sock ──► plan
 //!           restore: the node's checkpoint, or one pulled from a peer ──► serving
 //!           cold boot, checkpoint, restore ─────────────────────────────► serving
+//!           remove a checkpoint from another environment,
+//!             then cold boot, checkpoint, restore ──────────────────────► serving
 //!           cold boot (no room, or it failed here before) ──────────────► serving
 //! ```
 mod criu;
+pub mod environment;
 mod layout;
-mod manifest;
+pub mod manifest;
 mod pod;
 mod process;
 mod report;
@@ -29,8 +32,10 @@ use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::cri::{Runtime, Sandbox};
+use crate::cuda::Gpu;
 use crate::metrics::{self, How, Metrics, Step};
-use crate::node::manifest::Manifest;
+use crate::node::environment::Environment;
+use crate::node::manifest::{Manifest, Refusal};
 use crate::node::pod::Pod;
 use crate::node::process::{HostPid, PodPid};
 use crate::node::report::{seconds, short_id};
@@ -185,6 +190,7 @@ pub struct Args {
 
 struct Node {
     args: Args,
+    environment: Environment,
     classes: Classes,
     metrics: Arc<Metrics>,
     #[cfg(feature = "nixl")]
@@ -210,17 +216,21 @@ impl Node {
 enum Image {
     Absent,
     Usable,
+    /// This pod cannot take it.
     Unusable(String),
+    /// No pod on this node can take it.
+    Stale(String),
 }
 
 impl Image {
-    fn of(store: &RevisionStore, pod: &Pod) -> Result<Self> {
+    fn of(store: &RevisionStore, gpus: &[Gpu], node: &Environment) -> Result<Self> {
         if !store.image_ready() {
             return Ok(Self::Absent);
         }
         let image = store.image_dir();
-        Ok(match Manifest::load(&image)?.refusal(&image, pod.gpus())? {
-            Some(reason) => Self::Unusable(reason),
+        Ok(match Manifest::load(&image)?.refusal(&image, gpus, node)? {
+            Some(Refusal::Pod(reason)) => Self::Unusable(reason),
+            Some(Refusal::Node(reason)) => Self::Stale(reason),
             None => Self::Usable,
         })
     }
@@ -230,12 +240,16 @@ impl Image {
 enum Plan {
     Restore,
     Capture,
+    /// Replace a stale checkpoint with one taken from this pod.
+    Recapture(String),
     ColdBoot(String),
 }
 
 impl Plan {
-    /// `room` is whether the store can take a new checkpoint.
-    fn choose(failed_before: bool, image: Image, room: Result<()>) -> Self {
+    /// `room` is whether the store can take a new checkpoint. `recaptured`
+    /// is whether the revision was already recaptured in this node's
+    /// environment.
+    fn choose(failed_before: bool, image: Image, room: Result<()>, recaptured: bool) -> Self {
         if failed_before {
             return Self::ColdBoot("a checkpoint or restore failed in this pod before".to_string());
         }
@@ -243,6 +257,14 @@ impl Plan {
             (Image::Usable, _) => Self::Restore,
             (Image::Unusable(reason), _) => Self::ColdBoot(format!(
                 "the node's checkpoint cannot be restored into it: {reason}"
+            )),
+            (Image::Stale(reason), _) if recaptured => Self::ColdBoot(format!(
+                "the node's checkpoint is stale ({reason}), and it was already recaptured \
+                 in this environment"
+            )),
+            (Image::Stale(reason), Ok(())) => Self::Recapture(reason),
+            (Image::Stale(reason), Err(error)) => Self::ColdBoot(format!(
+                "the node's checkpoint is stale ({reason}), and no new one can be taken: {error:#}"
             )),
             (Image::Absent, Ok(())) => Self::Capture,
             (Image::Absent, Err(error)) => Self::ColdBoot(format!("{error:#}")),
@@ -523,10 +545,21 @@ async fn bring_up(
             }
         }
     }
+    let recaptured = match store.recaptured_for() {
+        Ok(environment) => environment.as_ref() == Some(&node.environment),
+        Err(error) => {
+            warn!(
+                error = %format_args!("{error:#}"),
+                "taking the revision as already recaptured"
+            );
+            true
+        }
+    };
     let plan = Plan::choose(
         store.failed_before(),
-        Image::of(&store, pod)?,
+        Image::of(&store, pod.gpus(), &node.environment)?,
         class.room(&revision),
+        recaptured,
     );
     match plan {
         Plan::Restore => {
@@ -538,27 +571,45 @@ async fn bring_up(
             Ok(Served::Restored)
         }
         Plan::ColdBoot(because) => cold_boot_only(node, pod, shim, because).await,
-        Plan::Capture => {
-            info!("cold booting; this pod gives the revision its checkpoint");
-            let (server, control, _) = cold_boot(node, pod, shim).await?;
-            store.clear_staging()?;
-            let staging = store.staging_dir();
-            let cycled = async {
-                let asked = Instant::now();
-                pod.checkpoint(control, shim, server, staging).await?;
-                node.metrics.stepped(Step::Checkpoint, asked.elapsed());
-                let asked = Instant::now();
-                let restored = pod.restore(staging).await?;
-                node.metrics.stepped(Step::Restore, asked.elapsed());
-                Ok(restored)
-            }
-            .await;
-            adopt_or_give_up(cycled, pod, &store, shim).await?;
-            store.publish()?;
-            info!(image = %store.image_dir().display(), "checkpoint published on this node");
-            Ok(Served::Captured)
+        Plan::Capture => capture(node, pod, shim, &store).await,
+        Plan::Recapture(because) => {
+            warn!(
+                because,
+                environment = %node.environment,
+                "the node's checkpoint was taken in another environment; replacing it"
+            );
+            store.retire_image()?;
+            store.record_recapture(&node.environment)?;
+            capture(node, pod, shim, &store).await
         }
     }
+}
+
+async fn capture(
+    node: &Node,
+    pod: &Pod,
+    shim: &mut ShimClient,
+    store: &RevisionStore,
+) -> Result<Served> {
+    info!("cold booting; this pod gives the revision its checkpoint");
+    let (server, control, _) = cold_boot(node, pod, shim).await?;
+    store.clear_staging()?;
+    let staging = store.staging_dir();
+    let cycled = async {
+        let asked = Instant::now();
+        pod.checkpoint(control, shim, server, staging, &node.environment)
+            .await?;
+        node.metrics.stepped(Step::Checkpoint, asked.elapsed());
+        let asked = Instant::now();
+        let restored = pod.restore(staging).await?;
+        node.metrics.stepped(Step::Restore, asked.elapsed());
+        Ok(restored)
+    }
+    .await;
+    adopt_or_give_up(cycled, pod, store, shim).await?;
+    store.publish()?;
+    info!(image = %store.image_dir().display(), "checkpoint published on this node");
+    Ok(Served::Captured)
 }
 
 async fn look_after(node: &Node, sandbox: &Sandbox) -> Result<()> {
@@ -682,11 +733,15 @@ async fn serve(args: Args) -> Result<()> {
         "no criu in {}",
         args.pod.tools_dir.display()
     );
+    let environment = Environment::of_node(&args.pod.tools_dir)
+        .context("read the environment checkpoints depend on")?;
+    info!(%environment, "checkpoints are taken and checked in this environment");
     let metrics = Arc::new(Metrics::default());
     metrics::start(args.metrics_listen, Arc::clone(&metrics)).await?;
     let node = Arc::new(Node {
         #[cfg(feature = "nixl")]
-        peers: Peers::start(&args.peers, classes.clone()).await?,
+        peers: Peers::start(&args.peers, classes.clone(), environment.clone()).await?,
+        environment,
         classes,
         metrics,
         #[cfg(feature = "nixl")]
@@ -746,8 +801,10 @@ pub fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::io::{self, Write};
     use std::net::{IpAddr, SocketAddr};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use anyhow::anyhow;
@@ -755,7 +812,14 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use crate::cri::Sandbox;
+    use crate::cuda::Gpu;
+    use crate::cuinterpose;
+    use crate::node::environment::Environment;
+    use crate::node::environment::tests::{environment, with_driver, with_kernel};
+    use crate::node::manifest::Manifest;
+    use crate::node::process::PodPid;
     use crate::node::{Args, Image, Labels, Plan};
+    use crate::store::{RevisionKey, RevisionStore};
     use crate::vllm::{Endpoint, Transport};
 
     fn sandbox(labels: &[(&str, &str)]) -> Sandbox {
@@ -1086,29 +1150,194 @@ mod tests {
     }
 
     #[test]
-    fn a_pod_is_restored_captured_or_only_cold_booted() {
+    fn a_pod_is_restored_captured_recaptured_or_only_cold_booted() {
         let unusable = || Image::Unusable("other GPUs".to_string());
+        let stale = || Image::Stale("another driver".to_string());
         let full = || Err(anyhow!("12 bytes free"));
         let cold = |because: &str| Plan::ColdBoot(because.to_string());
+        let recapture = Plan::Recapture("another driver".to_string());
         let failed = "a checkpoint or restore failed in this pod before";
         let other = "the node's checkpoint cannot be restored into it: other GPUs";
+        let again = "the node's checkpoint is stale (another driver), and it was already \
+                     recaptured in this environment";
+        let no_room = "the node's checkpoint is stale (another driver), and no new one can be \
+                       taken: 12 bytes free";
         let cases = [
-            (false, Image::Usable, Ok(()), Plan::Restore),
-            (false, Image::Usable, full(), Plan::Restore),
-            (false, Image::Absent, Ok(()), Plan::Capture),
-            (false, Image::Absent, full(), cold("12 bytes free")),
-            (false, unusable(), Ok(()), cold(other)),
-            (false, unusable(), full(), cold(other)),
-            (true, Image::Usable, Ok(()), cold(failed)),
-            (true, Image::Absent, Ok(()), cold(failed)),
-            (true, unusable(), Ok(()), cold(failed)),
+            (false, Image::Usable, Ok(()), false, Plan::Restore),
+            (false, Image::Usable, full(), false, Plan::Restore),
+            (false, Image::Usable, Ok(()), true, Plan::Restore),
+            (false, Image::Absent, Ok(()), false, Plan::Capture),
+            (false, Image::Absent, Ok(()), true, Plan::Capture),
+            (false, Image::Absent, full(), false, cold("12 bytes free")),
+            (false, unusable(), Ok(()), false, cold(other)),
+            (false, unusable(), full(), false, cold(other)),
+            (false, unusable(), Ok(()), true, cold(other)),
+            (false, stale(), Ok(()), false, recapture),
+            (false, stale(), Ok(()), true, cold(again)),
+            (false, stale(), full(), false, cold(no_room)),
+            (false, stale(), full(), true, cold(again)),
+            (true, Image::Usable, Ok(()), false, cold(failed)),
+            (true, Image::Absent, Ok(()), false, cold(failed)),
+            (true, unusable(), Ok(()), false, cold(failed)),
+            (true, stale(), Ok(()), false, cold(failed)),
         ];
-        for (number, (failed_before, image, room, wanted)) in cases.into_iter().enumerate() {
+        for (number, (failed_before, image, room, recaptured, wanted)) in
+            cases.into_iter().enumerate()
+        {
             assert_eq!(
-                Plan::choose(failed_before, image, room),
+                Plan::choose(failed_before, image, room, recaptured),
                 wanted,
                 "case {number}"
             );
         }
+    }
+
+    fn gpus(minors: &[u32]) -> Vec<Gpu> {
+        minors
+            .iter()
+            .map(|&minor| Gpu {
+                uuid: format!("GPU-{minor:08x}-8867-7cb7-7ffd-202baf8a3566")
+                    .parse()
+                    .unwrap(),
+                minor,
+            })
+            .collect()
+    }
+
+    fn revision_store(test: &str, pod: &str) -> (PathBuf, RevisionStore) {
+        let dir =
+            std::env::temp_dir().join(format!("snapshotd-node-{test}-{}", std::process::id()));
+        let revision: RevisionKey = "serving/qwen/7b9f694bf8".parse().unwrap();
+        let store = RevisionStore::open(&dir, &revision, pod).unwrap();
+        (dir, store)
+    }
+
+    fn take(store: &RevisionStore, minors: &[u32], environment: Option<Environment>) {
+        fs::create_dir_all(store.image_dir().join("img")).unwrap();
+        Manifest {
+            root: PodPid(57),
+            gpus: gpus(minors),
+            address: "10.0.2.165".parse().unwrap(),
+            environment,
+        }
+        .save(&store.image_dir())
+        .unwrap();
+    }
+
+    #[test]
+    fn the_nodes_checkpoint_is_absent_usable_unusable_or_stale() {
+        let (dir, store) = revision_store("image", "a");
+        let node = environment();
+        assert_eq!(
+            Image::of(&store, &gpus(&[4, 5]), &node).unwrap(),
+            Image::Absent
+        );
+
+        take(&store, &[4, 5], Some(environment()));
+        assert_eq!(
+            Image::of(&store, &gpus(&[4, 5]), &node).unwrap(),
+            Image::Usable
+        );
+        assert_eq!(
+            Image::of(&store, &gpus(&[6, 7]), &node).unwrap(),
+            Image::Usable,
+            "unshared memory moves to other minors"
+        );
+        assert_eq!(
+            Image::of(
+                &store,
+                &gpus(&[4, 5]),
+                &with_kernel("6.12.0-55.el10.x86_64")
+            )
+            .unwrap(),
+            Image::Usable,
+            "a kernel change is only logged"
+        );
+        assert_eq!(
+            Image::of(&store, &gpus(&[4]), &node).unwrap(),
+            Image::Unusable("it ran on 2 GPUs and the pod has 1".to_string())
+        );
+        cuinterpose::Manifest {
+            libraries: Default::default(),
+            pids: vec![675, 676],
+        }
+        .save(&store.image_dir().join("img"))
+        .unwrap();
+        assert!(
+            matches!(
+                Image::of(&store, &gpus(&[6, 7]), &node).unwrap(),
+                Image::Unusable(reason) if reason.contains("share GPU memory")
+            ),
+            "shared memory on other minors is still this pod's problem"
+        );
+
+        let upgraded = with_driver("580.82.07");
+        assert_eq!(
+            Image::of(&store, &gpus(&[4, 5]), &upgraded).unwrap(),
+            Image::Stale(
+                "it was taken under NVIDIA driver 580.65.06 and the node runs 580.82.07"
+                    .to_string()
+            )
+        );
+        assert!(
+            matches!(
+                Image::of(&store, &gpus(&[6, 7]), &upgraded).unwrap(),
+                Image::Stale(_)
+            ),
+            "a stale image is replaced even when this pod could not take it"
+        );
+
+        take(&store, &[4, 5], None);
+        assert_eq!(
+            Image::of(&store, &gpus(&[4, 5]), &node).unwrap(),
+            Image::Stale("it records no environment".to_string())
+        );
+
+        fs::write(store.image_dir().join("manifest.json"), "{").unwrap();
+        assert!(Image::of(&store, &gpus(&[4, 5]), &node).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_checkpoint_is_recaptured_once_per_environment() {
+        let (dir, ours) = revision_store("recapture", "a");
+        let (_, theirs) = revision_store("recapture", "b");
+        let before = environment();
+        let after = with_driver("580.82.07");
+        let plan = |store: &RevisionStore, node: &Environment| {
+            let recaptured = store.recaptured_for().unwrap().as_ref() == Some(node);
+            Plan::choose(
+                store.failed_before(),
+                Image::of(store, &gpus(&[4, 5]), node).unwrap(),
+                Ok(()),
+                recaptured,
+            )
+        };
+
+        take(&ours, &[4, 5], Some(before.clone()));
+        assert_eq!(plan(&theirs, &before), Plan::Restore);
+        assert!(matches!(plan(&ours, &after), Plan::Recapture(_)));
+        ours.retire_image().unwrap();
+        ours.record_recapture(&after).unwrap();
+        assert_eq!(
+            plan(&theirs, &after),
+            Plan::Capture,
+            "while the recapture runs, another pod captures too"
+        );
+        take(&ours, &[4, 5], Some(after.clone()));
+        assert_eq!(plan(&theirs, &after), Plan::Restore);
+
+        take(&ours, &[4, 5], Some(before.clone()));
+        assert!(
+            matches!(plan(&theirs, &after), Plan::ColdBoot(reason) if reason.contains("already recaptured")),
+            "a recapture that comes out stale again is not repeated"
+        );
+
+        let later = with_driver("590.12");
+        assert!(
+            matches!(plan(&theirs, &later), Plan::Recapture(_)),
+            "the next driver upgrade recaptures again"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::cuda::{self, Driver, Gpu, GpuMap, GpuUuid};
 use crate::cuinterpose::{self, SharedMemory};
 use crate::node::criu;
+use crate::node::environment::Environment;
 use crate::node::layout::{CUINTERPOSE, IMAGE, TOOLS, WORK};
 use crate::node::manifest::Manifest;
 use crate::node::process::{self, HostPid, PodPid, blocking, copy_tree};
@@ -171,6 +172,7 @@ impl Pod {
         shim: &mut ShimClient,
         root: PodPid,
         image: &Path,
+        environment: &Environment,
     ) -> Result<()> {
         let started = Instant::now();
         fs::create_dir_all(image.join("img"))
@@ -238,6 +240,7 @@ impl Pod {
             root,
             gpus: self.gpus.clone(),
             address: self.address(),
+            environment: Some(environment.clone()),
         }
         .save(image)?;
         info!(

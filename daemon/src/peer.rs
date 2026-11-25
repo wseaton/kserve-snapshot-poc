@@ -19,6 +19,8 @@ use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
 use crate::lanes::Lanes;
+use crate::node::environment::Environment;
+use crate::node::manifest::Manifest;
 use crate::store::{Classes, RevisionKey, RevisionStore, directory_bytes};
 use crate::topology::{Candidate, Place, nearest_first};
 use crate::transfer::{self, Endpoint, Pool};
@@ -102,6 +104,7 @@ pub struct Peers {
     busy_timeout: Duration,
     place: Place,
     classes: Classes,
+    environment: Environment,
     /// One lane for each transfer this daemon can take part in at once,
     /// sending or receiving, each with its share of the registered pool.
     transfers: Lanes<Endpoint>,
@@ -111,7 +114,11 @@ pub struct Peers {
 }
 
 impl Peers {
-    pub async fn start(args: &Args, classes: Classes) -> Result<Option<Arc<Self>>> {
+    pub async fn start(
+        args: &Args,
+        classes: Classes,
+        environment: Environment,
+    ) -> Result<Option<Arc<Self>>> {
         let (Some(name), Some(own_ip), Some(ca_file)) =
             (&args.peers, args.own_ip, &args.peer_ca_file)
         else {
@@ -143,6 +150,7 @@ impl Peers {
             busy_timeout: Duration::from_secs(args.peer_busy_timeout_s),
             place,
             classes,
+            environment,
             transfers: Lanes::start(lanes, move |lane| {
                 Endpoint::new(&format!("{agent}-{lane}"), pool, false)
             })?,
@@ -164,10 +172,19 @@ impl Peers {
 
 impl Holder for Peers {
     fn status(&self, revision: &RevisionKey) -> Status {
+        let image = self.classes.image_of(revision);
+        let environment = image.as_deref().and_then(|image| match Manifest::load(image) {
+            Ok(manifest) => manifest.environment,
+            Err(error) => {
+                debug!(%revision, error = %format_args!("{error:#}"), "the held manifest is unreadable");
+                None
+            }
+        });
         Status {
-            held: self.classes.image_of(revision).is_some(),
+            held: image.is_some(),
             free_lanes: self.turns.available_permits(),
             place: self.place.clone(),
+            environment,
         }
     }
 
@@ -231,11 +248,21 @@ impl Peers {
         let mut holding = Vec::new();
         while let Some(answer) = asked.join_next().await {
             match answer {
-                Ok((address, Ok(status))) if status.held => holding.push(Candidate {
-                    address,
-                    place: status.place,
-                    free_lanes: status.free_lanes,
-                }),
+                Ok((address, Ok(status))) if status.held => {
+                    match self
+                        .environment
+                        .incompatibility(status.environment.as_ref())
+                    {
+                        None => holding.push(Candidate {
+                            address,
+                            place: status.place,
+                            free_lanes: status.free_lanes,
+                        }),
+                        Some(reason) => {
+                            debug!(peer = %address, reason, "the peer's checkpoint cannot be restored here")
+                        }
+                    }
+                }
                 Ok((peer, Ok(_))) => debug!(%peer, "the peer has no checkpoint of it"),
                 Ok((peer, Err(error))) => {
                     debug!(%peer, error = %format_args!("{error:#}"), "the peer did not answer")
