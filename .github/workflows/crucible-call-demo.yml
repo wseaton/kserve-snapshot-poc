@@ -20,10 +20,6 @@ on:
         description: A JSON object, serialized
         type: string
         default: "{}"
-      sha:
-        description: The commit the legs build
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -48,11 +44,6 @@ jobs:
       matrix:
         leg: [left, right]
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha }}
-          fetch-depth: 2
-          persist-credentials: false
       - env:
           LEG: ${{ matrix.leg }}
           MESSAGE: ${{ inputs.message }}
@@ -61,28 +52,20 @@ jobs:
         run: |
           echo "leg=$LEG flavor=$FLAVOR keys=$KEYS"
           echo "message=$MESSAGE"
-          git log -1 --stat
           sleep 5
 
   report:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha }}
-          fetch-depth: 2
-          persist-credentials: false
       - env:
           MESSAGE: ${{ inputs.message }}
           FLAVOR: ${{ inputs.flavor }}
           LOUD: ${{ inputs.loud }}
           KEYS: ${{ needs.prepare.outputs.keys }}
-          SHA: ${{ inputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p out
-          changed=$(git diff --name-only HEAD~1 HEAD | jq -R . | jq -sc .)
           summary="$FLAVOR build of '$MESSAGE' over 2 legs"
           if [ "$LOUD" = "true" ]; then summary=$(printf '%s' "$summary" | tr '[:lower:]' '[:upper:]'); fi
           jq -n \
@@ -90,9 +73,7 @@ jobs:
             --arg flavor "$FLAVOR" \
             --argjson loud "$LOUD" \
             --argjson keys "$KEYS" \
-            --arg sha "$SHA" \
-            --argjson changed "$changed" \
-            '{summary: $summary, flavor: $flavor, loud: $loud, legs: 2, payload_keys: $keys, sha: $sha, changed: $changed}' \
+            '{summary: $summary, flavor: $flavor, loud: $loud, legs: 2, payload_keys: $keys}' \
             > out/result.json
           {
             echo "# crucible-call-demo"
@@ -100,8 +81,6 @@ jobs:
             echo "- message: $MESSAGE"
             echo "- flavor: $FLAVOR"
             echo "- payload keys: $KEYS"
-            echo "- commit: $SHA"
-            echo "- changed: $changed"
             echo "- run: $RUN_URL"
           } > out/notes.md
           cat out/result.json
